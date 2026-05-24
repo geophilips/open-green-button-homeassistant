@@ -1,0 +1,39 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Choose your utility",
+        "description": "Pick the utility company that provides your energy data. Only utilities currently supported by the Open Green Button proxy server are shown.",
+        "data": {
+          "utility_id": "Utility"
+        }
+      },
+      "connect": {
+        "title": "Authorize with {utility_name}",
+        "description": "**Step 1.** Open the authorization link below in a new tab and complete the Green Button consent flow with {utility_name}.\n\n[Authorize {utility_name} →]({authorize_url})\n\n**Step 2.** After consent, the page shows a code starting with `gb_live_`. Paste it below.",
+        "data": {
+          "claim_code": "Claim code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authorize {utility_name}",
+        "description": "Your authorization with {utility_name} has expired or was revoked. Re-authorize by opening this link in a new tab:\n\n[Re-authorize {utility_name} →]({authorize_url})\n\nAfter consent, paste the new claim code below.",
+        "data": {
+          "claim_code": "Claim code"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach the Open Green Button server. Check your internet connection and try again.",
+      "claim_code_empty": "Paste the claim code shown on the authorization page after consent.",
+      "invalid_or_expired_code": "This claim code is unknown, expired, or already used. Open the authorize link again to get a fresh code."
+    },
+    "abort": {
+      "already_configured": "This utility account is already configured.",
+      "cannot_connect": "Cannot reach the Open Green Button server.",
+      "no_utilities": "The Open Green Button server has no utilities configured.",
+      "unknown_utility": "The selected utility is no longer available.",
+      "reauth_successful": "Re-authorization complete."
+    }
+  }
+}

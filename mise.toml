@@ -1,0 +1,14 @@
+# Toolchain + Python venv config. Auto-activates when you cd into the repo.
+#
+# Setup from a clean checkout:
+#   mise trust            # one-time
+#   mise install          # installs Python 3.13, auto-creates .venv
+#   pip install -r requirements_test.txt
+#
+# The venv lives at .venv/ (ignored by .gitignore).
+
+[tools]
+python = "3.13"
+
+[env]
+_.python.venv = { path = ".venv", create = true }

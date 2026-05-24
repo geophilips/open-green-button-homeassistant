@@ -1,0 +1,31 @@
+name: HACS validation
+
+# Validates that the repo meets HACS's distribution requirements (hacs.json fields, info.md,
+# manifest.json fields, brand presence, etc.). The scheduled daily run is important even when
+# our code hasn't changed: HACS evolves its validation rules, and we want to know when a
+# previously-passing repo starts failing without us doing anything.
+#
+# Layout per https://www.hacs.xyz/docs/publish/action/
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  schedule:
+    - cron: '0 0 * * *'   # 00:00 UTC daily — catches upstream HACS rule changes
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  validate-hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+          # `brands` covers the home-assistant/brands repo registration, which we'll address
+          # at HACS submission time. Drop this once the integration has a brand entry there.
+          ignore: brands

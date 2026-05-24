@@ -1,0 +1,5 @@
+# Test deps for the Open Green Button HA integration. pytest-homeassistant-custom-component
+# pulls in the matching HA core + pytest + aioresponses for HTTP mocking. Pin to a version
+# tied to the HA core minor we target.
+pytest-homeassistant-custom-component>=0.13.190
+ruff>=0.6.0

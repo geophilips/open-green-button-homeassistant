@@ -1,0 +1,6 @@
+# Surfaces the "Sponsor" button on the GitHub repo and ties into GitHub's funding
+# discovery (e.g. star/explore views). Keep in sync with the Support section in README.md
+# here, and with the proxy server's landing page in the rocketraman/open-green-button repo.
+
+github: [rocketraman]
+buy_me_a_coffee: rocketraman
