@@ -3,18 +3,23 @@
 Endpoints used:
   - GET /utilities          — discovery for the utility picker
   - POST /claim/{code}      — single-use claim-code redemption
-  - POST /proxy/usage       — pull a window of normalized ESPI usage data
+  - POST /proxy/usage       — pulls a window of usage data; returns the utility's raw ESPI
+                              Atom XML which we parse locally via [espi.parse_usage_feed]
 
-The proxy server is stateless; every `/proxy/usage` call carries the encrypted refresh blob
-and the proof-of-possession proxy token. Refresh-token rotation surfaces in the response as
-`new_credentials`, which the coordinator persists back into the config entry.
+The proxy server is stateless and a pure pass-through for the data fetch: every
+`/proxy/usage` call carries the encrypted refresh blob and the proof-of-possession proxy
+token. The proxy decrypts the blob, refreshes the access token at the utility, GETs the
+subscription URI, and streams the response body back verbatim. Refresh-token rotation
+(RFC 6749 §6) surfaces via response **headers** (`OpenGB-New-Encrypted-Refresh-Blob` +
+`OpenGB-New-Proxy-Token`) so the body stays pure ESPI; the coordinator persists rotated
+credentials back into the config entry when present.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import aiohttp
@@ -170,16 +175,22 @@ class OpenGbApi:
         self,
         encrypted_refresh_blob: str,
         proxy_token: str,
-        published_min: int | None = None,
-        published_max: int | None = None,
+        published_min: datetime | None = None,
+        published_max: datetime | None = None,
     ) -> UsageResponse:
         """Pull a window of usage data from the proxy.
+
+        The proxy returns the utility's raw ESPI Atom XML; we parse it locally via
+        [espi.parse_usage_feed]. Rotated credentials, when present, arrive as response
+        headers rather than in the body.
 
         Args:
             encrypted_refresh_blob: persisted blob from the config entry.
             proxy_token: persisted bearer token from the config entry.
-            published_min: optional ESPI `published-min` filter, epoch seconds.
-            published_max: optional ESPI `published-max` filter, epoch seconds.
+            published_min: optional ESPI `published-min` filter — must be tz-aware.
+                Serialized to ISO 8601 with `Z` suffix on the wire (the format
+                Burlington Hydro's test-lab harness requires).
+            published_max: optional ESPI `published-max` filter — same constraints.
 
         Raises:
             OpenGbAuthExpiredError: utility refused our refresh token (HTTP 401 with
@@ -187,17 +198,21 @@ class OpenGbApi:
             OpenGbApiError: any other failure (network, 401 with different error code,
                 4xx body issue, 5xx).
         """
+        # Local import to avoid an import cycle (espi.py imports the dataclasses defined
+        # above in this module).
+        from .espi import parse_usage_feed
+
         url = f"{self._base}/proxy/usage"
         body: dict[str, Any] = {"encryptedRefreshBlob": encrypted_refresh_blob}
         if published_min is not None:
-            body["publishedMin"] = published_min
+            body["publishedMin"] = _to_iso_z(published_min)
         if published_max is not None:
-            body["publishedMax"] = published_max
+            body["publishedMax"] = _to_iso_z(published_max)
 
         headers = {**self.headers, "Authorization": f"Bearer {proxy_token}"}
         async with self._session.post(url, headers=headers, json=body) as resp:
-            text = await resp.text()
             if resp.status == 401:
+                text = await resp.text()
                 error_code = _safe_json_error(text)
                 if error_code == "utility_auth_expired":
                     raise OpenGbAuthExpiredError(
@@ -205,10 +220,18 @@ class OpenGbApi:
                     )
                 raise OpenGbApiError(f"POST /proxy/usage returned 401 ({error_code}): {text[:200]}")
             if resp.status != 200:
+                text = await resp.text()
                 raise OpenGbApiError(f"POST /proxy/usage returned {resp.status}: {text[:200]}")
-            payload: dict[str, Any] = await resp.json()
 
-        return _parse_usage_response(payload)
+            xml_bytes = await resp.read()
+            new_credentials = _new_credentials_from_headers(resp.headers)
+
+        updated, usage_points = parse_usage_feed(xml_bytes)
+        return UsageResponse(
+            updated=updated,
+            usage_points=usage_points,
+            new_credentials=new_credentials,
+        )
 
 
 def _safe_json_error(text: str) -> str | None:
@@ -225,73 +248,29 @@ def _safe_json_error(text: str) -> str | None:
         return None
 
 
-def _parse_usage_response(payload: dict[str, Any]) -> UsageResponse:
-    """Map the camelCase wire payload onto our snake_case dataclasses.
+_HEADER_NEW_ENCRYPTED_REFRESH_BLOB = "OpenGB-New-Encrypted-Refresh-Blob"
+_HEADER_NEW_PROXY_TOKEN = "OpenGB-New-Proxy-Token"  # noqa: S105 — header name, not a token
 
-    Kept as a plain function (no dataclasses-json / pydantic dep) — the shape is small and
-    pinned by ProxyUsageResponse on the server side. If the wire format gains fields the
-    dataclasses don't list, they're silently dropped, which is the behaviour we want for
-    forward-compatibility within an API version.
+
+def _new_credentials_from_headers(headers: Any) -> NewCredentials | None:
+    """Extract rotated credentials from the OpenGB-New-* response headers, if both present.
+
+    The proxy emits these only when the utility actually rotated the refresh token; absence
+    means "your stored credentials are still valid, don't update the config entry."
     """
-    return UsageResponse(
-        updated=_parse_iso(payload.get("updated")),
-        usage_points=[_parse_usage_point(up) for up in payload.get("usagePoints", [])],
-        new_credentials=_parse_new_credentials(payload.get("newCredentials")),
-    )
-
-
-def _parse_usage_point(up: dict[str, Any]) -> UsagePoint:
-    return UsagePoint(
-        usage_point_id=up["usagePointId"],
-        service_kind=up["serviceKind"],
-        series=[_parse_series(s) for s in up.get("series", [])],
-    )
-
-
-def _parse_series(s: dict[str, Any]) -> MeterReadingSeries:
-    rt = s["readingType"]
-    return MeterReadingSeries(
-        meter_reading_id=s["meterReadingId"],
-        reading_type=NormalizedReadingType(
-            commodity=rt["commodity"],
-            flow_direction=rt["flowDirection"],
-            accumulation_behaviour=rt["accumulationBehaviour"],
-            interval_length_seconds=rt["intervalLengthSeconds"],
-            unit_of_measure=rt["unitOfMeasure"],
-            unit_of_measure_symbol=rt["unitOfMeasureSymbol"],
-            power_of_ten_multiplier=rt["powerOfTenMultiplier"],
-            currency_numeric_code=rt.get("currencyNumericCode"),
-        ),
-        readings=[
-            UsageReading(
-                start=_parse_iso(r["start"]) or _bad("reading.start"),
-                duration_seconds=r["durationSeconds"],
-                value=r["value"],
-            )
-            for r in s.get("readings", [])
-        ],
-    )
-
-
-def _parse_new_credentials(nc: dict[str, Any] | None) -> NewCredentials | None:
-    if nc is None:
+    blob = headers.get(_HEADER_NEW_ENCRYPTED_REFRESH_BLOB)
+    token = headers.get(_HEADER_NEW_PROXY_TOKEN)
+    if not blob or not token:
         return None
-    return NewCredentials(
-        encrypted_refresh_blob=nc["encryptedRefreshBlob"],
-        proxy_token=nc["proxyToken"],
-    )
+    return NewCredentials(encrypted_refresh_blob=blob, proxy_token=token)
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    """ISO-8601 string → tz-aware datetime. ``Z`` suffix supported (Python 3.11+).
+def _to_iso_z(dt: datetime) -> str:
+    """Serialize a tz-aware datetime to ISO 8601 with `Z` suffix.
 
-    The server emits ``kotlin.time.Instant.toString()`` which is always UTC; we don't worry
-    about non-Z offsets here.
+    Python's stdlib emits ``+00:00`` for UTC; the ESPI harness wants ``Z``. We normalize to
+    UTC first so a caller can pass any tz-aware datetime without thinking about offsets.
     """
-    if value is None:
-        return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def _bad(field: str) -> datetime:
-    raise OpenGbApiError(f"proxy returned a malformed usage payload: missing or null {field}")
+    if dt.tzinfo is None:
+        raise ValueError("published_min/max must be timezone-aware")
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")

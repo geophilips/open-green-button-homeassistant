@@ -3,3 +3,7 @@
 # tied to the HA core minor we target.
 pytest-homeassistant-custom-component>=0.13.190
 ruff>=0.6.0
+# defusedxml is a runtime dep of the integration (espi.py guards XML parsing). HA core ships
+# with it bundled in production, but pytest-homeassistant-custom-component's transitive
+# requirements don't install it, so add it explicitly for the test environment.
+defusedxml>=0.7.1

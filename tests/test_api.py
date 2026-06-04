@@ -1,4 +1,10 @@
-"""Tests for the proxy-server HTTP client — fetch_usage paths."""
+"""Tests for the proxy-server HTTP client — fetch_usage paths.
+
+After the pass-through refactor: the proxy returns raw ESPI XML rather than normalized JSON,
+and rotated credentials arrive in response **headers**. These tests cover the XML→dataclass
+parse round-trip plus the auth-error mapping that distinguishes "reauth required" from
+"transient upstream failure".
+"""
 
 from __future__ import annotations
 
@@ -15,9 +21,9 @@ from custom_components.greenbutton.api import (
 )
 
 from .const import (
-    MOCK_USAGE_RESPONSE_OK,
-    MOCK_USAGE_RESPONSE_WITH_ROTATION,
+    MOCK_USAGE_XML,
     PROXY_USAGE_URL,
+    ROTATED_HEADERS,
     SERVER_BASE_URL,
 )
 
@@ -32,14 +38,18 @@ def _api(hass: HomeAssistant) -> OpenGbApi:
     return OpenGbApi(session=async_get_clientsession(hass), server_base_url=SERVER_BASE_URL)
 
 
-async def test_fetch_usage_returns_normalized_dataclasses(
+async def test_fetch_usage_parses_proxied_atom_xml_into_dataclasses(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,
 ) -> None:
-    """Happy path → camelCase JSON maps onto the snake_case dataclass tree."""
-    aioclient_mock.post(PROXY_USAGE_URL, json=MOCK_USAGE_RESPONSE_OK)
+    """Happy path: ESPI Atom XML parses into the same domain tree the coordinator consumes."""
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        content=MOCK_USAGE_XML,
+        headers={"Content-Type": "application/atom+xml"},
+    )
 
-    response = await _api(hass).fetch_usage("blob_value", "token_value")
+    response = await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
 
     assert response.updated == datetime(2026, 6, 3, 14, 0, 0, tzinfo=UTC)
     assert response.new_credentials is None
@@ -54,26 +64,32 @@ async def test_fetch_usage_returns_normalized_dataclasses(
     assert series.meter_reading_id == "022e1a41-a279-5af7-889e-3b46e67d9a01"
     assert series.reading_type.commodity == "ELECTRICITY_SECONDARY_METERED"
     assert series.reading_type.flow_direction == "FORWARD"
+    assert series.reading_type.accumulation_behaviour == "DELTA_DATA"
     assert series.reading_type.unit_of_measure == "WATT_HOURS"
+    assert series.reading_type.unit_of_measure_symbol == "Wh"
     assert series.reading_type.interval_length_seconds == 3600
     assert series.reading_type.currency_numeric_code == 124
 
     assert len(series.readings) == 2
-    assert series.readings[0].start == datetime(2026, 2, 24, 5, 0, 0, tzinfo=UTC)
+    assert series.readings[0].start == datetime(2025, 2, 24, 5, 0, 0, tzinfo=UTC)
     assert series.readings[0].duration_seconds == 3600
     assert series.readings[0].value == 1000.0
-    assert series.readings[1].start == datetime(2026, 2, 24, 6, 0, 0, tzinfo=UTC)
+    assert series.readings[1].start == datetime(2025, 2, 24, 6, 0, 0, tzinfo=UTC)
     assert series.readings[1].value == 1500.0
 
 
-async def test_fetch_usage_surfaces_new_credentials(
+async def test_fetch_usage_surfaces_new_credentials_from_response_headers(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,
 ) -> None:
-    """Refresh-token rotation surfaces verbatim in `response.new_credentials`."""
-    aioclient_mock.post(PROXY_USAGE_URL, json=MOCK_USAGE_RESPONSE_WITH_ROTATION)
+    """Refresh-token rotation arrives via OpenGB-New-* response headers, not the body."""
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        content=MOCK_USAGE_XML,
+        headers={"Content-Type": "application/atom+xml", **ROTATED_HEADERS},
+    )
 
-    response = await _api(hass).fetch_usage("blob_value", "token_value")
+    response = await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
 
     assert response.new_credentials is not None
     assert response.new_credentials.encrypted_refresh_blob == "rotated_blob_value"
@@ -84,21 +100,44 @@ async def test_fetch_usage_passes_published_window(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,
 ) -> None:
-    """publishedMin / publishedMax appear in the request body when supplied."""
-    aioclient_mock.post(PROXY_USAGE_URL, json=MOCK_USAGE_RESPONSE_OK)
+    """tz-aware datetimes → ISO 8601 with `Z` (the format Burlington's harness wants)."""
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        content=MOCK_USAGE_XML,
+        headers={"Content-Type": "application/atom+xml"},
+    )
 
     await _api(hass).fetch_usage(
         "blob_value",
-        "token_value",
-        published_min=1771900000,
-        published_max=1772000000,
+        "token_value",  # noqa: S106
+        published_min=datetime(2024, 2, 23, 5, 0, 0, tzinfo=UTC),
+        published_max=datetime(2026, 2, 24, 5, 0, 0, tzinfo=UTC),
     )
 
     last = aioclient_mock.mock_calls[-1]
     body = last[2]
     assert body["encryptedRefreshBlob"] == "blob_value"
-    assert body["publishedMin"] == 1771900000
-    assert body["publishedMax"] == 1772000000
+    assert body["publishedMin"] == "2024-02-23T05:00:00Z"
+    assert body["publishedMax"] == "2026-02-24T05:00:00Z"
+
+
+async def test_fetch_usage_rejects_naive_datetimes(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """Naive datetimes are ambiguous (no UTC offset) → ValueError before we hit the wire."""
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        content=MOCK_USAGE_XML,
+        headers={"Content-Type": "application/atom+xml"},
+    )
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await _api(hass).fetch_usage(
+            "blob_value",
+            "token_value",  # noqa: S106
+            published_min=datetime(2024, 2, 23, 5, 0, 0),  # noqa: DTZ001
+        )
 
 
 async def test_fetch_usage_translates_utility_auth_expired_to_distinct_exception(
@@ -113,7 +152,7 @@ async def test_fetch_usage_translates_utility_auth_expired_to_distinct_exception
     )
 
     with pytest.raises(OpenGbAuthExpiredError):
-        await _api(hass).fetch_usage("blob_value", "token_value")
+        await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
 
 
 async def test_fetch_usage_treats_other_401_as_generic_error(
@@ -128,7 +167,7 @@ async def test_fetch_usage_treats_other_401_as_generic_error(
     )
 
     with pytest.raises(OpenGbApiError) as exc_info:
-        await _api(hass).fetch_usage("blob_value", "token_value")
+        await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
     assert not isinstance(exc_info.value, OpenGbAuthExpiredError)
 
 
@@ -140,5 +179,5 @@ async def test_fetch_usage_treats_5xx_as_generic_error(
     aioclient_mock.post(PROXY_USAGE_URL, status=502, json={"error": "utility_upstream_error"})
 
     with pytest.raises(OpenGbApiError) as exc_info:
-        await _api(hass).fetch_usage("blob_value", "token_value")
+        await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
     assert not isinstance(exc_info.value, OpenGbAuthExpiredError)
