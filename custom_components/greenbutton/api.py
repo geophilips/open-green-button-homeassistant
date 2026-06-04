@@ -1,16 +1,20 @@
 """Thin async HTTP client for the Open Green Button proxy server.
 
-Only covers the endpoints needed by the config flow in Phase 3.0/3.1:
-  - GET /utilities       — discovery for the utility picker
-  - POST /claim/{code}   — single-use claim-code redemption
+Endpoints used:
+  - GET /utilities          — discovery for the utility picker
+  - POST /claim/{code}      — single-use claim-code redemption
+  - POST /proxy/usage       — pull a window of normalized ESPI usage data
 
-`/proxy/usage` and `/proxy/refresh` are added when the coordinator lands (Phase 3.3).
+The proxy server is stateless; every `/proxy/usage` call carries the encrypted refresh blob
+and the proof-of-possession proxy token. Refresh-token rotation surfaces in the response as
+`new_credentials`, which the coordinator persists back into the config entry.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import aiohttp
@@ -40,12 +44,79 @@ class ClaimResponse:
     current_api_version: str
 
 
+@dataclass(frozen=True, slots=True)
+class UsageReading:
+    """One hourly (or sub-hourly) consumption point."""
+
+    start: datetime
+    duration_seconds: int
+    value: float
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedReadingType:
+    """ReadingType metadata flattened onto each series — the server already maps ESPI integer
+    codes to enum names, so these strings are stable across utility implementations."""
+
+    commodity: str
+    flow_direction: str
+    accumulation_behaviour: str
+    interval_length_seconds: int
+    unit_of_measure: str
+    unit_of_measure_symbol: str
+    power_of_ten_multiplier: int
+    currency_numeric_code: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class MeterReadingSeries:
+    """All readings for one (UsagePoint, MeterReading, ReadingType) tuple."""
+
+    meter_reading_id: str
+    reading_type: NormalizedReadingType
+    readings: list[UsageReading]
+
+
+@dataclass(frozen=True, slots=True)
+class UsagePoint:
+    """A logical metering point (e.g. the electric meter at a service address)."""
+
+    usage_point_id: str
+    service_kind: str
+    series: list[MeterReadingSeries]
+
+
+@dataclass(frozen=True, slots=True)
+class NewCredentials:
+    """Rotated refresh blob + proxy token to persist into the config entry."""
+
+    encrypted_refresh_blob: str
+    proxy_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class UsageResponse:
+    """A successful POST /proxy/usage response."""
+
+    updated: datetime | None
+    usage_points: list[UsagePoint]
+    new_credentials: NewCredentials | None
+
+
 class OpenGbApiError(Exception):
     """Catch-all proxy-server error."""
 
 
 class OpenGbClaimNotFoundError(OpenGbApiError):
     """The claim code was unknown, already used, or expired (HTTP 410)."""
+
+
+class OpenGbAuthExpiredError(OpenGbApiError):
+    """The utility rejected our refresh token — caller must trigger reauth.
+
+    Distinct from generic ``OpenGbApiError`` so the coordinator can map this to
+    ``ConfigEntryAuthFailed`` instead of treating it as a transient ``UpdateFailed``.
+    """
 
 
 class OpenGbApi:
@@ -94,3 +165,133 @@ class OpenGbApi:
             scope=payload.get("scope"),
             current_api_version=payload["currentApiVersion"],
         )
+
+    async def fetch_usage(
+        self,
+        encrypted_refresh_blob: str,
+        proxy_token: str,
+        published_min: int | None = None,
+        published_max: int | None = None,
+    ) -> UsageResponse:
+        """Pull a window of usage data from the proxy.
+
+        Args:
+            encrypted_refresh_blob: persisted blob from the config entry.
+            proxy_token: persisted bearer token from the config entry.
+            published_min: optional ESPI `published-min` filter, epoch seconds.
+            published_max: optional ESPI `published-max` filter, epoch seconds.
+
+        Raises:
+            OpenGbAuthExpiredError: utility refused our refresh token (HTTP 401 with
+                `error=utility_auth_expired`). Caller should trigger the reauth flow.
+            OpenGbApiError: any other failure (network, 401 with different error code,
+                4xx body issue, 5xx).
+        """
+        url = f"{self._base}/proxy/usage"
+        body: dict[str, Any] = {"encryptedRefreshBlob": encrypted_refresh_blob}
+        if published_min is not None:
+            body["publishedMin"] = published_min
+        if published_max is not None:
+            body["publishedMax"] = published_max
+
+        headers = {**self.headers, "Authorization": f"Bearer {proxy_token}"}
+        async with self._session.post(url, headers=headers, json=body) as resp:
+            text = await resp.text()
+            if resp.status == 401:
+                error_code = _safe_json_error(text)
+                if error_code == "utility_auth_expired":
+                    raise OpenGbAuthExpiredError(
+                        "Utility refresh token expired; user must re-authorize",
+                    )
+                raise OpenGbApiError(f"POST /proxy/usage returned 401 ({error_code}): {text[:200]}")
+            if resp.status != 200:
+                raise OpenGbApiError(f"POST /proxy/usage returned {resp.status}: {text[:200]}")
+            payload: dict[str, Any] = await resp.json()
+
+        return _parse_usage_response(payload)
+
+
+def _safe_json_error(text: str) -> str | None:
+    """Pull the `error` field out of a JSON body, if present, without raising on malformed input.
+
+    The proxy emits ``{"error": "...", "message": "..."}`` on 4xx/5xx, but we don't want to
+    explode on an empty body or a different shape.
+    """
+    import json
+
+    try:
+        return json.loads(text).get("error")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _parse_usage_response(payload: dict[str, Any]) -> UsageResponse:
+    """Map the camelCase wire payload onto our snake_case dataclasses.
+
+    Kept as a plain function (no dataclasses-json / pydantic dep) — the shape is small and
+    pinned by ProxyUsageResponse on the server side. If the wire format gains fields the
+    dataclasses don't list, they're silently dropped, which is the behaviour we want for
+    forward-compatibility within an API version.
+    """
+    return UsageResponse(
+        updated=_parse_iso(payload.get("updated")),
+        usage_points=[_parse_usage_point(up) for up in payload.get("usagePoints", [])],
+        new_credentials=_parse_new_credentials(payload.get("newCredentials")),
+    )
+
+
+def _parse_usage_point(up: dict[str, Any]) -> UsagePoint:
+    return UsagePoint(
+        usage_point_id=up["usagePointId"],
+        service_kind=up["serviceKind"],
+        series=[_parse_series(s) for s in up.get("series", [])],
+    )
+
+
+def _parse_series(s: dict[str, Any]) -> MeterReadingSeries:
+    rt = s["readingType"]
+    return MeterReadingSeries(
+        meter_reading_id=s["meterReadingId"],
+        reading_type=NormalizedReadingType(
+            commodity=rt["commodity"],
+            flow_direction=rt["flowDirection"],
+            accumulation_behaviour=rt["accumulationBehaviour"],
+            interval_length_seconds=rt["intervalLengthSeconds"],
+            unit_of_measure=rt["unitOfMeasure"],
+            unit_of_measure_symbol=rt["unitOfMeasureSymbol"],
+            power_of_ten_multiplier=rt["powerOfTenMultiplier"],
+            currency_numeric_code=rt.get("currencyNumericCode"),
+        ),
+        readings=[
+            UsageReading(
+                start=_parse_iso(r["start"]) or _bad("reading.start"),
+                duration_seconds=r["durationSeconds"],
+                value=r["value"],
+            )
+            for r in s.get("readings", [])
+        ],
+    )
+
+
+def _parse_new_credentials(nc: dict[str, Any] | None) -> NewCredentials | None:
+    if nc is None:
+        return None
+    return NewCredentials(
+        encrypted_refresh_blob=nc["encryptedRefreshBlob"],
+        proxy_token=nc["proxyToken"],
+    )
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """ISO-8601 string → tz-aware datetime. ``Z`` suffix supported (Python 3.11+).
+
+    The server emits ``kotlin.time.Instant.toString()`` which is always UTC; we don't worry
+    about non-Z offsets here.
+    """
+    if value is None:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _bad(field: str) -> datetime:
+    raise OpenGbApiError(f"proxy returned a malformed usage payload: missing or null {field}")

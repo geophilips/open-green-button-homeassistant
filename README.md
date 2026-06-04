@@ -46,6 +46,7 @@ Want your utility added? [Open an issue](https://github.com/rocketraman/open-gre
 - Your refresh token, usage data, and account identifiers live **only on your Home Assistant instance**.
 - The hosted proxy server holds **zero per-user durable state** — no accounts, no databases, no usage history.
 - Open source under MIT — read the code, run your own proxy, or fork it.
+- **Clean removal:** deleting the integration via Devices & Services purges every long-term statistic it created. Multiple config entries on the same utility (e.g. a sandbox account beside a real one, or several meters at one address) get distinct, per-entry statistic IDs so they never bleed together in the Energy dashboard.
 
 ## Development
 
@@ -62,6 +63,21 @@ pytest
 ```
 
 The venv at `.venv/` is auto-activated when you `cd` into the repo.
+
+## Roadmap
+
+**Working today**
+
+- OAuth authorization against the proxy server, with refresh-token rotation handled automatically
+- Polls the proxy every 6 hours and writes hourly consumption into the Energy dashboard's long-term statistics via [`async_add_external_statistics`](https://developers.home-assistant.io/docs/core/entity/sensor#statistics-imported-from-external-sources)
+- Reauth flow surfaces as an HA notification when the utility revokes our refresh token
+
+**Pending**
+
+- Burlington Hydro production credentials — currently in test-lab certification with the Green Button Alliance
+- Cost data from ESPI `UsageSummary` blocks — the proxy already parses these, the statistics writer doesn't import them yet
+- Push-based delivery (ESPI FB_39 NotificationURI) instead of polling, once a real utility supports it
+- Additional utilities — [open an issue](https://github.com/rocketraman/open-green-button-homeassistant/issues) with your provider's name
 
 ## Contributing
 
