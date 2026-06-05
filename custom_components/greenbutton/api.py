@@ -266,11 +266,15 @@ def _new_credentials_from_headers(headers: Any) -> NewCredentials | None:
 
 
 def _to_iso_z(dt: datetime) -> str:
-    """Serialize a tz-aware datetime to ISO 8601 with `Z` suffix.
+    """Serialize a tz-aware datetime to ISO 8601 with `Z` suffix at second precision.
 
-    Python's stdlib emits ``+00:00`` for UTC; the ESPI harness wants ``Z``. We normalize to
-    UTC first so a caller can pass any tz-aware datetime without thinking about offsets.
+    Two non-obvious normalizations:
+      - Python's stdlib emits ``+00:00`` for UTC; the ESPI harness wants ``Z``. Convert.
+      - The Green Button Alliance test-lab harness rejects timestamps with subsecond
+        precision (it returns HTTP 400 with an empty body). ``datetime.now(UTC)`` carries
+        microseconds, which leak through ``.isoformat()`` into the URL — strip them. ESPI
+        readings are hourly, so we never need sub-second resolution on the wire anyway.
     """
     if dt.tzinfo is None:
         raise ValueError("published_min/max must be timezone-aware")
-    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    return dt.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
