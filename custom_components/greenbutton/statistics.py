@@ -66,6 +66,16 @@ def statistic_id_for_series(
     return f"{DOMAIN}:{_slugify(entry_id)}_{_slugify(usage_point_id)}_{flow_direction.lower()}"
 
 
+def statistic_id_for_cost(entry_id: str, usage_point_id: str) -> str:
+    """Return the statistic_id for the cost series tied to a UsagePoint.
+
+    Cost is per UsagePoint (matches one customer account's billing), not per flow direction
+    — ESPI's UsageSummary is account-level. The id shares the same entry+usage-point prefix
+    as the energy stats so async_remove_entry's prefix purge catches both.
+    """
+    return f"{DOMAIN}:{_slugify(entry_id)}_{_slugify(usage_point_id)}_cost"
+
+
 def statistic_id_prefix_for_entry(entry_id: str) -> str:
     """Return the ``startswith`` prefix that matches every statistic owned by an entry.
 
@@ -100,6 +110,7 @@ async def import_usage_statistics(
     for up in response.usage_points:
         for series in up.series:
             await _import_series(hass, entry, up, series, utility_display_name)
+        await _import_cost_summaries(hass, entry, up, utility_display_name)
 
 
 async def _import_series(
@@ -183,6 +194,98 @@ def _stat_display_name(
     short_id = up.usage_point_id[:8]
     flow = series.reading_type.flow_direction.title()
     return f"{utility_display_name} · {up.service_kind.title()} {flow} ({short_id})"
+
+
+async def _import_cost_summaries(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    up: UsagePoint,
+    utility_display_name: str,
+) -> None:
+    """Write a cumulative-cost statistic from this UsagePoint's BillingSummary entries.
+
+    HA's Energy dashboard pairs an energy stat with a cost stat at config time — by emitting
+    a cost stat with the same entry+usage-point prefix, the user can wire it in alongside
+    the FORWARD energy stat to get the Cost column populated.
+
+    Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary to
+    accounts they bill; meter-only test profiles often won't), or when the currency code
+    isn't one we have an ISO 4217 alpha mapping for.
+    """
+    if not up.summaries:
+        return
+    currency_alpha = _iso_4217_alpha(up.summaries[0].currency_numeric_code)
+    if currency_alpha is None:
+        _LOGGER.debug(
+            "Skipping cost stat for usage point %s: currency code %s has no ISO 4217 mapping",
+            up.usage_point_id,
+            up.summaries[0].currency_numeric_code,
+        )
+        return
+
+    statistic_id = statistic_id_for_cost(entry.entry_id, up.usage_point_id)
+    metadata: StatisticMetaData = {
+        "has_mean": False,
+        "has_sum": True,
+        "name": (
+            f"{utility_display_name} · {up.service_kind.title()} Cost ({up.usage_point_id[:8]})"
+        ),
+        "source": DOMAIN,
+        "statistic_id": statistic_id,
+        "unit_of_measurement": currency_alpha,
+    }
+    if _MEAN_TYPE_NONE is not None:
+        metadata["mean_type"] = _MEAN_TYPE_NONE
+
+    resume_from_sum, resume_after_epoch = await _resume_point(hass, statistic_id)
+
+    stats: list[StatisticData] = []
+    running = resume_from_sum
+    # Summaries are already sorted by billing_period_start (the parser does this); the
+    # explicit sort here is belt-and-suspenders.
+    for summary in sorted(up.summaries, key=lambda s: s.billing_period_start):
+        period_start = _align_to_hour(summary.billing_period_start)
+        if resume_after_epoch is not None and period_start.timestamp() <= resume_after_epoch:
+            continue
+        period_cost = summary.total_cost
+        if period_cost == 0:
+            # Test-lab fixtures often have $0 placeholders — skip rather than emit a
+            # cumulative-flat row that confuses the dashboard.
+            continue
+        running += period_cost
+        stats.append(StatisticData(start=period_start, state=running, sum=running))
+
+    if not stats:
+        return
+
+    _LOGGER.info(
+        "Importing %d cost rows for %s in %s (resume_from_sum=%.2f)",
+        len(stats),
+        statistic_id,
+        currency_alpha,
+        resume_from_sum,
+    )
+    async_add_external_statistics(hass, metadata, stats)
+
+
+# Just the codes we expect to see from utilities currently in scope. Expand as we onboard
+# more — leaving an unknown code unmapped is safe (we skip the cost stat rather than emit
+# one with a unit HA can't display).
+_ISO_4217_ALPHA: dict[int, str] = {
+    124: "CAD",  # Canada — Burlington Hydro, all Ontario utilities
+    840: "USD",  # United States
+    978: "EUR",  # Eurozone
+    826: "GBP",  # United Kingdom
+    36: "AUD",  # Australia
+    554: "NZD",  # New Zealand
+}
+
+
+def _iso_4217_alpha(numeric_code: int | None) -> str | None:
+    """Map an ISO 4217 numeric currency code to its alpha-3 string (e.g. 124 → ``CAD``)."""
+    if numeric_code is None:
+        return None
+    return _ISO_4217_ALPHA.get(numeric_code)
 
 
 def _ha_unit_for(reading_type: NormalizedReadingType) -> str | None:

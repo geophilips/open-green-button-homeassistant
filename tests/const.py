@@ -95,6 +95,35 @@ MOCK_USAGE_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
       </espi:ReadingType>
     </content>
   </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <id>urn:uuid:us</id>
+    <link rel="self" href="https://utility.mock/UsagePoint/e082e9a9-390b-58fb-8ca5-4ee707c95652/UsageSummary/sum1"/>
+    <link rel="related" type="espi-entry/UsagePoint" href="https://utility.mock/UsagePoint/e082e9a9-390b-58fb-8ca5-4ee707c95652"/>
+    <content>
+      <espi:UsageSummary>
+        <!-- billingPeriod start = 1716129608 = 2024-05-19T13:20:08Z; duration = 30 days -->
+        <espi:billingPeriod>
+          <espi:duration>2592000</espi:duration>
+          <espi:start>1716129608</espi:start>
+        </espi:billingPeriod>
+        <!-- billLastPeriod 10250000 (raw, 1/100,000) = $102.50 in currency units -->
+        <espi:billLastPeriod>10250000</espi:billLastPeriod>
+        <espi:costAdditionalLastPeriod>0</espi:costAdditionalLastPeriod>
+        <espi:costAdditionalDetailLastPeriod>
+          <espi:amount>2700</espi:amount>
+          <espi:note>Regulatory Charges</espi:note>
+          <espi:itemKind>0</espi:itemKind>
+          <espi:unitCost>0</espi:unitCost>
+        </espi:costAdditionalDetailLastPeriod>
+        <espi:costAdditionalDetailLastPeriod>
+          <espi:amount>61780</espi:amount>
+          <espi:note>Delivery</espi:note>
+          <espi:itemKind>0</espi:itemKind>
+          <espi:unitCost>0</espi:unitCost>
+        </espi:costAdditionalDetailLastPeriod>
+      </espi:UsageSummary>
+    </content>
+  </entry>
 </feed>"""
 
 # Server emits these on rotation. Header NAMES must match what the server sends (and what

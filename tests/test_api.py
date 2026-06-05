@@ -77,6 +77,22 @@ async def test_fetch_usage_parses_proxied_atom_xml_into_dataclasses(
     assert series.readings[1].start == datetime(2025, 2, 24, 6, 0, 0, tzinfo=UTC)
     assert series.readings[1].value == 1500.0
 
+    # The fixture also carries a UsageSummary block attached to the UsagePoint via the
+    # `related` link. After parsing it should appear on `up.summaries` with the right
+    # billing-period start, total cost (raw → currency units), and line-item breakdown.
+    assert len(up.summaries) == 1
+    summary = up.summaries[0]
+    assert summary.billing_period_start == datetime(2024, 5, 19, 14, 40, 8, tzinfo=UTC)
+    assert summary.billing_period_duration_seconds == 2_592_000
+    assert summary.bill_last_period_raw == 10_250_000
+    assert summary.total_cost == 102.50
+    assert summary.currency_numeric_code == 124
+    assert len(summary.cost_details) == 2
+    assert summary.cost_details[0].note == "Regulatory Charges"
+    assert summary.cost_details[0].amount == 0.027
+    assert summary.cost_details[1].note == "Delivery"
+    assert summary.cost_details[1].amount == 0.6178
+
 
 async def test_fetch_usage_surfaces_new_credentials_from_response_headers(
     hass: HomeAssistant,

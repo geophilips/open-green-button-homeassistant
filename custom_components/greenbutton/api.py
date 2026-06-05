@@ -18,7 +18,7 @@ credentials back into the config entry when present.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -83,12 +83,63 @@ class MeterReadingSeries:
 
 
 @dataclass(frozen=True, slots=True)
+class CostDetail:
+    """One line item in a UsageSummary's cost breakdown.
+
+    ESPI reports cost amounts in **1/100,000 of the parent's currency unit** — see
+    [`amount`][] for the float currency value. The raw integer is preserved for callers
+    that want to inspect or round differently.
+    """
+
+    amount_raw: int
+    note: str | None
+    item_kind: int | None
+    unit_cost_raw: int | None
+
+    @property
+    def amount(self) -> float:
+        """Amount in currency units (e.g. dollars). Raw value divided by 100,000."""
+        return self.amount_raw / 100_000.0
+
+
+@dataclass(frozen=True, slots=True)
+class BillingSummary:
+    """One periodic billing summary parsed from an ESPI UsageSummary entry.
+
+    Typically one summary per billing period (monthly) per UsagePoint. Carries the period
+    total, an "additional charges" subtotal, and detailed line items (Delivery, Off-Peak,
+    On-Peak, Mid-Peak, etc. in Ontario's case).
+    """
+
+    billing_period_start: datetime
+    billing_period_duration_seconds: int
+    bill_last_period_raw: int | None
+    cost_additional_last_period_raw: int | None
+    cost_details: list[CostDetail]
+    currency_numeric_code: int | None
+
+    @property
+    def total_cost(self) -> float:
+        """Best-effort total cost in currency units.
+
+        Some utilities populate `billLastPeriod` with the grand total; others leave it 0
+        and only fill in the detail items. We prefer `billLastPeriod` when present and
+        positive, falling back to the sum of detail amounts.
+        """
+        bill = (self.bill_last_period_raw or 0) / 100_000.0
+        if bill > 0:
+            return bill
+        return sum(d.amount for d in self.cost_details)
+
+
+@dataclass(frozen=True, slots=True)
 class UsagePoint:
     """A logical metering point (e.g. the electric meter at a service address)."""
 
     usage_point_id: str
     service_kind: str
     series: list[MeterReadingSeries]
+    summaries: list[BillingSummary] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)

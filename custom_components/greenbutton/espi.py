@@ -38,6 +38,8 @@ from typing import IO
 from defusedxml.ElementTree import iterparse as _safe_iterparse
 
 from .api import (
+    BillingSummary,
+    CostDetail,
     MeterReadingSeries,
     NormalizedReadingType,
     UsagePoint,
@@ -58,6 +60,7 @@ _TAG_USAGE_POINT = f"{{{_ESPI_NS}}}UsagePoint"
 _TAG_METER_READING = f"{{{_ESPI_NS}}}MeterReading"
 _TAG_INTERVAL_BLOCK = f"{{{_ESPI_NS}}}IntervalBlock"
 _TAG_READING_TYPE = f"{{{_ESPI_NS}}}ReadingType"
+_TAG_USAGE_SUMMARY = f"{{{_ESPI_NS}}}UsageSummary"
 
 _TAG_SERVICE_CATEGORY = f"{{{_ESPI_NS}}}ServiceCategory"
 _TAG_KIND = f"{{{_ESPI_NS}}}kind"
@@ -74,6 +77,15 @@ _TAG_FLOW = f"{{{_ESPI_NS}}}flowDirection"
 _TAG_INTERVAL_LEN = f"{{{_ESPI_NS}}}intervalLength"
 _TAG_POW10 = f"{{{_ESPI_NS}}}powerOfTenMultiplier"
 _TAG_UOM = f"{{{_ESPI_NS}}}uom"
+
+_TAG_BILLING_PERIOD = f"{{{_ESPI_NS}}}billingPeriod"
+_TAG_BILL_LAST_PERIOD = f"{{{_ESPI_NS}}}billLastPeriod"
+_TAG_COST_ADDITIONAL_LAST_PERIOD = f"{{{_ESPI_NS}}}costAdditionalLastPeriod"
+_TAG_COST_ADDITIONAL_DETAIL_LAST_PERIOD = f"{{{_ESPI_NS}}}costAdditionalDetailLastPeriod"
+_TAG_AMOUNT = f"{{{_ESPI_NS}}}amount"
+_TAG_NOTE = f"{{{_ESPI_NS}}}note"
+_TAG_ITEM_KIND = f"{{{_ESPI_NS}}}itemKind"
+_TAG_UNIT_COST = f"{{{_ESPI_NS}}}unitCost"
 
 
 # Intermediate types — accumulated during iterparse and resolved into the public api.py
@@ -111,6 +123,14 @@ class _RawIntervalBlock:
     readings: list[UsageReading] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class _RawUsageSummary:
+    """A UsageSummary entry pinned to its parent UsagePoint via the `related` link."""
+
+    usage_point_id: str | None
+    summary: BillingSummary
+
+
 def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[UsagePoint]]:
     """Parse an ESPI usage Atom feed.
 
@@ -128,6 +148,7 @@ def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[U
     raw_meter_readings: dict[str, _RawMeterReading] = {}
     raw_reading_types: dict[str, _RawReadingType] = {}
     raw_interval_blocks: list[_RawIntervalBlock] = []
+    raw_summaries: list[_RawUsageSummary] = []
 
     seen_first_entry = False
 
@@ -145,6 +166,7 @@ def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[U
                 raw_meter_readings,
                 raw_reading_types,
                 raw_interval_blocks,
+                raw_summaries,
             )
             elem.clear()
 
@@ -153,6 +175,7 @@ def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[U
         raw_meter_readings,
         raw_reading_types,
         raw_interval_blocks,
+        raw_summaries,
     )
 
 
@@ -168,6 +191,7 @@ def _classify_entry(
     meter_readings: dict[str, _RawMeterReading],
     reading_types: dict[str, _RawReadingType],
     interval_blocks: list[_RawIntervalBlock],
+    summaries: list[_RawUsageSummary],
 ) -> None:
     # Atom content wrapper → first child tells us the payload type.
     content = entry.find(f"{{{_ATOM_NS}}}content")
@@ -218,6 +242,57 @@ def _classify_entry(
             power_of_ten_multiplier=_int_text(payload.find(_TAG_POW10)) or 0,
             uom=_int_text(payload.find(_TAG_UOM)),
         )
+    elif payload.tag == _TAG_USAGE_SUMMARY:
+        # Pin to parent via "related" link, since UsageSummary doesn't appear in the
+        # UsagePoint's own link tree.
+        up_id_from_related = _related_id(entry, "espi-entry/UsagePoint", "UsagePoint")
+        summary = _parse_usage_summary(payload)
+        if summary is not None:
+            summaries.append(
+                _RawUsageSummary(usage_point_id=up_id_from_related, summary=summary)
+            )
+
+
+def _parse_usage_summary(payload: ET.Element) -> BillingSummary | None:
+    """Build a BillingSummary from the inside of a `<content><espi:UsageSummary>` block."""
+    billing_period_elem = payload.find(_TAG_BILLING_PERIOD)
+    if billing_period_elem is None:
+        return None
+    start_text = billing_period_elem.findtext(_TAG_START)
+    duration_text = billing_period_elem.findtext(_TAG_DURATION)
+    if start_text is None or duration_text is None:
+        return None
+    try:
+        start_epoch = int(start_text)
+        duration_seconds = int(duration_text)
+    except ValueError:
+        return None
+
+    # Currency is occasionally surfaced on UsageSummary directly; otherwise the consumer
+    # falls back to whatever the linked ReadingType carries.
+    currency = _int_text(payload.find(_TAG_CURRENCY))
+
+    return BillingSummary(
+        billing_period_start=datetime.fromtimestamp(start_epoch, tz=UTC),
+        billing_period_duration_seconds=duration_seconds,
+        bill_last_period_raw=_int_text(payload.find(_TAG_BILL_LAST_PERIOD)),
+        cost_additional_last_period_raw=_int_text(payload.find(_TAG_COST_ADDITIONAL_LAST_PERIOD)),
+        cost_details=[
+            _parse_cost_detail(d)
+            for d in payload.findall(_TAG_COST_ADDITIONAL_DETAIL_LAST_PERIOD)
+        ],
+        currency_numeric_code=currency,
+    )
+
+
+def _parse_cost_detail(elem: ET.Element) -> CostDetail:
+    """One <espi:costAdditionalDetailLastPeriod> → CostDetail."""
+    return CostDetail(
+        amount_raw=_int_text(elem.find(_TAG_AMOUNT)) or 0,
+        note=elem.findtext(_TAG_NOTE),
+        item_kind=_int_text(elem.find(_TAG_ITEM_KIND)),
+        unit_cost_raw=_int_text(elem.find(_TAG_UNIT_COST)),
+    )
 
 
 def _parse_interval_readings(block: ET.Element):
@@ -254,6 +329,7 @@ def _assemble(
     raw_meter_readings: dict[str, _RawMeterReading],
     raw_reading_types: dict[str, _RawReadingType],
     raw_interval_blocks: list[_RawIntervalBlock],
+    raw_summaries: list[_RawUsageSummary],
 ) -> list[UsagePoint]:
     # Group IntervalBlocks by their parent MeterReading id.
     blocks_by_mr: dict[str, list[_RawIntervalBlock]] = {}
@@ -261,6 +337,24 @@ def _assemble(
         if block.meter_reading_id is None:
             continue
         blocks_by_mr.setdefault(block.meter_reading_id, []).append(block)
+
+    # Group billing summaries by their parent UsagePoint id (resolved from the "related" link).
+    summaries_by_up: dict[str, list[BillingSummary]] = {}
+    for raw_summary in raw_summaries:
+        if raw_summary.usage_point_id is None:
+            continue
+        summaries_by_up.setdefault(raw_summary.usage_point_id, []).append(raw_summary.summary)
+
+    # The currency on a UsageSummary occasionally falls back to the ReadingType's currency
+    # — pre-compute the first non-null currency we see per UsagePoint so we can fill it in.
+    currency_by_up: dict[str, int | None] = {}
+    for raw_mr in raw_meter_readings.values():
+        up_id = raw_mr.usage_point_id
+        if up_id is None or up_id in currency_by_up:
+            continue
+        rt = raw_reading_types.get(raw_mr.reading_type_id or "")
+        if rt and rt.currency is not None:
+            currency_by_up[up_id] = rt.currency
 
     out: list[UsagePoint] = []
     for up_id, raw_up in raw_usage_points.items():
@@ -287,14 +381,36 @@ def _assemble(
                     readings=readings,
                 )
             )
+        # Fill in the parent UsagePoint's currency on each summary that didn't carry one of
+        # its own.
+        fallback_currency = currency_by_up.get(up_id)
+        summaries = [
+            _with_currency_default(s, fallback_currency)
+            for s in summaries_by_up.get(up_id, [])
+        ]
+        summaries.sort(key=lambda s: s.billing_period_start)
         out.append(
             UsagePoint(
                 usage_point_id=up_id,
                 service_kind=_service_kind(raw_up.kind),
                 series=series,
+                summaries=summaries,
             )
         )
     return out
+
+
+def _with_currency_default(s: BillingSummary, fallback: int | None) -> BillingSummary:
+    if s.currency_numeric_code is not None or fallback is None:
+        return s
+    return BillingSummary(
+        billing_period_start=s.billing_period_start,
+        billing_period_duration_seconds=s.billing_period_duration_seconds,
+        bill_last_period_raw=s.bill_last_period_raw,
+        cost_additional_last_period_raw=s.cost_additional_last_period_raw,
+        cost_details=s.cost_details,
+        currency_numeric_code=fallback,
+    )
 
 
 def _normalize_reading_type(rt: _RawReadingType | None) -> NormalizedReadingType:
