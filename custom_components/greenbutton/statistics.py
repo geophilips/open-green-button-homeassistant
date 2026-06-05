@@ -25,12 +25,19 @@ from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
+from .tou import cost_detail_tou_bucket, ontario_tou_bucket
 
 if TYPE_CHECKING:
     from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
     from homeassistant.config_entries import ConfigEntry
 
-    from .api import MeterReadingSeries, NormalizedReadingType, UsagePoint, UsageResponse
+    from .api import (
+        BillingSummary,
+        MeterReadingSeries,
+        NormalizedReadingType,
+        UsagePoint,
+        UsageResponse,
+    )
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
@@ -287,11 +294,15 @@ async def _import_cost_summaries(
         total_period_kwh = sum(k for (_, k) in in_period)
         if total_period_kwh <= 0:
             continue
-        rate = period_cost / total_period_kwh
-        for hour_start, kwh in in_period:
+
+        # Per-hour cost = per-kWh TOU rate (zero if not a TOU bucket) + per-kWh non-TOU rate
+        # for everything else (Delivery, Global Adjustment, rebates, etc.). Sum of all hourly
+        # costs across the period equals the period's total bill — verified by construction.
+        cost_at_hour = _cost_distribution_for_period(summary, in_period, total_period_kwh)
+        for hour_start, _kwh in in_period:
             if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
                 continue
-            running += kwh * rate
+            running += cost_at_hour[hour_start]
             stats.append(StatisticData(start=hour_start, state=running, sum=running))
 
     if not stats:
@@ -305,6 +316,59 @@ async def _import_cost_summaries(
         resume_from_sum,
     )
     async_add_external_statistics(hass, metadata, stats)
+
+
+def _cost_distribution_for_period(
+    summary: BillingSummary,
+    in_period: list[tuple[datetime, float]],
+    total_period_kwh: float,
+) -> dict[datetime, float]:
+    """Return per-hour cost for the readings in [in_period].
+
+    When the summary's detail items include TOU line items (Off-Peak, Mid-Peak, On-Peak),
+    each TOU portion is distributed across the hours of that bucket at its own rate, and
+    everything else (Delivery, taxes, rebates, plus billLastPeriod headroom) is distributed
+    flat per kWh. When no TOU line items are present, the whole period total goes flat
+    per kWh — same result as the pre-TOU implementation.
+
+    Conservation invariant: ``sum(returned.values()) == summary.total_cost`` (to within
+    floating-point rounding), provided every reading lands in a non-empty bucket. If a
+    bucket has no readings in this period (e.g. test data spans only weekdays so the
+    weekend off-peak bucket is empty), that bucket's spend is absorbed into the flat
+    component instead — avoids "lost" dollars in the dashboard.
+    """
+    tou_cost_by_bucket: dict[str, float] = {}
+    for detail in summary.cost_details:
+        bucket = cost_detail_tou_bucket(detail.note)
+        if bucket is not None:
+            tou_cost_by_bucket[bucket] = tou_cost_by_bucket.get(bucket, 0.0) + detail.amount
+
+    # Per-bucket kWh in this period (drives the TOU-rate denominator).
+    kwh_by_bucket: dict[str, float] = {}
+    bucket_of: dict[datetime, str] = {}
+    for hour_start, kwh in in_period:
+        b = ontario_tou_bucket(hour_start)
+        bucket_of[hour_start] = b
+        kwh_by_bucket[b] = kwh_by_bucket.get(b, 0.0) + kwh
+
+    # If a TOU line item is for a bucket the period has no readings in, fold its spend into
+    # the flat-rate residual rather than dropping it.
+    tou_distributed: float = 0.0
+    bucket_rates: dict[str, float] = {}
+    for bucket, cost in tou_cost_by_bucket.items():
+        bucket_kwh = kwh_by_bucket.get(bucket, 0.0)
+        if bucket_kwh > 0:
+            bucket_rates[bucket] = cost / bucket_kwh
+            tou_distributed += cost
+
+    flat_residual = summary.total_cost - tou_distributed
+    flat_rate = (flat_residual / total_period_kwh) if total_period_kwh > 0 else 0.0
+
+    out: dict[datetime, float] = {}
+    for hour_start, kwh in in_period:
+        tou_rate = bucket_rates.get(bucket_of[hour_start], 0.0)
+        out[hour_start] = kwh * (tou_rate + flat_rate)
+    return out
 
 
 # Just the codes we expect to see from utilities currently in scope. Expand as we onboard
