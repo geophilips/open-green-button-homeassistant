@@ -45,22 +45,34 @@ def statistic_id_for_series(
 ) -> str:
     """Return the canonical statistic_id for one (entry, usage_point, flow_direction) triple.
 
-    Format: ``greenbutton:<entry_id>_<usage_point_id>_<flow_lower>``.
+    Format: ``greenbutton:<entry_slug>_<usage_point_slug>_<flow_lower>``.
 
     The entry_id prefix is what scopes a test entry's stats apart from a real entry's stats
-    on the same utility. Lower-casing flow_direction keeps the id stable if a future server
-    version emits a different enum casing.
+    on the same utility. Each id component is slugified — HA enforces that the part of a
+    statistic_id after the `:` matches a lowercase-letters/digits/underscores slug pattern,
+    and our inputs (ULID entry_id with uppercase, UUID usage_point_id with hyphens) violate
+    that as-is.
     """
-    return f"{DOMAIN}:{entry_id}_{usage_point_id}_{flow_direction.lower()}"
+    return f"{DOMAIN}:{_slugify(entry_id)}_{_slugify(usage_point_id)}_{flow_direction.lower()}"
 
 
 def statistic_id_prefix_for_entry(entry_id: str) -> str:
     """Return the ``startswith`` prefix that matches every statistic owned by an entry.
 
     Used by ``async_remove_entry`` to find all of an entry's stats for purging — pairs with
-    [statistic_id_for_series] so the format only lives in one place.
+    [statistic_id_for_series] so the format (and the slugification) only live in one place.
     """
-    return f"{DOMAIN}:{entry_id}_"
+    return f"{DOMAIN}:{_slugify(entry_id)}_"
+
+
+def _slugify(component: str) -> str:
+    """Lowercase + replace non-alphanumeric with underscore.
+
+    HA's ``valid_statistic_id`` rejects anything outside ``[a-z0-9_]`` after the colon. Our
+    inputs are ULIDs (uppercase letters + digits) and UUIDs (hex + hyphens) — both pass
+    through this cleanly into a valid slug.
+    """
+    return "".join(c if c.isalnum() else "_" for c in component.lower())
 
 
 async def import_usage_statistics(

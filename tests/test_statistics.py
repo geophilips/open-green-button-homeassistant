@@ -54,3 +54,21 @@ def test_statistic_id_prefix_matches_all_ids_for_an_entry() -> None:
     assert statistic_id_for_series("entry_a", "up_2", "REVERSE").startswith(prefix)
     # …and crucially, *doesn't* catch a different entry's ids
     assert not statistic_id_for_series("entry_b", "up_1", "FORWARD").startswith(prefix)
+
+
+def test_statistic_id_slugifies_real_world_ulid_and_uuid_inputs() -> None:
+    """Real production inputs (HA ULID entry_id, ESPI UUID usage_point_id) must produce a
+    valid slug after the `:` — HA's external-statistics machinery rejects mixed case or
+    hyphens with "Invalid statistic_id", which kills async_setup_entry on first refresh.
+    """
+    sid = statistic_id_for_series(
+        "01KT5B7TVYNVZY86P0PH0EPTAB",  # ULID — uppercase + digits
+        "e082e9a9-390b-58fb-8ca5-4ee707c95652",  # UUID — hex + hyphens
+        "FORWARD",
+    )
+    # No uppercase letters, no hyphens, only [a-z0-9_:] anywhere in the id.
+    after_colon = sid.split(":", 1)[1]
+    assert all(c.isalnum() or c == "_" for c in after_colon), sid
+    assert after_colon.islower() or not any(c.isalpha() for c in after_colon), sid
+    # And the same entry id still produces the same prefix used by async_remove_entry.
+    assert sid.startswith(statistic_id_prefix_for_entry("01KT5B7TVYNVZY86P0PH0EPTAB"))
