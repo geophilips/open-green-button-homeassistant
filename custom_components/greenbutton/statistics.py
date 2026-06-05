@@ -137,7 +137,7 @@ async def _import_series(
     if not stats:
         return
 
-    _LOGGER.debug(
+    _LOGGER.info(
         "Importing %d statistic rows for %s (resume_from_sum=%.3f)",
         len(stats),
         statistic_id,

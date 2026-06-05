@@ -17,6 +17,7 @@ Behaviour summary:
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -25,10 +26,14 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import OpenGbApiError, OpenGbAuthExpiredError, UsageResponse
 from .const import (
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_LAST_FETCHED_AT,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    INITIAL_FETCH_LOOKBACK,
+    LAST_FETCHED_OVERLAP,
+    PUBLISHED_MAX_LOOKAHEAD,
 )
 from .statistics import import_usage_statistics
 
@@ -66,10 +71,23 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
 
     async def _async_update_data(self) -> UsageResponse:
         """Fetch, persist rotated credentials, then write statistics."""
+        now = datetime.now(UTC)
+        published_min = self._published_min(now)
+        published_max = now + PUBLISHED_MAX_LOOKAHEAD
+
+        _LOGGER.info(
+            "Fetching usage for entry %s with published-min=%s published-max=%s",
+            self.entry.entry_id,
+            published_min.isoformat(),
+            published_max.isoformat(),
+        )
+
         try:
             response = await self.api.fetch_usage(
                 encrypted_refresh_blob=self.entry.data[CONF_ENCRYPTED_REFRESH_BLOB],
                 proxy_token=self.entry.data[CONF_PROXY_TOKEN],
+                published_min=published_min,
+                published_max=published_max,
             )
         except OpenGbAuthExpiredError as err:
             # HA turns ConfigEntryAuthFailed into a persistent notification + reauth flow;
@@ -93,10 +111,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                     CONF_PROXY_TOKEN: response.new_credentials.proxy_token,
                 },
             )
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Persisted rotated credentials for entry %s",
                 self.entry.entry_id,
             )
+
+        total_readings = sum(len(s.readings) for up in response.usage_points for s in up.series)
+        _LOGGER.info(
+            "Fetched %d usage point(s) with %d total reading(s) for entry %s",
+            len(response.usage_points),
+            total_readings,
+            self.entry.entry_id,
+        )
 
         await import_usage_statistics(
             self.hass,
@@ -104,4 +130,43 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             response,
             utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
         )
+
+        # Record the success cutoff — read on the next refresh to scope `published-min`.
+        # Done LAST so a partial failure (stats write throwing) doesn't advance the cursor
+        # and leave a gap; better to re-fetch a window we've already imported (idempotent)
+        # than to skip a window we never wrote.
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_LAST_FETCHED_AT: datetime.now(UTC).isoformat()},
+        )
         return response
+
+    def _published_min(self, now: datetime) -> datetime:
+        """Return the `published_min` value to send on the next /proxy/usage call.
+
+        Always returns a concrete instant — never None. This is a deliberate workaround for
+        a quirk in the Green Button Alliance test-lab harness: when `published-min` and
+        `published-max` are both absent, it returns the usage feed without any IntervalBlock
+        entries (metadata only). Sending an explicit window forces the data path on.
+
+        On the first refresh (no recorded `last_fetched_at`) we look back five years —
+        comfortably wider than our requested 36-month `HistoryLength` so we collect whatever
+        the utility retains. Subsequent refreshes ask for the slice published since the last
+        successful fetch, minus a small overlap that absorbs clock skew and any
+        late-arriving corrections.
+        """
+        raw = self.entry.data.get(CONF_LAST_FETCHED_AT)
+        if raw is None:
+            return now - INITIAL_FETCH_LOOKBACK
+        try:
+            last_fetched = datetime.fromisoformat(raw)
+        except ValueError:
+            # Stored value is corrupt — drop back to a full refetch rather than silently
+            # losing the historical window.
+            _LOGGER.warning(
+                "%s in entry data is unparseable (%r); fetching full history",
+                CONF_LAST_FETCHED_AT,
+                raw,
+            )
+            return now - INITIAL_FETCH_LOOKBACK
+        return last_fetched - LAST_FETCHED_OVERLAP

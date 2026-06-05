@@ -8,6 +8,7 @@ mode, when to persist rotated credentials, etc.).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
@@ -70,10 +71,25 @@ async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) ->
     ) as import_mock:
         await coordinator.async_refresh()
 
-    api.fetch_usage.assert_awaited_once_with(
-        encrypted_refresh_blob="original_blob",
-        proxy_token="original_token",  # noqa: S106
+    # Both window params are always set — sending neither makes the GBA test-lab harness
+    # omit IntervalBlocks. On a first refresh (no CONF_LAST_FETCHED_AT), published_min looks
+    # back INITIAL_FETCH_LOOKBACK (5 years); published_max is always now + a small buffer.
+    api.fetch_usage.assert_awaited_once()
+    call = api.fetch_usage.await_args
+    assert call.kwargs["encrypted_refresh_blob"] == "original_blob"
+    assert call.kwargs["proxy_token"] == "original_token"  # noqa: S105
+
+    from custom_components.greenbutton.const import (
+        INITIAL_FETCH_LOOKBACK,
+        PUBLISHED_MAX_LOOKAHEAD,
     )
+
+    now = datetime.now(UTC)
+    expected_min = now - INITIAL_FETCH_LOOKBACK
+    expected_max = now + PUBLISHED_MAX_LOOKAHEAD
+    # Tolerate the few seconds of clock drift between the coordinator and the assertion.
+    assert abs((call.kwargs["published_min"] - expected_min).total_seconds()) < 60
+    assert abs((call.kwargs["published_max"] - expected_max).total_seconds()) < 60
     import_mock.assert_awaited_once()
     call_args = import_mock.await_args
     assert call_args.args[1] is entry

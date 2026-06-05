@@ -55,6 +55,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))
+    _LOGGER.info(
+        "Set up Open Green Button entry %s for utility %s",
+        entry.entry_id,
+        entry.data.get("utility_id"),
+    )
     return True
 
 
