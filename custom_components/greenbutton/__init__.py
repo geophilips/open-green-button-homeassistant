@@ -77,12 +77,12 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     the integration UI but show up in DevTools → Statistics and pollute the dashboard.
     """
     prefix = statistic_id_prefix_for_entry(entry.entry_id)
-    # ``async_list_statistic_ids`` is a ``@callback`` (sync, called from async context) and
-    # takes no `statistic_source` kwarg — we list everything the recorder knows about and
-    # filter to the stats we own by (a) source == DOMAIN and (b) id starts with our prefix.
-    # The source check is the load-bearing one; the prefix check guards against future
-    # additions where we might emit multiple sources from one integration.
-    all_ids = async_list_statistic_ids(hass)
+    # `async_list_statistic_ids` is `async def` (returns a coroutine, not @callback) — and it
+    # takes no `statistic_source` kwarg, so we filter to ours after listing everything the
+    # recorder knows about. The source check is the load-bearing one; the prefix check
+    # guards against future additions where we might emit multiple sources from one
+    # integration.
+    all_ids = await async_list_statistic_ids(hass)
     owned = [
         item["statistic_id"]
         for item in all_ids
