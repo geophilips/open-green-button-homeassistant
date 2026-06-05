@@ -35,6 +35,16 @@ if TYPE_CHECKING:
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 
+# `mean_type` replaces `has_mean` in HA core ≥ 2025.6; the legacy field becomes a hard
+# requirement to omit at 2026.11. Import lazily so this module still loads on an HA core
+# that predates the enum — if the import fails we'll keep emitting `has_mean=False` only.
+try:
+    from homeassistant.components.recorder.models import StatisticMeanType
+
+    _MEAN_TYPE_NONE = StatisticMeanType.NONE
+except ImportError:  # pragma: no cover — older HA core, drop-through to has_mean only
+    _MEAN_TYPE_NONE = None
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -125,6 +135,11 @@ async def _import_series(
         "statistic_id": statistic_id,
         "unit_of_measurement": unit,
     }
+    # New typed field added in HA core ≥ 2025.6; mean_type replaces has_mean. We keep
+    # has_mean for compatibility with HA installs older than that. StatisticMeanType.NONE
+    # is the correct value for energy/volume statistics (we only carry `sum`, no mean).
+    if _MEAN_TYPE_NONE is not None:
+        metadata["mean_type"] = _MEAN_TYPE_NONE
 
     resume_from_sum, resume_after_epoch = await _resume_point(hass, statistic_id)
 
