@@ -14,7 +14,7 @@ the id format — never construct one ad-hoc elsewhere.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from homeassistant.components.recorder.statistics import (
@@ -145,6 +145,7 @@ async def _import_series(
         "source": DOMAIN,
         "statistic_id": statistic_id,
         "unit_of_measurement": unit,
+        "unit_class": _ha_unit_class_for(series.reading_type),
     }
     # New typed field added in HA core ≥ 2025.6; mean_type replaces has_mean. We keep
     # has_mean for compatibility with HA installs older than that. StatisticMeanType.NONE
@@ -204,12 +205,25 @@ async def _import_cost_summaries(
 ) -> None:
     """Write a cumulative-cost statistic from this UsagePoint's BillingSummary entries.
 
-    HA's Energy dashboard pairs an energy stat with a cost stat at config time — by emitting
-    a cost stat with the same entry+usage-point prefix, the user can wire it in alongside
-    the FORWARD energy stat to get the Cost column populated.
+    HA's Energy dashboard pairs an energy stat with a cost stat at config time, and reads
+    them at the *same* time-bucket granularity as the energy stat (hourly). A single-value
+    cost stat at billing_period_start would show non-zero for one hour and zero for every
+    other hour — which is exactly the "shows as zero" symptom users see.
 
-    Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary to
-    accounts they bill; meter-only test profiles often won't), or when the currency code
+    Instead, we distribute each billing-period total across the hours within that period
+    in proportion to that hour's consumption:
+
+        cost_at_hour_h = period_total_cost × (kwh_h / total_kwh_in_period)
+
+    This gives a per-hour cost that the dashboard aggregates into daily/monthly views
+    correctly, and matches the way a utility actually bills (you pay for the energy you
+    used, and a higher-consumption hour incurs more of the period's total cost). Real-world
+    accuracy depends on whether the utility's pricing is flat or TOU; the test lab is
+    flat, Burlington production uses TOU which we'd want richer cost-detail handling for
+    (future work).
+
+    Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary
+    to accounts they bill; meter-only test profiles often won't), or when the currency code
     isn't one we have an ISO 4217 alpha mapping for.
     """
     if not up.summaries:
@@ -233,27 +247,52 @@ async def _import_cost_summaries(
         "source": DOMAIN,
         "statistic_id": statistic_id,
         "unit_of_measurement": currency_alpha,
+        # Currency unit class isn't a registered BaseUnitConverter in HA — explicit `None`
+        # satisfies the 2026.11 unit_class-required check without claiming a conversion
+        # family that doesn't exist for monetary values.
+        "unit_class": None,
     }
     if _MEAN_TYPE_NONE is not None:
         metadata["mean_type"] = _MEAN_TYPE_NONE
+
+    # Gather all FORWARD-flow energy readings on this UsagePoint, indexed by start, in kWh.
+    # REVERSE flow (solar export) isn't part of consumption cost — utilities credit it back
+    # under a separate accounting that doesn't go through UsageSummary's billLastPeriod.
+    forward_readings: list[tuple[datetime, float]] = []
+    for series in up.series:
+        if series.reading_type.flow_direction != "FORWARD":
+            continue
+        for reading in series.readings:
+            forward_readings.append((
+                _align_to_hour(reading.start),
+                _to_ha_units(reading.value, series.reading_type),
+            ))
+    if not forward_readings:
+        return
+    forward_readings.sort(key=lambda x: x[0])
 
     resume_from_sum, resume_after_epoch = await _resume_point(hass, statistic_id)
 
     stats: list[StatisticData] = []
     running = resume_from_sum
-    # Summaries are already sorted by billing_period_start (the parser does this); the
-    # explicit sort here is belt-and-suspenders.
     for summary in sorted(up.summaries, key=lambda s: s.billing_period_start):
-        period_start = _align_to_hour(summary.billing_period_start)
-        if resume_after_epoch is not None and period_start.timestamp() <= resume_after_epoch:
-            continue
         period_cost = summary.total_cost
         if period_cost == 0:
             # Test-lab fixtures often have $0 placeholders — skip rather than emit a
-            # cumulative-flat row that confuses the dashboard.
+            # cumulative-flat row across an entire month.
             continue
-        running += period_cost
-        stats.append(StatisticData(start=period_start, state=running, sum=running))
+        period_start = summary.billing_period_start
+        period_end = period_start + timedelta(seconds=summary.billing_period_duration_seconds)
+        in_period = [(s, k) for (s, k) in forward_readings if period_start <= s < period_end]
+        total_period_kwh = sum(k for (_, k) in in_period)
+        if total_period_kwh <= 0:
+            continue
+        rate = period_cost / total_period_kwh
+        for hour_start, kwh in in_period:
+            if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
+                continue
+            running += kwh * rate
+            stats.append(StatisticData(start=hour_start, state=running, sum=running))
 
     if not stats:
         return
@@ -298,6 +337,21 @@ def _ha_unit_for(reading_type: NormalizedReadingType) -> str | None:
         return UnitOfEnergy.KILO_WATT_HOUR  # We convert Wh → kWh below.
     if reading_type.unit_of_measure == "CUBIC_METERS":
         return UnitOfVolume.CUBIC_METERS
+    return None
+
+
+def _ha_unit_class_for(reading_type: NormalizedReadingType) -> str | None:
+    """Return the HA `unit_class` matching the series's normalized unit.
+
+    HA's recorder uses unit_class to know which `BaseUnitConverter` family the statistic
+    belongs to (and therefore which units it can convert between in the UI). The class names
+    are the strings on each subclass's `UNIT_CLASS` attribute in `util.unit_conversion`.
+    Missing the field is a deprecation that becomes a hard requirement in 2026.11.
+    """
+    if reading_type.unit_of_measure == "WATT_HOURS":
+        return "energy"
+    if reading_type.unit_of_measure == "CUBIC_METERS":
+        return "volume"
     return None
 
 
