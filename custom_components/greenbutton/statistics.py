@@ -254,12 +254,14 @@ async def _import_cost_summaries(
         "source": DOMAIN,
         "statistic_id": statistic_id,
         "unit_of_measurement": currency_alpha,
-        # "monetary" mirrors `SensorDeviceClass.MONETARY` — the device class HA uses for
-        # currency-valued sensors. There's no MonetaryConverter in `util.unit_conversion`,
-        # but the Energy dashboard's cost-stat picker filters by *unit_class* as well as
-        # by unit, and a `None` here is excluded by the filter; "monetary" lights the stat
-        # up in the dashboard while still satisfying the 2026.11 required-field check.
-        "unit_class": "monetary",
+        # HA's recorder validates `unit_class` against the registered `BaseUnitConverter`
+        # families in `util.unit_conversion`. There's no MonetaryConverter (you can't
+        # convert CAD ↔ USD via a fixed-ratio table), so anything besides None throws
+        # `Unsupported unit_class: '<value>'` at metadata validation. None is the
+        # well-formed answer for currency stats — the 2026.11 deprecation warning still
+        # fires for it, but the warning isn't a hard error and HA hasn't introduced a
+        # monetary class to migrate to yet. Revisit when HA adds one.
+        "unit_class": None,
     }
     if _MEAN_TYPE_NONE is not None:
         metadata["mean_type"] = _MEAN_TYPE_NONE
