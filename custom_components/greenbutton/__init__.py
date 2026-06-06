@@ -91,18 +91,19 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     if not owned:
         return
 
-    # async_clear_statistics is recorder-internal; import lazily so the recorder import
-    # cost lands only when removing an entry.
-    from homeassistant.components.recorder import get_instance
-    from homeassistant.components.recorder.statistics import async_clear_statistics
-
     _LOGGER.info(
         "Purging %d statistic(s) for removed entry %s: %s",
         len(owned),
         entry.entry_id,
         owned,
     )
-    await get_instance(hass).async_add_executor_job(async_clear_statistics, hass, owned)
+    # `Recorder.async_clear_statistics` is a `@callback` on the recorder instance — schedule
+    # the delete on the recorder's worker thread by calling it from the event loop. It's not
+    # a standalone module-level function, and wrapping it in `async_add_executor_job` would
+    # both (a) bypass the recorder's queueing and (b) call a callback off the event loop.
+    from homeassistant.components.recorder import get_instance
+
+    get_instance(hass).async_clear_statistics(owned)
 
 
 async def _async_reload_on_update(hass: HomeAssistant, entry: ConfigEntry) -> None:
