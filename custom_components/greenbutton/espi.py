@@ -17,9 +17,10 @@ What's parsed:
   - IntervalBlock (interval + repeated IntervalReading children)
   - ReadingType (commodity / flowDirection / accumulationBehaviour / intervalLength /
                  uom / powerOfTenMultiplier / currency)
+  - UsageSummary (billing-period total + per-line-item cost breakdown for the Energy
+                  dashboard's Cost column — see [statistics._import_cost_summaries])
 
 What's deliberately ignored (this round):
-  - UsageSummary (cost data — future enhancement)
   - LocalTimeParameters (HA uses its own configured TZ)
   - Customer-namespace payloads (not needed for the Energy dashboard)
 """
@@ -248,9 +249,7 @@ def _classify_entry(
         up_id_from_related = _related_id(entry, "espi-entry/UsagePoint", "UsagePoint")
         summary = _parse_usage_summary(payload)
         if summary is not None:
-            summaries.append(
-                _RawUsageSummary(usage_point_id=up_id_from_related, summary=summary)
-            )
+            summaries.append(_RawUsageSummary(usage_point_id=up_id_from_related, summary=summary))
 
 
 def _parse_usage_summary(payload: ET.Element) -> BillingSummary | None:
@@ -278,8 +277,7 @@ def _parse_usage_summary(payload: ET.Element) -> BillingSummary | None:
         bill_last_period_raw=_int_text(payload.find(_TAG_BILL_LAST_PERIOD)),
         cost_additional_last_period_raw=_int_text(payload.find(_TAG_COST_ADDITIONAL_LAST_PERIOD)),
         cost_details=[
-            _parse_cost_detail(d)
-            for d in payload.findall(_TAG_COST_ADDITIONAL_DETAIL_LAST_PERIOD)
+            _parse_cost_detail(d) for d in payload.findall(_TAG_COST_ADDITIONAL_DETAIL_LAST_PERIOD)
         ],
         currency_numeric_code=currency,
     )
@@ -385,8 +383,7 @@ def _assemble(
         # its own.
         fallback_currency = currency_by_up.get(up_id)
         summaries = [
-            _with_currency_default(s, fallback_currency)
-            for s in summaries_by_up.get(up_id, [])
+            _with_currency_default(s, fallback_currency) for s in summaries_by_up.get(up_id, [])
         ]
         summaries.sort(key=lambda s: s.billing_period_start)
         out.append(

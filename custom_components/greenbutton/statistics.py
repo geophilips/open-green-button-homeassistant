@@ -270,10 +270,12 @@ async def _import_cost_summaries(
         if series.reading_type.flow_direction != "FORWARD":
             continue
         for reading in series.readings:
-            forward_readings.append((
-                _align_to_hour(reading.start),
-                _to_ha_units(reading.value, series.reading_type),
-            ))
+            forward_readings.append(
+                (
+                    _align_to_hour(reading.start),
+                    _to_ha_units(reading.value, series.reading_type),
+                )
+            )
     if not forward_readings:
         return
     forward_readings.sort(key=lambda x: x[0])
