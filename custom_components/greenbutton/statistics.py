@@ -254,10 +254,12 @@ async def _import_cost_summaries(
         "source": DOMAIN,
         "statistic_id": statistic_id,
         "unit_of_measurement": currency_alpha,
-        # Currency unit class isn't a registered BaseUnitConverter in HA — explicit `None`
-        # satisfies the 2026.11 unit_class-required check without claiming a conversion
-        # family that doesn't exist for monetary values.
-        "unit_class": None,
+        # "monetary" mirrors `SensorDeviceClass.MONETARY` — the device class HA uses for
+        # currency-valued sensors. There's no MonetaryConverter in `util.unit_conversion`,
+        # but the Energy dashboard's cost-stat picker filters by *unit_class* as well as
+        # by unit, and a `None` here is excluded by the filter; "monetary" lights the stat
+        # up in the dashboard while still satisfying the 2026.11 required-field check.
+        "unit_class": "monetary",
     }
     if _MEAN_TYPE_NONE is not None:
         metadata["mean_type"] = _MEAN_TYPE_NONE
