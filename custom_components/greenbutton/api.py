@@ -18,6 +18,7 @@ credentials back into the config entry when present.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -25,6 +26,10 @@ from typing import Any
 import aiohttp
 
 from .const import API_VERSION
+
+# An async callable that receives raw upstream XML bytes and persists them somewhere.
+# The bytes are released as soon as the call returns — no caller holds a reference.
+RawXmlSink = Callable[[bytes], Awaitable[None]]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -228,6 +233,7 @@ class OpenGbApi:
         proxy_token: str,
         published_min: datetime | None = None,
         published_max: datetime | None = None,
+        raw_xml_sink: RawXmlSink | None = None,
     ) -> UsageResponse:
         """Pull a window of usage data from the proxy.
 
@@ -242,6 +248,11 @@ class OpenGbApi:
                 Serialized to ISO 8601 with `Z` suffix on the wire (the format
                 Burlington Hydro's test-lab harness requires).
             published_max: optional ESPI `published-max` filter — same constraints.
+            raw_xml_sink: optional async callback invoked with the raw response body
+                bytes between the read and the parse. Used by the coordinator to persist
+                the body to disk for diagnostics — passed in (instead of returned on
+                [UsageResponse]) so the bytes can be garbage-collected as soon as parsing
+                finishes. No memory residency beyond a single request.
 
         Raises:
             OpenGbAuthExpiredError: utility refused our refresh token (HTTP 401 with
@@ -277,7 +288,14 @@ class OpenGbApi:
             xml_bytes = await resp.read()
             new_credentials = _new_credentials_from_headers(resp.headers)
 
+        if raw_xml_sink is not None:
+            # Persist before parsing so a parse-failure path still leaves a debuggable
+            # artifact on disk (which is useful for figuring out *why* it failed).
+            await raw_xml_sink(xml_bytes)
+
         updated, usage_points = parse_usage_feed(xml_bytes)
+        # xml_bytes goes out of scope here; the only persistent copy is whatever the sink
+        # decided to do with it (default: nothing).
         return UsageResponse(
             updated=updated,
             usage_points=usage_points,

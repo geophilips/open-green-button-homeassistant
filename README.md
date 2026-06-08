@@ -79,6 +79,37 @@ The venv at `.venv/` is auto-activated when you `cd` into the repo.
 - Push-based delivery (ESPI FB_39 NotificationURI) instead of polling, once a real utility supports it
 - Additional utilities — [open an issue](https://github.com/rocketraman/open-green-button-homeassistant/issues) with your provider's name
 
+## Debugging
+
+If something looks off (cost showing zero, readings missing, parser surprised by a utility's quirk), the integration ships a diagnostics export that surfaces the relevant signals in one click.
+
+**Settings → Devices & Services → Open Green Button → ⋮ → Download Diagnostics**
+
+You'll get a JSON file containing:
+
+- Redacted config-entry data (no refresh tokens or proxy tokens leak)
+- Coordinator state (last refresh result, scan interval)
+- Parsed last-response summary — usage points, series counts, **billing summaries with full cost-detail breakdown**
+- The raw ESPI XML from the most recent upstream fetch, **if** debug logging is enabled
+
+To capture the raw XML for offline analysis:
+
+1. **Enable debug logging** — the integration's ⋮ menu has an "Enable debug logging" toggle. Or add to `configuration.yaml`:
+   ```yaml
+   logger:
+     logs:
+       custom_components.greenbutton: debug
+   ```
+2. Wait for the next refresh (or reload the integration to force one).
+3. **Download Diagnostics** — the resulting JSON has an `raw_xml` field with the full upstream feed.
+4. Extract it with `jq`:
+   ```sh
+   jq -r '.raw_xml' diagnostics-greenbutton-*.json > usage.xml
+   xmllint --format usage.xml | less
+   ```
+
+XML is cached on disk (in HA's `.storage` directory) rather than held in memory — so even multi-MB feeds don't bloat the running integration. The cache is overwritten on every debug-enabled refresh and removed when the config entry is removed.
+
 ## Contributing
 
 Issues and PRs welcome. For substantial features, open an issue first so we can talk through the approach.

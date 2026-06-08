@@ -27,6 +27,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import OpenGbApi
 from .const import CONF_SERVER_BASE_URL, DEFAULT_SERVER_BASE_URL, DOMAIN
 from .coordinator import GreenButtonCoordinator
+from .diagnostics import async_remove_xml_cache
 from .statistics import statistic_id_prefix_for_entry
 
 if TYPE_CHECKING:
@@ -88,6 +89,11 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         for item in all_ids
         if item.get("source") == DOMAIN and item["statistic_id"].startswith(prefix)
     ]
+    # Drop any cached debug XML for this entry regardless of whether the entry has stats
+    # to clear — happens before the stats purge so a stats-purge exception doesn't strand
+    # the file on disk.
+    await async_remove_xml_cache(hass, entry.entry_id)
+
     if not owned:
         return
 

@@ -17,6 +17,7 @@ Behaviour summary:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,7 @@ from .const import (
     PUBLISHED_MAX_LOOKAHEAD,
 )
 from .statistics import import_usage_statistics
+from .storage import xml_cache_path
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -43,7 +45,18 @@ if TYPE_CHECKING:
 
     from .api import OpenGbApi
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger(__package__)
+
+
+def _write_xml_sync(path: str, data: bytes) -> None:
+    """Synchronous file write executed off the event loop via `async_add_executor_job`."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Write to a temp file + atomic rename so a half-written cache from a crash mid-write
+    # doesn't fool the diagnostics handler into reading garbage.
+    tmp = f"{path}.tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
 
 
 class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
@@ -82,12 +95,20 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             published_max.isoformat(),
         )
 
+        # Persist the raw upstream XML to disk only when debug logging is enabled on our
+        # domain — keeps the integration's normal memory + disk footprint negligible while
+        # giving operators a one-toggle path to capture the bytes for diagnostics. The sink
+        # is invoked between read and parse inside `fetch_usage`, then the bytes drop out
+        # of scope: no in-memory cache.
+        raw_xml_sink = self._make_raw_xml_sink_if_debug()
+
         try:
             response = await self.api.fetch_usage(
                 encrypted_refresh_blob=self.entry.data[CONF_ENCRYPTED_REFRESH_BLOB],
                 proxy_token=self.entry.data[CONF_PROXY_TOKEN],
                 published_min=published_min,
                 published_max=published_max,
+                raw_xml_sink=raw_xml_sink,
             )
         except OpenGbAuthExpiredError as err:
             # HA turns ConfigEntryAuthFailed into a persistent notification + reauth flow;
@@ -140,6 +161,24 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             data={**self.entry.data, CONF_LAST_FETCHED_AT: datetime.now(UTC).isoformat()},
         )
         return response
+
+    def _make_raw_xml_sink_if_debug(self):
+        """Return a sink that writes the raw upstream XML to disk, or None.
+
+        Gating is `_LOGGER.isEnabledFor(DEBUG)` for `custom_components.greenbutton` — the
+        same toggle that flips when the user enables debug logging on the integration in
+        the UI (Settings → Devices & Services → ⋮ → Enable debug logging). When debug is
+        off we return None so [api.fetch_usage] skips the IO entirely.
+        """
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return None
+        path = xml_cache_path(self.hass, self.entry.entry_id)
+
+        async def sink(data: bytes) -> None:
+            await self.hass.async_add_executor_job(_write_xml_sync, path, data)
+            _LOGGER.debug("Persisted %d bytes of raw upstream XML to %s", len(data), path)
+
+        return sink
 
     def _published_min(self, now: datetime) -> datetime:
         """Return the `published_min` value to send on the next /proxy/usage call.
