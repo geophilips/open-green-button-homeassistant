@@ -25,6 +25,7 @@ MOCK_CLAIM_RESPONSE = {
     "subscriptionUri": "https://utility.example/Subscription/42",
     "scope": "FB=1_3_4_5;IntervalDuration=3600",
     "currentApiVersion": "2026-05-22",
+    "initialHistorySeconds": 2 * 365 * 86400,  # 2 years, as the server now supplies
 }
 
 PROXY_USAGE_URL = f"{SERVER_BASE_URL}/proxy/usage"

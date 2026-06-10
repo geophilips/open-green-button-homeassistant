@@ -73,7 +73,7 @@ async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) ->
 
     # Both window params are always set — sending neither makes the GBA test-lab harness
     # omit IntervalBlocks. On a first refresh (no CONF_LAST_FETCHED_AT), published_min looks
-    # back INITIAL_FETCH_LOOKBACK (5 years); published_max is always now + a small buffer.
+    # back INITIAL_FETCH_LOOKBACK (2 years); published_max is always now + a small buffer.
     api.fetch_usage.assert_awaited_once()
     call = api.fetch_usage.await_args
     assert call.kwargs["encrypted_refresh_blob"] == "original_blob"

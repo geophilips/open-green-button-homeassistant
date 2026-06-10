@@ -11,10 +11,13 @@ DOMAIN = "greenbutton"
 # idempotent on (statistic_id, hour) so duplicates are harmless.
 LAST_FETCHED_OVERLAP = timedelta(days=1)
 
-# How far back to look on the first fetch (no recorded `last_fetched_at`). Our requested
-# scope is 36 months of history (HistoryLength=94608000 in utilities.conf); 5 years gives
-# headroom for utilities that retain longer histories.
-INITIAL_FETCH_LOOKBACK = timedelta(days=5 * 365)
+# Fallback for how far back to look on the first fetch (no recorded `last_fetched_at`). The
+# authoritative, per-utility window comes from the server in the claim response and is stored
+# as `CONF_INITIAL_HISTORY_SECONDS`; this constant is used ONLY when that value is absent —
+# e.g. entries created before the server exposed it, or a self-hosted server that doesn't. It
+# is deliberately NOT the source of truth (see the server's per-utility `initialHistory`), so
+# the backfill window isn't configured in two places.
+INITIAL_FETCH_LOOKBACK = timedelta(days=2 * 365)
 
 # Small forward buffer added to `published_max` to absorb clock skew between us and the
 # utility — a meter reading published at `now()` on the utility's clock might be a few
@@ -44,6 +47,12 @@ CONF_SUBSCRIPTION_URI = "subscription_uri"
 CONF_SCOPE = "scope"
 CONF_API_VERSION = "api_version"
 CONF_LAST_IMPORTED = "last_imported"
+
+# Per-utility initial-backfill window, in seconds, as supplied by the server in the claim
+# response (`initialHistorySeconds`). The coordinator uses this to compute `published-min` on
+# the first fetch. Absent on entries created before the server exposed it → coordinator falls
+# back to INITIAL_FETCH_LOOKBACK. (Re-authorizing an existing entry refreshes this value.)
+CONF_INITIAL_HISTORY_SECONDS = "initial_history_seconds"
 
 # UTC ISO 8601 timestamp of the most recent successful /proxy/usage call. The coordinator
 # uses this to scope subsequent requests via ESPI's `published-min` query param — first

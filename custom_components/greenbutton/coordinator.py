@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -27,6 +27,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import OpenGbApiError, OpenGbAuthExpiredError, UsageResponse
 from .const import (
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_INITIAL_HISTORY_SECONDS,
     CONF_LAST_FETCHED_AT,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_NAME,
@@ -188,15 +189,15 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         `published-max` are both absent, it returns the usage feed without any IntervalBlock
         entries (metadata only). Sending an explicit window forces the data path on.
 
-        On the first refresh (no recorded `last_fetched_at`) we look back five years —
-        comfortably wider than our requested 36-month `HistoryLength` so we collect whatever
-        the utility retains. Subsequent refreshes ask for the slice published since the last
-        successful fetch, minus a small overlap that absorbs clock skew and any
-        late-arriving corrections.
+        On the first refresh (no recorded `last_fetched_at`) we look back by the per-utility
+        initial-history window the server supplied in the claim response — a bounded initial
+        import that keeps the utility's data-collection job and our statistics write
+        manageable. Subsequent refreshes ask for the slice published since the last successful
+        fetch, minus a small overlap that absorbs clock skew and any late-arriving corrections.
         """
         raw = self.entry.data.get(CONF_LAST_FETCHED_AT)
         if raw is None:
-            return now - INITIAL_FETCH_LOOKBACK
+            return now - self._initial_lookback()
         try:
             last_fetched = datetime.fromisoformat(raw)
         except ValueError:
@@ -207,5 +208,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 CONF_LAST_FETCHED_AT,
                 raw,
             )
-            return now - INITIAL_FETCH_LOOKBACK
+            return now - self._initial_lookback()
         return last_fetched - LAST_FETCHED_OVERLAP
+
+    def _initial_lookback(self) -> timedelta:
+        """How far back to backfill on the first fetch.
+
+        Prefers the per-utility window the server supplied in the claim response (stored as
+        `CONF_INITIAL_HISTORY_SECONDS`); falls back to `INITIAL_FETCH_LOOKBACK` only when that
+        value is missing or non-positive (entries created before the server exposed it, or a
+        self-hosted server that doesn't). The server is the single source of truth.
+        """
+        secs = self.entry.data.get(CONF_INITIAL_HISTORY_SECONDS)
+        if isinstance(secs, (int, float)) and secs > 0:
+            return timedelta(seconds=secs)
+        return INITIAL_FETCH_LOOKBACK

@@ -12,6 +12,7 @@ from custom_components.greenbutton.const import (
     CONF_API_VERSION,
     CONF_CLAIM_CODE,
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_INITIAL_HISTORY_SECONDS,
     CONF_PROXY_TOKEN,
     CONF_SCOPE,
     CONF_SERVER_BASE_URL,
@@ -76,6 +77,7 @@ async def test_user_flow_happy_path(
     assert data[CONF_SUBSCRIPTION_URI] == MOCK_CLAIM_RESPONSE["subscriptionUri"]
     assert data[CONF_SCOPE] == MOCK_CLAIM_RESPONSE["scope"]
     assert data[CONF_API_VERSION] == MOCK_CLAIM_RESPONSE["currentApiVersion"]
+    assert data[CONF_INITIAL_HISTORY_SECONDS] == MOCK_CLAIM_RESPONSE["initialHistorySeconds"]
 
 
 async def test_user_flow_strips_whitespace_in_claim_code(

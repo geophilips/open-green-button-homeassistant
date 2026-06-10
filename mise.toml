@@ -1,13 +1,18 @@
 # Toolchain + Python venv config. Auto-activates when you cd into the repo.
 #
 # Setup from a clean checkout:
-#   mise trust            # one-time
-#   mise install          # installs Python 3.13, auto-creates .venv
-#   pip install -r requirements_test.txt
+#   mise trust                              # one-time
+#   mise install                            # installs Python 3.13 + uv, creates .venv
+#   mise exec -- uv pip install -r requirements_test.txt
 #
-# The venv lives at .venv/ (ignored by .gitignore).
+# The venv lives at .venv/ (ignored by .gitignore). mise creates it with uv, so it is a bare
+# venv with NO pip — always install with `uv pip install` (or `python -m pip` after
+# `python -m ensurepip`), never a bare `pip`. See CLAUDE.md for the full rationale.
 
 [tools]
+# uv listed before python so its bin dir wins on PATH — the python install ships a stray `uv`
+# binary that would otherwise shadow the pinned version.
+uv = "0.11.19"
 python = "3.13"
 
 [env]

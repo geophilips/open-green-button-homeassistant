@@ -52,6 +52,9 @@ class ClaimResponse:
     subscription_uri: str | None
     scope: str | None
     current_api_version: str
+    # Per-utility initial-backfill window in seconds. Older servers omit it → None, and the
+    # coordinator falls back to its local default.
+    initial_history_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +228,7 @@ class OpenGbApi:
             subscription_uri=payload.get("subscriptionUri"),
             scope=payload.get("scope"),
             current_api_version=payload["currentApiVersion"],
+            initial_history_seconds=payload.get("initialHistorySeconds"),
         )
 
     async def fetch_usage(
