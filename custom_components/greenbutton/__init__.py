@@ -94,6 +94,12 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     # the file on disk.
     await async_remove_xml_cache(hass, entry.entry_id)
 
+    # Drop any background-load repair issue this entry raised — HA doesn't auto-clear custom
+    # integration issues on entry removal, so it would otherwise linger in Settings → Repairs.
+    from homeassistant.helpers import issue_registry as ir
+
+    ir.async_delete_issue(hass, DOMAIN, f"background_load_{entry.entry_id}")
+
     if not owned:
         return
 

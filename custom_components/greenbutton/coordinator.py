@@ -24,8 +24,14 @@ from typing import TYPE_CHECKING
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import OpenGbApiError, OpenGbAuthExpiredError, UsageResponse
+from .api import (
+    OpenGbApiError,
+    OpenGbAuthExpiredError,
+    OpenGbDataPendingError,
+    UsageResponse,
+)
 from .const import (
+    BACKGROUND_LOAD_ISSUE_URL,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_INITIAL_HISTORY_SECONDS,
     CONF_LAST_FETCHED_AT,
@@ -116,6 +122,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             # the user re-authorizes through the existing config flow, which updates the
             # blob/token via _update_existing_entry().
             raise ConfigEntryAuthFailed(str(err)) from err
+        except OpenGbDataPendingError as err:
+            # The utility is assembling a large dataset out-of-band (ESPI async batch). We
+            # don't implement the Notification/BatchList retrieval flow yet, so raise a repair
+            # issue linking to the tracking GitHub issue and ask the (rare) affected user to
+            # comment — then fail this refresh so the entry shows as failed. Must be caught
+            # BEFORE OpenGbApiError, of which it is a subclass.
+            self._async_create_background_load_issue()
+            raise UpdateFailed(str(err)) from err
         except OpenGbApiError as err:
             raise UpdateFailed(str(err)) from err
         except (TimeoutError, ConnectionError) as err:
@@ -153,6 +167,10 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
         )
 
+        # A successful fetch means we're no longer blocked on an async background load — clear
+        # any background-load repair issue raised by a previous poll (no-op if none exists).
+        self._async_clear_background_load_issue()
+
         # Record the success cutoff — read on the next refresh to scope `published-min`.
         # Done LAST so a partial failure (stats write throwing) doesn't advance the cursor
         # and leave a gap; better to re-fetch a window we've already imported (idempotent)
@@ -162,6 +180,39 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             data={**self.entry.data, CONF_LAST_FETCHED_AT: datetime.now(UTC).isoformat()},
         )
         return response
+
+    @property
+    def _background_load_issue_id(self) -> str:
+        """Stable repair-issue id for this entry's async background-load condition."""
+        return f"background_load_{self.entry.entry_id}"
+
+    def _async_create_background_load_issue(self) -> None:
+        """Raise a (non-fixable) repair issue pointing at the background-load tracking issue.
+
+        The issue carries `learn_more_url` so HA renders a "Learn more" link straight to the
+        GitHub issue, and the description asks the user to comment with their utility/details.
+        We don't implement the async batch flow yet, so this is the user-facing surface for it.
+        """
+        from homeassistant.helpers import issue_registry as ir
+
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self._background_load_issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="background_load_unsupported",
+            translation_placeholders={
+                "utility": self.entry.data.get(CONF_UTILITY_NAME, "your utility"),
+            },
+            learn_more_url=BACKGROUND_LOAD_ISSUE_URL,
+        )
+
+    def _async_clear_background_load_issue(self) -> None:
+        """Delete the background-load repair issue for this entry (no-op if absent)."""
+        from homeassistant.helpers import issue_registry as ir
+
+        ir.async_delete_issue(self.hass, DOMAIN, self._background_load_issue_id)
 
     def _make_raw_xml_sink_if_debug(self):
         """Return a sink that writes the raw upstream XML to disk, or None.

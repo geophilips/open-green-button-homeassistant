@@ -18,6 +18,7 @@ from custom_components.greenbutton.api import (
     OpenGbApi,
     OpenGbApiError,
     OpenGbAuthExpiredError,
+    OpenGbDataPendingError,
 )
 
 from .const import (
@@ -197,3 +198,18 @@ async def test_fetch_usage_treats_5xx_as_generic_error(
     with pytest.raises(OpenGbApiError) as exc_info:
         await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
     assert not isinstance(exc_info.value, OpenGbAuthExpiredError)
+
+
+async def test_fetch_usage_translates_202_to_data_pending_exception(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """202 utility_data_pending (async batch) → OpenGbDataPendingError, distinct from a 5xx.
+
+    The coordinator keys on this to raise a background-load repair issue rather than treat it
+    as a transient upstream failure.
+    """
+    aioclient_mock.post(PROXY_USAGE_URL, status=202, json={"error": "utility_data_pending"})
+
+    with pytest.raises(OpenGbDataPendingError):
+        await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106

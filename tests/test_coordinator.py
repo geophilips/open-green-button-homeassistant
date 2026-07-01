@@ -141,6 +141,67 @@ async def test_generic_api_error_becomes_update_failed(hass: HomeAssistant) -> N
         await coordinator._async_update_data()
 
 
+async def test_data_pending_raises_repair_issue_and_update_failed(hass: HomeAssistant) -> None:
+    """A 202 (async background load) → UpdateFailed + a non-fixable repair issue with the link.
+
+    We don't support the ESPI async batch flow yet, so the only user-facing behaviour is a
+    repair issue pointing at the tracking GitHub issue; the entry then fails this refresh.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+    from custom_components.greenbutton.const import BACKGROUND_LOAD_ISSUE_URL
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("data pending (202)"),
+    )
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ) as import_mock,
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    import_mock.assert_not_awaited()
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
+    assert issue is not None
+    assert issue.is_fixable is False
+    assert issue.severity == ir.IssueSeverity.ERROR
+    assert issue.learn_more_url == BACKGROUND_LOAD_ISSUE_URL
+    assert issue.translation_placeholders == {"utility": "Burlington Hydro"}
+
+
+async def test_successful_refresh_clears_background_load_issue(hass: HomeAssistant) -> None:
+    """Once a fetch succeeds, any previously-raised background-load issue is cleared."""
+    from homeassistant.helpers import issue_registry as ir
+
+    entry = _entry(hass)
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    # Pre-seed the issue as if a prior poll had hit a 202.
+    coordinator._async_create_background_load_issue()
+    assert (
+        ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is not None
+    )
+
+    coordinator.api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is None
+
+
 async def test_rotated_credentials_are_persisted_before_stats_import(
     hass: HomeAssistant,
 ) -> None:

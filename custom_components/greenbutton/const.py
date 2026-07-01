@@ -32,6 +32,16 @@ DEFAULT_SCAN_INTERVAL = timedelta(hours=6)
 # server_base_url in entry.data.
 DEFAULT_SERVER_BASE_URL = "https://api.opengreenbutton.org"
 
+# GitHub issue tracking "background data loads". Some utilities answer the initial request
+# asynchronously (ESPI async batch: HTTP 202 "data is being collected, available later") when
+# the dataset is very large. We don't implement that Notification/BatchList retrieval flow
+# yet, so when the integration hits a 202 it raises a repair issue linking here and asks the
+# affected user to comment with their utility + details — so we can implement and verify the
+# flow against a real dataset rather than speculatively. See coordinator background-load issue.
+BACKGROUND_LOAD_ISSUE_URL = (
+    "https://github.com/rocketraman/open-green-button-homeassistant/issues/1"
+)
+
 # Stripe-style API version this client was built against. Sent as OpenGB-Api-Version on every
 # request. When the server bumps its API, this constant moves with the integration version.
 API_VERSION = "2026-05-22"

@@ -35,5 +35,11 @@
       "unknown_utility": "The selected utility is no longer available.",
       "reauth_successful": "Re-authorization complete."
     }
+  },
+  "issues": {
+    "background_load_unsupported": {
+      "title": "{utility} is sending a large background data load we can't import yet",
+      "description": "{utility} answered the initial data request asynchronously (HTTP 202 — \"the data is being collected and will be available later\"), which only happens for very large datasets. Open Green Button doesn't support this background-delivery flow yet, so importing is paused for this account and the entry will keep failing until it's implemented.\n\nYou're one of the first to hit this. Please use the **Learn more** link below to open the tracking issue on GitHub and add a comment with: your utility/energy provider and region, roughly how much history you were importing, and whether this is a residential or commercial account. With a real example we can implement and verify the fix."
+    }
   }
 }

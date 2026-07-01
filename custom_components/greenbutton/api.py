@@ -183,6 +183,17 @@ class OpenGbAuthExpiredError(OpenGbApiError):
     """
 
 
+class OpenGbDataPendingError(OpenGbApiError):
+    """The utility is preparing the data asynchronously (ESPI async batch — HTTP 202).
+
+    The proxy surfaces this as ``utility_data_pending`` (HTTP 202) when the utility answers
+    the batch request with "data is being collected, available later" — which only happens
+    for very large datasets. We don't implement the Notification/BatchList retrieval flow
+    yet, so the coordinator maps this to a repair issue (with a link to the tracking GitHub
+    issue) instead of treating it as a transient ``UpdateFailed``.
+    """
+
+
 class OpenGbApi:
     """Async client for the Open Green Button proxy server."""
 
@@ -285,6 +296,18 @@ class OpenGbApi:
                         "Utility refresh token expired; user must re-authorize",
                     )
                 raise OpenGbApiError(f"POST /proxy/usage returned 401 ({error_code}): {text[:200]}")
+            if resp.status == 202:
+                # The proxy passes the utility's 202 Accepted through as `utility_data_pending`:
+                # the dataset is large enough that the utility is assembling it out-of-band
+                # (ESPI async batch). We don't implement the Notification/BatchList retrieval
+                # flow yet, so raise a distinct error the coordinator turns into a repair issue.
+                text = await resp.text()
+                error_code = _safe_json_error(text)
+                raise OpenGbDataPendingError(
+                    "Utility is preparing data asynchronously (HTTP 202, "
+                    f"{error_code or 'utility_data_pending'}); background data loads are not "
+                    "yet supported",
+                )
             if resp.status != 200:
                 text = await resp.text()
                 raise OpenGbApiError(f"POST /proxy/usage returned {resp.status}: {text[:200]}")
