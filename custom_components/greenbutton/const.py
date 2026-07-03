@@ -6,6 +6,14 @@ from datetime import timedelta
 
 DOMAIN = "greenbutton"
 
+# Service that purges an entry's imported statistics and re-downloads + recomputes them from
+# a full history re-fetch — the supported way to pick up a calculation-logic change (e.g. a
+# cost fix) without removing the entry and redoing the OAuth authorization.
+SERVICE_REBUILD_STATISTICS = "rebuild_statistics"
+# Optional service field: which config entry to rebuild (via HA's config_entry selector).
+# Omitted → rebuild every loaded Open Green Button entry.
+ATTR_CONFIG_ENTRY_ID = "config_entry_id"
+
 # How far back to overlap the window when re-fetching. Generous to absorb clock skew between
 # us and the utility, and to forgive late-arriving corrections. The statistics writer is
 # idempotent on (statistic_id, hour) so duplicates are harmless.

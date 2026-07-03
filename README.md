@@ -33,6 +33,22 @@ Copy `custom_components/greenbutton/` into your Home Assistant config directory 
 
 The integration writes hourly consumption data into the HA Energy dashboard's long-term statistics.
 
+## Recomputing statistics after an update
+
+Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values. To rebuild them without removing the integration (and without redoing the Green Button authorization), run the **Rebuild statistics** action:
+
+**Developer Tools → Actions → “Open Green Button: Rebuild statistics” → Perform action.**
+
+Or in YAML:
+
+```yaml
+action: greenbutton.rebuild_statistics
+data:
+  config_entry_id: <your entry>   # optional — omit to rebuild every configured account
+```
+
+It deletes that account's imported energy and cost statistics, then re-downloads and recomputes the full history from scratch. Because it pulls the entire initial-history window, it puts the same load on your utility as a fresh setup — run it when you need it, not on a schedule. If the re-fetch fails partway (network/utility hiccup), the statistics simply repopulate on the next successful 6-hour poll or the next rebuild.
+
 ## Supported utilities
 
 See the [current utility status](https://github.com/rocketraman/open-green-button#status) on the proxy server for the up-to-date list of supported and in-progress utilities.

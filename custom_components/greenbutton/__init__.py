@@ -21,18 +21,28 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from homeassistant.components.recorder.statistics import async_list_statistic_ids
+import voluptuous as vol
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import OpenGbApi
-from .const import CONF_SERVER_BASE_URL, DEFAULT_SERVER_BASE_URL, DOMAIN
+from .const import (
+    ATTR_CONFIG_ENTRY_ID,
+    CONF_SERVER_BASE_URL,
+    DEFAULT_SERVER_BASE_URL,
+    DOMAIN,
+    SERVICE_REBUILD_STATISTICS,
+)
 from .coordinator import GreenButtonCoordinator
 from .diagnostics import async_remove_xml_cache
-from .statistics import statistic_id_prefix_for_entry
+from .statistics import async_clear_statistics_for_entry
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import HomeAssistant, ServiceCall
+
+_REBUILD_STATISTICS_SCHEMA = vol.Schema({vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.string})
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,12 +66,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))
+    _async_register_services(hass)
     _LOGGER.info(
         "Set up Open Green Button entry %s for utility %s",
         entry.entry_id,
         entry.data.get("utility_id"),
     )
     return True
+
+
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Register integration-wide services once (idempotent across multiple entries).
+
+    Services are global, not per-entry, so the first entry to set up registers them and later
+    entries no-op. We deliberately don't deregister on unload: HA services normally persist
+    for the integration's lifetime, and the handler already validates targets at call time.
+    """
+    if hass.services.has_service(DOMAIN, SERVICE_REBUILD_STATISTICS):
+        return
+
+    async def _handle_rebuild_statistics(call: ServiceCall) -> None:
+        entry_id = call.data.get(ATTR_CONFIG_ENTRY_ID)
+        coordinators: dict[str, GreenButtonCoordinator] = hass.data.get(DOMAIN, {})
+        if entry_id is not None:
+            coordinator = coordinators.get(entry_id)
+            if coordinator is None:
+                raise ServiceValidationError(
+                    f"No loaded Open Green Button account with config entry id {entry_id!r}"
+                )
+            targets = [coordinator]
+        else:
+            targets = list(coordinators.values())
+            if not targets:
+                raise ServiceValidationError("No loaded Open Green Button accounts to rebuild")
+        for coordinator in targets:
+            await coordinator.async_rebuild_statistics()
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REBUILD_STATISTICS,
+        _handle_rebuild_statistics,
+        schema=_REBUILD_STATISTICS_SCHEMA,
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -77,18 +123,6 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     the rows in ``statistics`` / ``statistics_meta`` indefinitely — they're invisible to
     the integration UI but show up in DevTools → Statistics and pollute the dashboard.
     """
-    prefix = statistic_id_prefix_for_entry(entry.entry_id)
-    # `async_list_statistic_ids` is `async def` (returns a coroutine, not @callback) — and it
-    # takes no `statistic_source` kwarg, so we filter to ours after listing everything the
-    # recorder knows about. The source check is the load-bearing one; the prefix check
-    # guards against future additions where we might emit multiple sources from one
-    # integration.
-    all_ids = await async_list_statistic_ids(hass)
-    owned = [
-        item["statistic_id"]
-        for item in all_ids
-        if item.get("source") == DOMAIN and item["statistic_id"].startswith(prefix)
-    ]
     # Drop any cached debug XML for this entry regardless of whether the entry has stats
     # to clear — happens before the stats purge so a stats-purge exception doesn't strand
     # the file on disk.
@@ -100,22 +134,14 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
     ir.async_delete_issue(hass, DOMAIN, f"background_load_{entry.entry_id}")
 
-    if not owned:
-        return
-
-    _LOGGER.info(
-        "Purging %d statistic(s) for removed entry %s: %s",
-        len(owned),
-        entry.entry_id,
-        owned,
-    )
-    # `Recorder.async_clear_statistics` is a `@callback` on the recorder instance — schedule
-    # the delete on the recorder's worker thread by calling it from the event loop. It's not
-    # a standalone module-level function, and wrapping it in `async_add_executor_job` would
-    # both (a) bypass the recorder's queueing and (b) call a callback off the event loop.
-    from homeassistant.components.recorder import get_instance
-
-    get_instance(hass).async_clear_statistics(owned)
+    owned = await async_clear_statistics_for_entry(hass, entry.entry_id)
+    if owned:
+        _LOGGER.info(
+            "Purged %d statistic(s) for removed entry %s: %s",
+            len(owned),
+            entry.entry_id,
+            owned,
+        )
 
 
 async def _async_reload_on_update(hass: HomeAssistant, entry: ConfigEntry) -> None:

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
+    async_list_statistic_ids,
     get_last_statistics,
 )
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
@@ -90,6 +91,32 @@ def statistic_id_prefix_for_entry(entry_id: str) -> str:
     [statistic_id_for_series] so the format (and the slugification) only live in one place.
     """
     return f"{DOMAIN}:{_slugify(entry_id)}_"
+
+
+async def async_clear_statistics_for_entry(hass: HomeAssistant, entry_id: str) -> list[str]:
+    """Delete every long-term statistic owned by one config entry; return the ids cleared.
+
+    Shared by ``async_remove_entry`` (teardown) and the ``rebuild_statistics`` service
+    (purge-before-reimport), so the "which ids belong to this entry" rule lives in one place
+    next to [statistic_id_for_series] / [statistic_id_prefix_for_entry].
+
+    ``async_list_statistic_ids`` is ``async`` (not a ``@callback``) and takes no source
+    filter, so we list everything the recorder knows and filter to our source + this entry's
+    prefix. The source check is the load-bearing one; the prefix keeps us from touching a
+    sibling entry's rows. ``Recorder.async_clear_statistics`` is a ``@callback`` that queues
+    the delete on the recorder's worker thread — call it from the event loop, never wrap it in
+    an executor job (that would bypass the recorder queue and run a callback off-loop).
+    """
+    prefix = statistic_id_prefix_for_entry(entry_id)
+    all_ids = await async_list_statistic_ids(hass)
+    owned = [
+        item["statistic_id"]
+        for item in all_ids
+        if item.get("source") == DOMAIN and item["statistic_id"].startswith(prefix)
+    ]
+    if owned:
+        get_instance(hass).async_clear_statistics(owned)
+    return owned
 
 
 def _slugify(component: str) -> str:

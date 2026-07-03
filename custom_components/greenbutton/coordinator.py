@@ -43,7 +43,7 @@ from .const import (
     LAST_FETCHED_OVERLAP,
     PUBLISHED_MAX_LOOKAHEAD,
 )
-from .statistics import import_usage_statistics
+from .statistics import async_clear_statistics_for_entry, import_usage_statistics
 from .storage import xml_cache_path
 
 if TYPE_CHECKING:
@@ -88,6 +88,10 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         )
         self.api = api
         self.entry = entry
+        # One-shot flag set by [async_rebuild_statistics] so the next fetch backfills the full
+        # initial-history window instead of the incremental slice since `last_fetched_at`.
+        # Consumed in [_published_min]; cleared after a successful import.
+        self._force_full_history = False
 
     async def _async_update_data(self) -> UsageResponse:
         """Fetch, persist rotated credentials, then write statistics."""
@@ -179,7 +183,51 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self.entry,
             data={**self.entry.data, CONF_LAST_FETCHED_AT: datetime.now(UTC).isoformat()},
         )
+        # A full-history rebuild has now landed; revert to incremental polling.
+        self._force_full_history = False
         return response
+
+    async def async_rebuild_statistics(self) -> None:
+        """Purge this entry's imported statistics and rebuild them from a full re-fetch.
+
+        The supported recovery path when a calculation change (e.g. the cost fix) means the
+        already-stored rows are wrong — without making the user remove the entry and redo the
+        OAuth authorization. Steps, in order:
+
+          1. Clear this entry's energy + cost statistics.
+          2. Block until the recorder has committed the delete. The per-series resume point
+             ([statistics._resume_point]) reads the last stored cumulative sum on a separate
+             DB executor thread; if we re-imported before the clear committed, it could resume
+             on top of the stale totals we're trying to discard.
+          3. Force the next fetch to span the full initial-history window, then refresh.
+
+        Raises:
+            HomeAssistantError: the rebuild fetch failed (network / upstream / reauth). The
+                purge has already happened, so the next scheduled poll — or another call to
+                this service — will repopulate the statistics.
+        """
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.exceptions import HomeAssistantError
+
+        cleared = await async_clear_statistics_for_entry(self.hass, self.entry.entry_id)
+        _LOGGER.info(
+            "Rebuild for entry %s: cleared %d statistic(s); re-fetching full history",
+            self.entry.entry_id,
+            len(cleared),
+        )
+        await get_instance(self.hass).async_block_till_done()
+
+        self._force_full_history = True
+        # async_refresh() swallows update errors into `last_update_success`; surface a failed
+        # rebuild to the service caller instead of silently leaving the entry empty.
+        await self.async_refresh()
+        if not self.last_update_success:
+            raise HomeAssistantError(
+                f"Rebuild fetch failed for entry {self.entry.entry_id}: "
+                f"{self.last_exception}. Statistics were cleared and will repopulate on the "
+                "next successful poll."
+            )
+        _LOGGER.info("Rebuild complete for entry %s", self.entry.entry_id)
 
     @property
     def _background_load_issue_id(self) -> str:
@@ -240,12 +288,15 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         `published-max` are both absent, it returns the usage feed without any IntervalBlock
         entries (metadata only). Sending an explicit window forces the data path on.
 
-        On the first refresh (no recorded `last_fetched_at`) we look back by the per-utility
-        initial-history window the server supplied in the claim response — a bounded initial
-        import that keeps the utility's data-collection job and our statistics write
-        manageable. Subsequent refreshes ask for the slice published since the last successful
-        fetch, minus a small overlap that absorbs clock skew and any late-arriving corrections.
+        On the first refresh (no recorded `last_fetched_at`) — or a rebuild, which sets
+        `_force_full_history` — we look back by the per-utility initial-history window the
+        server supplied in the claim response: a bounded initial import that keeps the
+        utility's data-collection job and our statistics write manageable. Subsequent refreshes
+        ask for the slice published since the last successful fetch, minus a small overlap that
+        absorbs clock skew and any late-arriving corrections.
         """
+        if self._force_full_history:
+            return now - self._initial_lookback()
         raw = self.entry.data.get(CONF_LAST_FETCHED_AT)
         if raw is None:
             return now - self._initial_lookback()

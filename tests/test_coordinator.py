@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -26,10 +26,12 @@ from custom_components.greenbutton.api import (
 )
 from custom_components.greenbutton.const import (
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_LAST_FETCHED_AT,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_ID,
     CONF_UTILITY_NAME,
     DOMAIN,
+    INITIAL_FETCH_LOOKBACK,
 )
 from custom_components.greenbutton.coordinator import GreenButtonCoordinator
 
@@ -240,3 +242,76 @@ async def test_rotated_credentials_are_persisted_before_stats_import(
     assert observed == {"blob": "rotated_blob", "token": "rotated_token"}
     assert entry.data[CONF_ENCRYPTED_REFRESH_BLOB] == "rotated_blob"
     assert entry.data[CONF_PROXY_TOKEN] == "rotated_token"
+
+
+async def test_rebuild_purges_then_refetches_full_history(hass: HomeAssistant) -> None:
+    """Rebuild clears the entry's stats, then re-fetches the FULL window (ignoring the cursor).
+
+    A stored `last_fetched_at` would normally scope the next fetch to a small incremental
+    slice — the rebuild must override that and pull the whole initial-history window so the
+    recomputed statistics cover all history, not just since the last poll.
+    """
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    # Simulate an established entry mid-way through incremental polling.
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_LAST_FETCHED_AT: "2026-06-01T00:00:00+00:00"},
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.async_clear_statistics_for_entry",
+            new=AsyncMock(return_value=[f"{DOMAIN}:x_cost", f"{DOMAIN}:x_forward"]),
+        ) as clear_mock,
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ) as import_mock,
+    ):
+        await coordinator.async_rebuild_statistics()
+
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    api.fetch_usage.assert_awaited_once()
+    import_mock.assert_awaited_once()
+
+    # published_min looks back the full initial window, NOT to the 2026-06-01 cursor.
+    now = datetime.now(UTC)
+    expected_min = now - INITIAL_FETCH_LOOKBACK
+    published_min = api.fetch_usage.await_args.kwargs["published_min"]
+    assert abs((published_min - expected_min).total_seconds()) < 120
+
+    # The one-shot flag is cleared after success → the next scheduled poll is incremental again.
+    assert coordinator._force_full_history is False
+
+
+async def test_rebuild_raises_when_refetch_fails_but_still_purged(hass: HomeAssistant) -> None:
+    """If the re-fetch fails, the purge already happened and the caller gets a clear error.
+
+    The service surfaces this to the user; the stats then repopulate on the next successful
+    poll (or another rebuild). We assert both: the purge ran, and the error propagates.
+    """
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(side_effect=OpenGbApiError("upstream 502"))  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.async_clear_statistics_for_entry",
+            new=AsyncMock(return_value=[f"{DOMAIN}:x_cost"]),
+        ) as clear_mock,
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ) as import_mock,
+        pytest.raises(HomeAssistantError),
+    ):
+        await coordinator.async_rebuild_statistics()
+
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    import_mock.assert_not_awaited()  # fetch failed before the import step
