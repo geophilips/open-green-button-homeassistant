@@ -112,6 +112,8 @@ XML is cached on disk (in HA's `.storage` directory) rather than held in memory 
 
 Issues and PRs welcome. For substantial features, open an issue first so we can talk through the approach.
 
+Questions or feedback? [Discuss this add-on on the Home Assistant Community forum](https://community.home-assistant.io/t/utility-energy-data-integration-via-green-button-connect/1016031).
+
 If this integration is useful to you and you want to help keep it maintained and the proxy server hosted:
 
 - [GitHub Sponsors](https://github.com/sponsors/rocketraman)
