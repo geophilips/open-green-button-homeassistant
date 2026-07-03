@@ -85,11 +85,11 @@ The venv at `.venv/` is auto-activated when you `cd` into the repo.
 - OAuth authorization against the proxy server, with refresh-token rotation handled automatically
 - Polls the proxy every 6 hours and writes hourly consumption into the Energy dashboard's long-term statistics via [`async_add_external_statistics`](https://developers.home-assistant.io/docs/core/entity/sensor#statistics-imported-from-external-sources)
 - Reauth flow surfaces as an HA notification when the utility revokes our refresh token
+- Imports per-billing-period cost from ESPI `UsageSummary` blocks into the Energy dashboard's Cost column, with Ontario time-of-use distribution
 
 **Pending**
 
 - First-utility production credentials — currently in test-lab certification with the Green Button Alliance (see [utility status](https://github.com/rocketraman/open-green-button#status))
-- Cost data from ESPI `UsageSummary` blocks — the proxy already parses these, the statistics writer doesn't import them yet
 - Push-based delivery (ESPI FB_39 NotificationURI) instead of polling, once a real utility supports it
 - Additional utilities — [request a new utility](https://github.com/rocketraman/open-green-button/issues/new?template=new-utility-request.md) with your provider's name
 
