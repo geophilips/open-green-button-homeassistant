@@ -6,10 +6,32 @@ where a recorder is wired up; these focus on the pure-function bits that don't n
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+from custom_components.greenbutton.api import BillingSummary
 from custom_components.greenbutton.statistics import (
+    _select_billing_summaries,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
 )
+
+_DAY = 86400
+
+
+def _summary(start: datetime, duration_days: int, total_dollars: float) -> BillingSummary:
+    """Build a BillingSummary whose total_cost is `total_dollars` (via billLastPeriod)."""
+    return BillingSummary(
+        billing_period_start=start,
+        billing_period_duration_seconds=duration_days * _DAY,
+        bill_last_period_raw=round(total_dollars * 100_000),
+        cost_additional_last_period_raw=0,
+        cost_details=[],
+        currency_numeric_code=124,
+    )
+
+
+_APR2 = datetime(2026, 4, 2, tzinfo=UTC)
+_MAY4 = datetime(2026, 5, 4, tzinfo=UTC)
 
 
 def test_statistic_id_is_scoped_per_entry() -> None:
@@ -72,3 +94,53 @@ def test_statistic_id_slugifies_real_world_ulid_and_uuid_inputs() -> None:
     assert after_colon.islower() or not any(c.isalpha() for c in after_colon), sid
     # And the same entry id still produces the same prefix used by async_remove_entry.
     assert sid.startswith(statistic_id_prefix_for_entry("01KT5B7TVYNVZY86P0PH0EPTAB"))
+
+
+def test_select_summaries_drops_exact_duplicate_period() -> None:
+    """A billing period repeated across the paginated feed must be costed once, not twice.
+
+    Two identical summaries → keeping both would double that period's cost in the Energy
+    dashboard (the regression this guards against).
+    """
+    a = _summary(_APR2, 32, 130.08)
+    b = _summary(_APR2, 32, 130.08)
+    selected = _select_billing_summaries([a, b])
+    assert len(selected) == 1
+    assert selected[0].total_cost == 130.08
+
+
+def test_select_summaries_drops_overlapping_rollup() -> None:
+    """A coarse rollup that spans a per-bill period is dropped in favor of the specific one.
+
+    This is the multi-fold inflation case: a 12-month rollup laid over the current bill's
+    hours would add its whole total on top of the per-bill total.
+    """
+    per_bill = _summary(_APR2, 32, 130.08)
+    rollup = _summary(datetime(2025, 6, 1, tzinfo=UTC), 365, 1500.0)
+    selected = _select_billing_summaries([rollup, per_bill])
+    assert selected == [per_bill]
+
+
+def test_select_summaries_keeps_consecutive_periods() -> None:
+    """Back-to-back real billing periods share only their boundary instant → both kept.
+
+    The interval check is half-open, so May 4 belongs to the second period only and the two
+    never register as overlapping.
+    """
+    first = _summary(_APR2, 32, 130.08)  # Apr 2 → May 4
+    second = _summary(_MAY4, 30, 118.0)  # May 4 → Jun 3
+    selected = _select_billing_summaries([second, first])
+    assert selected == [first, second]  # returned in billing-period order
+
+
+def test_select_summaries_prefers_real_bill_over_zero_placeholder() -> None:
+    """When a $0 placeholder duplicates a real bill's period, keep the real one.
+
+    Same period + same (shortest) duration → the tie is broken by higher total_cost so the
+    real bill wins and its cost isn't silently dropped.
+    """
+    placeholder = _summary(_APR2, 32, 0.0)
+    real = _summary(_APR2, 32, 130.08)
+    selected = _select_billing_summaries([placeholder, real])
+    assert len(selected) == 1
+    assert selected[0].total_cost == 130.08

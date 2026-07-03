@@ -204,6 +204,58 @@ def _stat_display_name(
     return f"{utility_display_name} · {up.service_kind.title()} {flow} ({short_id})"
 
 
+def _select_billing_summaries(summaries: list[BillingSummary]) -> list[BillingSummary]:
+    """Pick a non-overlapping, deduplicated set of summaries, in billing-period order.
+
+    A single ESPI feed frequently carries more than one ``UsageSummary`` covering the same
+    hours — exact duplicates repeated across the paginated feed, and/or rollup summaries at a
+    coarser granularity (e.g. a 12-month total alongside the per-bill totals). The cost
+    importer distributes each summary's *full* period total across its hours and **adds** the
+    result into one cumulative statistic, so any overlap multiplies the cost the Energy
+    dashboard shows for those hours (a single duplicated bill doubles it; a handful of
+    overlapping rollups can inflate it several-fold) while leaving energy untouched.
+
+    We defend against that here by choosing a maximal non-overlapping subset:
+
+      - Shortest duration first, so the summary most specific to a single bill wins over a
+        rollup that spans it.
+      - Higher total cost breaks ties, so a real bill beats a $0 placeholder for the same
+        period (test-lab feeds emit those).
+      - A summary is dropped when its ``[start, end)`` window overlaps one already kept.
+
+    Consecutive real billing periods share only their boundary instant, which is half-open
+    here, so they never collide — only genuine duplicates and coarser rollups get dropped.
+    """
+    # Shortest-first, then earliest, then most-expensive — see docstring for the rationale.
+    ordered = sorted(
+        summaries,
+        key=lambda s: (
+            s.billing_period_duration_seconds,
+            s.billing_period_start,
+            -s.total_cost,
+        ),
+    )
+    accepted: list[BillingSummary] = []
+    accepted_intervals: list[tuple[datetime, datetime]] = []
+    for summary in ordered:
+        start = summary.billing_period_start
+        end = start + timedelta(seconds=summary.billing_period_duration_seconds)
+        if any(start < a_end and a_start < end for a_start, a_end in accepted_intervals):
+            _LOGGER.debug(
+                "Dropping overlapping billing summary %s (+%ds, total_cost=%.2f) — its hours "
+                "are already costed by a more specific summary",
+                start.isoformat(),
+                summary.billing_period_duration_seconds,
+                summary.total_cost,
+            )
+            continue
+        accepted.append(summary)
+        accepted_intervals.append((start, end))
+
+    accepted.sort(key=lambda s: s.billing_period_start)
+    return accepted
+
+
 async def _import_cost_summaries(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -288,7 +340,7 @@ async def _import_cost_summaries(
 
     stats: list[StatisticData] = []
     running = resume_from_sum
-    for summary in sorted(up.summaries, key=lambda s: s.billing_period_start):
+    for summary in _select_billing_summaries(up.summaries):
         period_cost = summary.total_cost
         if period_cost == 0:
             # Test-lab fixtures often have $0 placeholders — skip rather than emit a
