@@ -117,7 +117,7 @@ async def test_fetch_usage_passes_published_window(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,
 ) -> None:
-    """tz-aware datetimes → ISO 8601 with `Z` (the format Burlington's harness wants)."""
+    """tz-aware datetimes → ISO 8601 with `Z` (the format the test-lab harness wants)."""
     aioclient_mock.post(
         PROXY_USAGE_URL,
         content=MOCK_USAGE_XML,

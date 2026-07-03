@@ -6,9 +6,9 @@ On-Peak charges as separate `costAdditionalDetailLastPeriod` line items). For ea
 need to know which bucket it falls in so the right rate applies — which depends on the
 utility's jurisdiction. This module exposes one classifier per supported jurisdiction.
 
-Today: only the Ontario IESO schedule is implemented because Burlington Hydro is our only
-utility. When we onboard a US or other-Canadian utility, add a sibling classifier here and
-extend the dispatch to pick the right one per utility.
+Today: only the Ontario IESO schedule is implemented because every currently supported
+utility is on it. When we onboard a US or other-Canadian utility on a different schedule,
+add a sibling classifier here and extend the dispatch to pick the right one per utility.
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ def ontario_tou_bucket(dt: datetime) -> str:
     """Classify a tz-aware instant under Ontario's IESO TOU schedule.
 
     Returns one of [OFF_PEAK], [MID_PEAK], [ON_PEAK]. Holidays are off-peak per IESO rules
-    but this implementation doesn't yet carry a holiday calendar — fix when a real Burlington
-    customer reports a holiday-week cost discrepancy.
+    but this implementation doesn't yet carry a holiday calendar — fix when a real customer
+    reports a holiday-week cost discrepancy.
 
     Summer (May 1 - Oct 31) weekdays:
       - 11:00 - 17:00 → On-Peak

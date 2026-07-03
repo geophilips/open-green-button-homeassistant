@@ -2,7 +2,7 @@
 
 Bridges your utility's [Green Button](https://www.greenbuttondata.org/) (NAESB ESPI) energy data into the Home Assistant Energy dashboard via a stateless OAuth proxy.
 
-🚧 **Pre-alpha.** Burlington Hydro (Ontario, Canada) is the first targeted utility.
+🚧 **Pre-alpha.** See the [current utility status](https://github.com/rocketraman/open-green-button#status) for which utilities are supported or in progress.
 
 ## Privacy
 

@@ -39,10 +39,10 @@ if TYPE_CHECKING:
 def _entry_with_data(hass: HomeAssistant) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        title="Burlington Hydro",
+        title="Example Utility",
         data={
-            CONF_UTILITY_ID: "burlington_hydro",
-            CONF_UTILITY_NAME: "Burlington Hydro",
+            CONF_UTILITY_ID: "example_utility",
+            CONF_UTILITY_NAME: "Example Utility",
             CONF_ENCRYPTED_REFRESH_BLOB: "secret_blob_value",  # noqa: S106
             CONF_PROXY_TOKEN: "secret_proxy_token_value",  # noqa: S106
         },
@@ -119,7 +119,7 @@ async def test_diagnostics_redacts_credentials(hass: HomeAssistant) -> None:
     assert result["entry"]["data"][CONF_ENCRYPTED_REFRESH_BLOB] != "secret_blob_value"
     assert result["entry"]["data"][CONF_PROXY_TOKEN] != "secret_proxy_token_value"  # noqa: S105
     # Non-sensitive fields stay intact.
-    assert result["entry"]["data"][CONF_UTILITY_ID] == "burlington_hydro"
+    assert result["entry"]["data"][CONF_UTILITY_ID] == "example_utility"
 
 
 async def test_diagnostics_summarizes_response_with_cost_details(hass: HomeAssistant) -> None:

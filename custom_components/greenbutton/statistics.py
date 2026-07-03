@@ -226,7 +226,7 @@ async def _import_cost_summaries(
     correctly, and matches the way a utility actually bills (you pay for the energy you
     used, and a higher-consumption hour incurs more of the period's total cost). Real-world
     accuracy depends on whether the utility's pricing is flat or TOU; the test lab is
-    flat, Burlington production uses TOU which we'd want richer cost-detail handling for
+    flat, while production TOU pricing would want richer cost-detail handling
     (future work).
 
     Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary
@@ -381,7 +381,7 @@ def _cost_distribution_for_period(
 # more — leaving an unknown code unmapped is safe (we skip the cost stat rather than emit
 # one with a unit HA can't display).
 _ISO_4217_ALPHA: dict[int, str] = {
-    124: "CAD",  # Canada — Burlington Hydro, all Ontario utilities
+    124: "CAD",  # Canada — Ontario and other Canadian utilities
     840: "USD",  # United States
     978: "EUR",  # Eurozone
     826: "GBP",  # United Kingdom

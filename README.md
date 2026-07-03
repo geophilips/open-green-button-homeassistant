@@ -2,7 +2,7 @@
 
 Bridges your utility's [Green Button](https://www.greenbuttondata.org/) (NAESB ESPI) energy data into the Home Assistant Energy dashboard via a stateless OAuth proxy server.
 
-🚧 **Pre-alpha.** Burlington Hydro (Ontario, Canada) is the first targeted utility. Their Green Button review is in progress; the proxy server itself is hosted on Fly.io.
+🚧 **Pre-alpha.** See the [current utility status](https://github.com/rocketraman/open-green-button#status) for which utilities are supported or in progress; the proxy server itself is hosted on Fly.io.
 
 ## How it works
 
@@ -35,11 +35,9 @@ The integration writes hourly consumption data into the HA Energy dashboard's lo
 
 ## Supported utilities
 
-| Utility | Status |
-| --- | --- |
-| Burlington Hydro (Ontario, Canada) | Pre-launch — Green Button review in progress |
+See the [current utility status](https://github.com/rocketraman/open-green-button#status) on the proxy server for the up-to-date list of supported and in-progress utilities.
 
-Want your utility added? [Open an issue](https://github.com/rocketraman/open-green-button-homeassistant/issues) or check the [server-side configuration](https://github.com/rocketraman/open-green-button/blob/master/server/app/src/main/resources/utilities.conf).
+Want your utility added? [Request a new utility](https://github.com/rocketraman/open-green-button/issues/new?template=new-utility-request.md).
 
 ## Privacy
 
@@ -74,10 +72,10 @@ The venv at `.venv/` is auto-activated when you `cd` into the repo.
 
 **Pending**
 
-- Burlington Hydro production credentials — currently in test-lab certification with the Green Button Alliance
+- First-utility production credentials — currently in test-lab certification with the Green Button Alliance (see [utility status](https://github.com/rocketraman/open-green-button#status))
 - Cost data from ESPI `UsageSummary` blocks — the proxy already parses these, the statistics writer doesn't import them yet
 - Push-based delivery (ESPI FB_39 NotificationURI) instead of polling, once a real utility supports it
-- Additional utilities — [open an issue](https://github.com/rocketraman/open-green-button-homeassistant/issues) with your provider's name
+- Additional utilities — [request a new utility](https://github.com/rocketraman/open-green-button/issues/new?template=new-utility-request.md) with your provider's name
 
 ## Debugging
 

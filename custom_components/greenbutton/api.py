@@ -261,7 +261,7 @@ class OpenGbApi:
             proxy_token: persisted bearer token from the config entry.
             published_min: optional ESPI `published-min` filter — must be tz-aware.
                 Serialized to ISO 8601 with `Z` suffix on the wire (the format
-                Burlington Hydro's test-lab harness requires).
+                the Green Button test-lab harness requires).
             published_max: optional ESPI `published-max` filter — same constraints.
             raw_xml_sink: optional async callback invoked with the raw response body
                 bytes between the read and the parse. Used by the coordinator to persist

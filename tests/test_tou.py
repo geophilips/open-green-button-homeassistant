@@ -55,7 +55,7 @@ def test_weekends_always_off_peak() -> None:
 
 def test_cost_detail_note_to_bucket() -> None:
     """ESPI line-item notes map to canonical bucket names; non-TOU items → None."""
-    # Burlington Hydro's actual labels seen in the test-lab feed.
+    # Actual Ontario IESO labels seen in the test-lab feed.
     assert cost_detail_tou_bucket("Off Peak-Summer") == OFF_PEAK
     assert cost_detail_tou_bucket("Mid Peak-Summer") == MID_PEAK
     assert cost_detail_tou_bucket("On Peak-Summer") == ON_PEAK

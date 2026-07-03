@@ -12,14 +12,14 @@ def claim_url(code: str) -> str:
 
 
 MOCK_UTILITIES = [
-    {"id": "burlington_hydro", "displayName": "Burlington Hydro"},
+    {"id": "example_utility", "displayName": "Example Utility"},
     {"id": "pge", "displayName": "Pacific Gas & Electric"},
 ]
 
 VALID_CLAIM_CODE = "gb_live_abc123def456"
 
 MOCK_CLAIM_RESPONSE = {
-    "utilityId": "burlington_hydro",
+    "utilityId": "example_utility",
     "encryptedRefreshBlob": "AQABABCDEF==",
     "proxyToken": "proxy_token_xyz",
     "subscriptionUri": "https://utility.example/Subscription/42",

@@ -41,8 +41,8 @@ def _entry(hass: HomeAssistant) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
-            CONF_UTILITY_ID: "burlington_hydro",
-            CONF_UTILITY_NAME: "Burlington Hydro",
+            CONF_UTILITY_ID: "example_utility",
+            CONF_UTILITY_NAME: "Example Utility",
             CONF_ENCRYPTED_REFRESH_BLOB: "original_blob",
             CONF_PROXY_TOKEN: "original_token",
         },
@@ -94,7 +94,7 @@ async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) ->
     call_args = import_mock.await_args
     assert call_args.args[1] is entry
     assert call_args.args[2] is response
-    assert call_args.kwargs == {"utility_display_name": "Burlington Hydro"}
+    assert call_args.kwargs == {"utility_display_name": "Example Utility"}
     assert coordinator.last_exception is None
 
 
@@ -175,7 +175,7 @@ async def test_data_pending_raises_repair_issue_and_update_failed(hass: HomeAssi
     assert issue.is_fixable is False
     assert issue.severity == ir.IssueSeverity.ERROR
     assert issue.learn_more_url == BACKGROUND_LOAD_ISSUE_URL
-    assert issue.translation_placeholders == {"utility": "Burlington Hydro"}
+    assert issue.translation_placeholders == {"utility": "Example Utility"}
 
 
 async def test_successful_refresh_clears_background_load_issue(hass: HomeAssistant) -> None:

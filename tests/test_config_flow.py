@@ -53,24 +53,24 @@ async def test_user_flow_happy_path(
     assert result["step_id"] == "user"
 
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_UTILITY_ID: "burlington_hydro"}
+        result["flow_id"], {CONF_UTILITY_ID: "example_utility"}
     )
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "connect"
-    # Authorize URL is substituted into the description; the dropdown chose burlington_hydro
+    # Authorize URL is substituted into the description; the dropdown chose example_utility
     # so the link must reference it.
     placeholders = result["description_placeholders"]
-    assert "burlington_hydro" in placeholders["authorize_url"]
-    assert placeholders["utility_name"] == "Burlington Hydro"
+    assert "example_utility" in placeholders["authorize_url"]
+    assert placeholders["utility_name"] == "Example Utility"
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_CLAIM_CODE: VALID_CLAIM_CODE}
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == "Burlington Hydro"
+    assert result["title"] == "Example Utility"
     data = result["data"]
-    assert data[CONF_UTILITY_ID] == "burlington_hydro"
-    assert data[CONF_UTILITY_NAME] == "Burlington Hydro"
+    assert data[CONF_UTILITY_ID] == "example_utility"
+    assert data[CONF_UTILITY_NAME] == "Example Utility"
     assert data[CONF_SERVER_BASE_URL] == SERVER_BASE_URL
     assert data[CONF_ENCRYPTED_REFRESH_BLOB] == MOCK_CLAIM_RESPONSE["encryptedRefreshBlob"]
     assert data[CONF_PROXY_TOKEN] == MOCK_CLAIM_RESPONSE["proxyToken"]
@@ -92,7 +92,7 @@ async def test_user_flow_strips_whitespace_in_claim_code(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_UTILITY_ID: "burlington_hydro"}
+        result["flow_id"], {CONF_UTILITY_ID: "example_utility"}
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_CLAIM_CODE: f"  {VALID_CLAIM_CODE}  \n"}
@@ -140,7 +140,7 @@ async def test_connect_step_shows_invalid_or_expired_on_410(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_UTILITY_ID: "burlington_hydro"}
+        result["flow_id"], {CONF_UTILITY_ID: "example_utility"}
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_CLAIM_CODE: "gb_live_expired"}
@@ -162,7 +162,7 @@ async def test_connect_step_shows_cannot_connect_on_network_failure(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_UTILITY_ID: "burlington_hydro"}
+        result["flow_id"], {CONF_UTILITY_ID: "example_utility"}
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_CLAIM_CODE: VALID_CLAIM_CODE}
@@ -182,7 +182,7 @@ async def test_connect_step_rejects_empty_claim_code(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_UTILITY_ID: "burlington_hydro"}
+        result["flow_id"], {CONF_UTILITY_ID: "example_utility"}
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_CLAIM_CODE: "   "}
@@ -204,7 +204,7 @@ async def test_second_flow_for_same_account_aborts_already_configured(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_UTILITY_ID: "burlington_hydro"}
+        result["flow_id"], {CONF_UTILITY_ID: "example_utility"}
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_CLAIM_CODE: VALID_CLAIM_CODE}
@@ -217,7 +217,7 @@ async def test_second_flow_for_same_account_aborts_already_configured(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_UTILITY_ID: "burlington_hydro"}
+        result["flow_id"], {CONF_UTILITY_ID: "example_utility"}
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_CLAIM_CODE: "gb_live_another"}
@@ -238,7 +238,7 @@ async def fixture_config_entry(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
     result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_UTILITY_ID: "burlington_hydro"}
+        result["flow_id"], {CONF_UTILITY_ID: "example_utility"}
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_CLAIM_CODE: VALID_CLAIM_CODE}
