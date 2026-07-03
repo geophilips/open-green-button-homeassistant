@@ -90,6 +90,23 @@ class MeterReadingSeries:
     readings: list[UsageReading]
 
 
+# Normalized (lowercased, whitespace-collapsed) notes for UsageSummary detail lines that are
+# NOT this period's charges: running-balance bookkeeping and subtotals that already aggregate
+# the real charge lines. Summing these back in is what triples a bill. See
+# [CostDetail.is_period_charge].
+_NON_CHARGE_NOTES = frozenset(
+    {
+        "balance forward",
+        "payments received",
+        "new charges this period",
+        "total amount due",
+    }
+)
+# The subtotal line that states the period's own charges directly — preferred by
+# [BillingSummary.total_cost] over re-summing the component lines.
+_NEW_CHARGES_NOTE = "new charges this period"
+
+
 @dataclass(frozen=True, slots=True)
 class CostDetail:
     """One line item in a UsageSummary's cost breakdown.
@@ -108,6 +125,31 @@ class CostDetail:
     def amount(self) -> float:
         """Amount in currency units (e.g. dollars). Raw value divided by 100,000."""
         return self.amount_raw / 100_000.0
+
+    @property
+    def normalized_note(self) -> str:
+        """Lowercased, whitespace-collapsed note for label matching (``""`` when absent)."""
+        return " ".join(self.note.lower().split()) if self.note else ""
+
+    @property
+    def is_period_charge(self) -> bool:
+        """True when this line item is an actual charge for the period.
+
+        A UsageSummary's detail list mixes three kinds of line item and only the first is a
+        charge to be summed:
+
+          - **Real charges** — Off/Mid/On-Peak energy, Delivery, Regulatory, tax, rebates.
+          - **Running-balance bookkeeping** — "Balance Forward" / "Payments Received". These
+            are prior-invoice carry-over, not this period's consumption.
+          - **Subtotals** — "New Charges This Period" / "Total Amount Due", which *already*
+            aggregate the real charge lines.
+
+        Summing everything indiscriminately is what inflates a bill ~3× (the charges, plus
+        the New-Charges subtotal that equals them, plus the Total-Amount-Due subtotal that
+        equals them again) — see the Burlington Hydro feed. Excluding the bookkeeping and
+        subtotal notes leaves exactly the period's charges.
+        """
+        return self.normalized_note not in _NON_CHARGE_NOTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,16 +170,29 @@ class BillingSummary:
 
     @property
     def total_cost(self) -> float:
-        """Best-effort total cost in currency units.
+        """Best-effort total cost for *this billing period* in currency units.
 
-        Some utilities populate `billLastPeriod` with the grand total; others leave it 0
-        and only fill in the detail items. We prefer `billLastPeriod` when present and
-        positive, falling back to the sum of detail amounts.
+        Order of preference:
+
+        1. ``billLastPeriod`` when present and positive — some utilities put the grand total
+           here directly.
+        2. The utility's own "New Charges This Period" line item — the authoritative
+           per-period amount, and (unlike "Total Amount Due") independent of any balance
+           carried from a prior invoice.
+        3. The sum of genuine charge line items — everything except running-balance
+           bookkeeping and subtotals (see [`CostDetail.is_period_charge`]).
+
+        (2) and (3) agree on a well-formed feed; (2) is preferred because it's the utility's
+        stated number and avoids rounding drift across many tax/rebate lines. Naively summing
+        *all* details — the previous behaviour — triple-counts via the subtotal lines.
         """
         bill = (self.bill_last_period_raw or 0) / 100_000.0
         if bill > 0:
             return bill
-        return sum(d.amount for d in self.cost_details)
+        for detail in self.cost_details:
+            if detail.normalized_note == _NEW_CHARGES_NOTE and detail.amount_raw != 0:
+                return detail.amount
+        return sum(d.amount for d in self.cost_details if d.is_period_charge)
 
 
 @dataclass(frozen=True, slots=True)
