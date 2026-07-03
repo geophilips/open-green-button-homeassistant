@@ -2,9 +2,14 @@
 
 Regression coverage for the Burlington Hydro feed, whose UsageSummary detail list carries
 running-balance bookkeeping ("Balance Forward" / "Payments Received") and subtotal lines
-("New Charges This Period" / "Total Amount Due") alongside the real charges. Naively summing
-every detail triple-counts the bill (charges + New-Charges subtotal + Total-Amount-Due
-subtotal), which is exactly what inflated the Energy dashboard's cost ~3×.
+("New Charges This Period" / "Total Amount Due") alongside the real charges. Two failure modes
+seen in real data, both fixed by summing only the itemized charge lines:
+
+  - Naively summing *every* detail triple-counts the bill (charges + New-Charges subtotal +
+    Total-Amount-Due subtotal) — the first ~3× inflation we saw.
+  - On roughly every other bill the "New Charges This Period" / "Total Amount Due" subtotals
+    are themselves *corrupt* (stamped well above the itemized charges), so trusting them is
+    also wrong — the second inflation. Only the itemized lines are reliable.
 """
 
 from __future__ import annotations
@@ -34,10 +39,10 @@ def _summary(details: list[CostDetail], bill_last_period_raw: int = 0) -> Billin
     )
 
 
-# The real Apr 2 – May 4 2026 Burlington Hydro bill: energy (Off/Mid/On) = $130.08, full
-# period charges = $182.08, and the feed's carried balance of $241.84 cancels against an
-# equal payment. Summing every line yields $546.24 (~3×). The one authoritative number is
-# "New Charges This Period" = $182.08.
+# The real Apr 2 – May 4 2026 Burlington Hydro bill (a "clean" month, where the subtotal
+# happens to match): itemized charges sum to $182.08, the carried balance of $241.84 cancels
+# against an equal payment, and both subtotal lines also read $182.08. Summing every line
+# yields $546.24 (~3×).
 _BURLINGTON_APR_2026 = [
     _detail("Off Peak-Charge", 70.39),
     _detail("Mid Peak-Charge", 26.79),
@@ -52,13 +57,43 @@ _BURLINGTON_APR_2026 = [
     _detail("Total Amount Due", 182.08),
 ]
 
+# The real May 4 – Jun 2 2026 bill (a "corrupt" month): the itemized charges sum to $187.73
+# and the H.S.T. of $27.27 is 13% of the pre-rebate subtotal — internally consistent — but
+# the "New Charges This Period" / "Total Amount Due" subtotals are stamped $502.29, with no
+# line item for the $314.56 difference. total_cost must resolve to the itemized $187.73.
+_BURLINGTON_MAY_2026 = [
+    _detail("Off Peak-Charge", 75.04),
+    _detail("Mid Peak-Charge", 24.45),
+    _detail("On Peak-Charge", 35.43),
+    _detail("Delivery Charge", 68.52),
+    _detail("Regulatory charge", 6.31),
+    _detail("H.S.T.", 27.27),
+    _detail("Ontario Electricity Rebate", -49.29),
+    _detail("Balance Forward", 182.08),
+    _detail("Payments Received", -182.08),
+    _detail("New Charges This Period", 502.29),
+    _detail("Total Amount Due", 502.29),
+]
 
-def test_total_cost_uses_new_charges_not_the_triple_counted_sum() -> None:
-    """The whole point: a real Burlington bill resolves to its period charges, not ~3×."""
+
+def test_total_cost_sums_itemized_charges_not_the_triple_counted_sum() -> None:
+    """A clean Burlington bill resolves to its itemized period charges, not the ~3× sum."""
     summary = _summary(_BURLINGTON_APR_2026)
     assert round(summary.total_cost, 2) == 182.08
-    # And crucially NOT the naive sum-of-everything the old code produced.
+    # And crucially NOT the naive sum-of-everything the very first version produced.
     assert round(sum(d.amount for d in summary.cost_details), 2) == 546.24
+
+
+def test_total_cost_ignores_corrupt_new_charges_subtotal() -> None:
+    """When the feed's subtotal is inflated, total_cost trusts the itemized lines instead.
+
+    This is the second inflation: "New Charges This Period" reads $502.29 but the real,
+    itemized period charges are $187.73. Trusting the subtotal (the earlier fix) gave ~3.5×
+    the true daily cost in the dashboard.
+    """
+    summary = _summary(_BURLINGTON_MAY_2026)
+    assert round(summary.total_cost, 2) == 187.73
+    assert summary.total_cost != 502.29
 
 
 def test_total_cost_prefers_bill_last_period_when_present() -> None:
@@ -67,11 +102,11 @@ def test_total_cost_prefers_bill_last_period_when_present() -> None:
     assert summary.total_cost == 130.08
 
 
-def test_total_cost_falls_back_to_charge_sum_without_a_new_charges_line() -> None:
-    """No "New Charges This Period" line → sum only genuine charges, dropping bookkeeping.
+def test_total_cost_excludes_uncancelled_running_balance() -> None:
+    """Balance Forward / Payments Received / subtotals never leak into the period cost.
 
-    Balance Forward / Payments Received / Total Amount Due must be excluded so a carried
-    balance that doesn't cancel can't leak into the period cost.
+    Even when a carried balance does NOT cancel (a partial payment), only the itemized
+    charges count — the running balance is prior-invoice money, not this period's usage.
     """
     details = [
         _detail("Off Peak-Charge", 70.39),
@@ -79,21 +114,11 @@ def test_total_cost_falls_back_to_charge_sum_without_a_new_charges_line() -> Non
         _detail("H.S.T.", 26.45),
         _detail("Balance Forward", 300.00),
         _detail("Payments Received", -100.00),  # deliberately does NOT cancel
+        _detail("New Charges This Period", 164.13),
         _detail("Total Amount Due", 364.13),
     ]
     summary = _summary(details)
     assert round(summary.total_cost, 2) == 70.39 + 67.29 + 26.45
-
-
-def test_total_cost_ignores_zero_valued_new_charges_placeholder() -> None:
-    """A $0 "New Charges This Period" placeholder shouldn't zero out a period with charges."""
-    details = [
-        _detail("Off Peak-Charge", 40.00),
-        _detail("Delivery Charge", 20.00),
-        _detail("New Charges This Period", 0.0),
-    ]
-    summary = _summary(details)
-    assert round(summary.total_cost, 2) == 60.00
 
 
 def test_is_period_charge_classifies_line_items() -> None:

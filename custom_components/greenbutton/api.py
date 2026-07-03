@@ -102,9 +102,6 @@ _NON_CHARGE_NOTES = frozenset(
         "total amount due",
     }
 )
-# The subtotal line that states the period's own charges directly — preferred by
-# [BillingSummary.total_cost] over re-summing the component lines.
-_NEW_CHARGES_NOTE = "new charges this period"
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,22 +173,22 @@ class BillingSummary:
 
         1. ``billLastPeriod`` when present and positive — some utilities put the grand total
            here directly.
-        2. The utility's own "New Charges This Period" line item — the authoritative
-           per-period amount, and (unlike "Total Amount Due") independent of any balance
-           carried from a prior invoice.
-        3. The sum of genuine charge line items — everything except running-balance
+        2. The sum of the genuine charge line items — every detail except running-balance
            bookkeeping and subtotals (see [`CostDetail.is_period_charge`]).
 
-        (2) and (3) agree on a well-formed feed; (2) is preferred because it's the utility's
-        stated number and avoids rounding drift across many tax/rebate lines. Naively summing
-        *all* details — the previous behaviour — triple-counts via the subtotal lines.
+        We deliberately do NOT trust the feed's own "New Charges This Period" / "Total Amount
+        Due" subtotal lines. Burlington Hydro stamps a corrupt value there on roughly every
+        other bill: a period whose itemized charges sum to $187.73 is reported as "New Charges
+        This Period = $502.29", with no line item for the $314.56 difference — and the bill's
+        own H.S.T. line (13% of the pre-rebate subtotal) only reconciles against the itemized
+        $187.73, confirming the subtotal is the wrong number. Summing the itemized charges is
+        correct there and identical to the subtotal on well-formed bills, so it's the single
+        rule for every feed. (A utility that under-itemizes — putting a real total only in the
+        subtotal — would need revisiting, but none in scope does.)
         """
         bill = (self.bill_last_period_raw or 0) / 100_000.0
         if bill > 0:
             return bill
-        for detail in self.cost_details:
-            if detail.normalized_note == _NEW_CHARGES_NOTE and detail.amount_raw != 0:
-                return detail.amount
         return sum(d.amount for d in self.cost_details if d.is_period_charge)
 
 
