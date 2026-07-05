@@ -65,6 +65,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+    # This integration owns no entities, so nothing subscribes to the coordinator. HA's
+    # DataUpdateCoordinator only re-arms its periodic refresh when it has ≥1 listener (see
+    # update_coordinator._async_refresh: `if ... self._listeners: self._schedule_refresh()`).
+    # Without a listener the coordinator fetches exactly once at setup and never polls again.
+    # Register a no-op listener for the entry's lifetime to keep the DEFAULT_SCAN_INTERVAL
+    # poll loop running.
+    entry.async_on_unload(coordinator.async_add_listener(lambda: None))
+
     entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))
     _async_register_services(hass)
     _LOGGER.info(
