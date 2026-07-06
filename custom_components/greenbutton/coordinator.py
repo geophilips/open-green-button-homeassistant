@@ -55,6 +55,32 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__package__)
 
 
+def _newest_reading_start(response: UsageResponse) -> datetime | None:
+    """Return the latest reading ``start`` across every series, or None if there are none.
+
+    Used to anchor the incremental cursor to the real data frontier (the newest interval we
+    actually imported) rather than wall-clock ``now`` — see
+    [GreenButtonCoordinator._advance_cursor].
+    """
+    newest: datetime | None = None
+    for up in response.usage_points:
+        for series in up.series:
+            for reading in series.readings:
+                if newest is None or reading.start > newest:
+                    newest = reading.start
+    return newest
+
+
+def _parse_iso_or_none(raw: object) -> datetime | None:
+    """Parse a stored ISO 8601 timestamp, tolerating None / non-str / corrupt values."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 def _write_xml_sync(path: str, data: bytes) -> None:
     """Synchronous file write executed off the event loop via `async_add_executor_job`."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -106,6 +132,42 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             published_max.isoformat(),
         )
 
+        response = await self._fetch(published_min, published_max)
+
+        total_readings = sum(len(s.readings) for up in response.usage_points for s in up.series)
+        _LOGGER.info(
+            "Fetched %d usage point(s) with %d total reading(s) for entry %s",
+            len(response.usage_points),
+            total_readings,
+            self.entry.entry_id,
+        )
+
+        await import_usage_statistics(
+            self.hass,
+            self.entry,
+            response,
+            utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
+        )
+
+        # A successful fetch means we're no longer blocked on an async background load — clear
+        # any background-load repair issue raised by a previous poll (no-op if none exists).
+        self._async_clear_background_load_issue()
+
+        # Advance the incremental cursor. Done LAST so a partial failure (stats write throwing)
+        # doesn't move it and leave a gap.
+        self._advance_cursor(response)
+        # A full-history rebuild has now landed; revert to incremental polling.
+        self._force_full_history = False
+        return response
+
+    async def _fetch(self, published_min: datetime, published_max: datetime) -> UsageResponse:
+        """Call /proxy/usage for a window and persist any rotated credentials.
+
+        Shared by the normal poll ([_async_update_data]) and [async_rebuild_statistics] so
+        the upstream-error → HA-outcome mapping and the credential-rotation write live in one
+        place. Raises ``ConfigEntryAuthFailed`` (→ reauth) or ``UpdateFailed`` (→ transient)
+        on failure; the stats write is the caller's responsibility.
+        """
         # Persist the raw upstream XML to disk only when debug logging is enabled on our
         # domain — keeps the integration's normal memory + disk footprint negligible while
         # giving operators a one-toggle path to capture the bytes for diagnostics. The sink
@@ -139,9 +201,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         except (TimeoutError, ConnectionError) as err:
             raise UpdateFailed(f"network error talking to the proxy: {err}") from err
 
-        # Persist rotated credentials FIRST. If the subsequent stats write fails we still
-        # want HA to remember the new token; otherwise the next poll uses the old (now
-        # invalid) token and we cascade into a spurious reauth.
+        # Persist rotated credentials FIRST. If a subsequent stats write fails we still want
+        # HA to remember the new token; otherwise the next poll uses the old (now invalid)
+        # token and we cascade into a spurious reauth.
         if response.new_credentials is not None:
             self.hass.config_entries.async_update_entry(
                 self.entry,
@@ -156,77 +218,98 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 self.entry.entry_id,
             )
 
-        total_readings = sum(len(s.readings) for up in response.usage_points for s in up.series)
-        _LOGGER.info(
-            "Fetched %d usage point(s) with %d total reading(s) for entry %s",
-            len(response.usage_points),
-            total_readings,
-            self.entry.entry_id,
+        return response
+
+    def _advance_cursor(self, response: UsageResponse) -> None:
+        """Persist the incremental cursor as the newest reading start we've imported.
+
+        The cursor only moves *forward*, and only when the response actually carried
+        readings. On an empty response it is left untouched — critical for a utility that
+        publishes on a multi-day lag: anchoring the cursor to the real data frontier (rather
+        than wall-clock ``now``) stops `published-min` from marching past the not-yet-
+        published data and starving every later poll. See [_published_min].
+        """
+        newest = _newest_reading_start(response)
+        if newest is None:
+            return  # Empty response — keep the window reaching back to the last real data.
+        prior_raw = self.entry.data.get(CONF_LAST_FETCHED_AT)
+        prior = _parse_iso_or_none(prior_raw)
+        cursor = newest if prior is None else max(prior, newest)
+        cursor_iso = cursor.isoformat()
+        if cursor_iso == prior_raw:
+            return  # No forward movement — avoid a no-op entry write (and its churn).
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_LAST_FETCHED_AT: cursor_iso},
         )
 
+    async def async_rebuild_statistics(self) -> None:
+        """Rebuild this entry's statistics from a full re-fetch — non-destructively.
+
+        The supported recovery path when a calculation change (e.g. the cost fix) means the
+        already-stored rows are wrong — without making the user remove the entry and redo the
+        OAuth authorization. Steps, in order:
+
+          1. Re-fetch the full initial-history window. **This happens FIRST**, so a failed
+             fetch can never leave the store emptied.
+          2. Only once we hold the replacement data: clear this entry's energy + cost stats.
+          3. Block until the recorder has committed the delete. The per-series resume point
+             ([statistics._resume_point]) reads the last stored cumulative sum on a separate
+             DB executor thread; if we re-imported before the clear committed, it could resume
+             on top of the stale totals we're trying to discard.
+          4. Import the freshly-fetched response into the now-empty store.
+
+        The earlier implementation cleared *before* re-fetching, so a failed fetch (the
+        utility's resource server is intermittently flaky) wiped the user's history — and the
+        incremental poll could not repopulate it, because its `published-min` window sits
+        ahead of the utility's lagged data. Fetching first makes a failed rebuild a no-op.
+
+        Raises:
+            HomeAssistantError: the rebuild fetch failed (network / upstream / reauth).
+                Nothing was purged; the existing statistics remain intact.
+        """
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.exceptions import HomeAssistantError
+
+        now = datetime.now(UTC)
+        self._force_full_history = True
+        try:
+            published_min = self._published_min(now)
+            published_max = now + PUBLISHED_MAX_LOOKAHEAD
+            _LOGGER.info(
+                "Rebuild for entry %s: re-fetching full history (published-min=%s) before purge",
+                self.entry.entry_id,
+                published_min.isoformat(),
+            )
+            try:
+                response = await self._fetch(published_min, published_max)
+            except (UpdateFailed, ConfigEntryAuthFailed) as err:
+                raise HomeAssistantError(
+                    f"Rebuild fetch failed for entry {self.entry.entry_id}: {err}. "
+                    "Existing statistics were left untouched."
+                ) from err
+        finally:
+            self._force_full_history = False
+
+        # The fetch succeeded — now it's safe to purge and re-import from a clean slate.
+        cleared = await async_clear_statistics_for_entry(self.hass, self.entry.entry_id)
+        await get_instance(self.hass).async_block_till_done()
+        _LOGGER.info(
+            "Rebuild for entry %s: cleared %d statistic(s); importing fresh",
+            self.entry.entry_id,
+            len(cleared),
+        )
         await import_usage_statistics(
             self.hass,
             self.entry,
             response,
             utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
         )
-
-        # A successful fetch means we're no longer blocked on an async background load — clear
-        # any background-load repair issue raised by a previous poll (no-op if none exists).
         self._async_clear_background_load_issue()
-
-        # Record the success cutoff — read on the next refresh to scope `published-min`.
-        # Done LAST so a partial failure (stats write throwing) doesn't advance the cursor
-        # and leave a gap; better to re-fetch a window we've already imported (idempotent)
-        # than to skip a window we never wrote.
-        self.hass.config_entries.async_update_entry(
-            self.entry,
-            data={**self.entry.data, CONF_LAST_FETCHED_AT: datetime.now(UTC).isoformat()},
-        )
-        # A full-history rebuild has now landed; revert to incremental polling.
-        self._force_full_history = False
-        return response
-
-    async def async_rebuild_statistics(self) -> None:
-        """Purge this entry's imported statistics and rebuild them from a full re-fetch.
-
-        The supported recovery path when a calculation change (e.g. the cost fix) means the
-        already-stored rows are wrong — without making the user remove the entry and redo the
-        OAuth authorization. Steps, in order:
-
-          1. Clear this entry's energy + cost statistics.
-          2. Block until the recorder has committed the delete. The per-series resume point
-             ([statistics._resume_point]) reads the last stored cumulative sum on a separate
-             DB executor thread; if we re-imported before the clear committed, it could resume
-             on top of the stale totals we're trying to discard.
-          3. Force the next fetch to span the full initial-history window, then refresh.
-
-        Raises:
-            HomeAssistantError: the rebuild fetch failed (network / upstream / reauth). The
-                purge has already happened, so the next scheduled poll — or another call to
-                this service — will repopulate the statistics.
-        """
-        from homeassistant.components.recorder import get_instance
-        from homeassistant.exceptions import HomeAssistantError
-
-        cleared = await async_clear_statistics_for_entry(self.hass, self.entry.entry_id)
-        _LOGGER.info(
-            "Rebuild for entry %s: cleared %d statistic(s); re-fetching full history",
-            self.entry.entry_id,
-            len(cleared),
-        )
-        await get_instance(self.hass).async_block_till_done()
-
-        self._force_full_history = True
-        # async_refresh() swallows update errors into `last_update_success`; surface a failed
-        # rebuild to the service caller instead of silently leaving the entry empty.
-        await self.async_refresh()
-        if not self.last_update_success:
-            raise HomeAssistantError(
-                f"Rebuild fetch failed for entry {self.entry.entry_id}: "
-                f"{self.last_exception}. Statistics were cleared and will repopulate on the "
-                "next successful poll."
-            )
+        self._advance_cursor(response)
+        # Publish the fresh response into the coordinator (updates .data, marks the update
+        # successful, notifies listeners, and re-arms the 6h poll) without a second fetch.
+        self.async_set_updated_data(response)
         _LOGGER.info("Rebuild complete for entry %s", self.entry.entry_id)
 
     @property
@@ -292,8 +375,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         `_force_full_history` — we look back by the per-utility initial-history window the
         server supplied in the claim response: a bounded initial import that keeps the
         utility's data-collection job and our statistics write manageable. Subsequent refreshes
-        ask for the slice published since the last successful fetch, minus a small overlap that
-        absorbs clock skew and any late-arriving corrections.
+        ask for the slice since the cursor, minus a small overlap that absorbs clock skew and
+        any late-arriving corrections.
+
+        The cursor (`CONF_LAST_FETCHED_AT`) is the newest *reading* we've imported, NOT the
+        wall-clock time of the last poll (see [_advance_cursor]). Anchoring it to the data
+        frontier is load-bearing: utilities publish on a multi-day lag, so a wall-clock cursor
+        would push `published-min` past the not-yet-published data and every later poll would
+        come back empty.
         """
         if self._force_full_history:
             return now - self._initial_lookback()

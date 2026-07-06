@@ -18,10 +18,14 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.greenbutton.api import (
+    MeterReadingSeries,
     NewCredentials,
+    NormalizedReadingType,
     OpenGbApi,
     OpenGbApiError,
     OpenGbAuthExpiredError,
+    UsagePoint,
+    UsageReading,
     UsageResponse,
 )
 from custom_components.greenbutton.const import (
@@ -56,6 +60,29 @@ def _entry(hass: HomeAssistant) -> MockConfigEntry:
 def _empty_response() -> UsageResponse:
     """A valid-shape UsageResponse with no readings — keeps stats writes trivial in tests."""
     return UsageResponse(updated=None, usage_points=[], new_credentials=None)
+
+
+def _reading_type() -> NormalizedReadingType:
+    return NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+
+
+def _response_with_readings(*starts: datetime) -> UsageResponse:
+    """A UsageResponse carrying one FORWARD series with a reading at each given start."""
+    readings = [UsageReading(start=s, duration_seconds=3600, value=1000.0) for s in starts]
+    series = MeterReadingSeries(
+        meter_reading_id="mr1", reading_type=_reading_type(), readings=readings
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
 
 
 async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) -> None:
@@ -244,12 +271,13 @@ async def test_rotated_credentials_are_persisted_before_stats_import(
     assert entry.data[CONF_PROXY_TOKEN] == "rotated_token"
 
 
-async def test_rebuild_purges_then_refetches_full_history(hass: HomeAssistant) -> None:
-    """Rebuild clears the entry's stats, then re-fetches the FULL window (ignoring the cursor).
+async def test_rebuild_refetches_full_history_then_purges(hass: HomeAssistant) -> None:
+    """Rebuild re-fetches the FULL window (ignoring the cursor), then clears + re-imports.
 
     A stored `last_fetched_at` would normally scope the next fetch to a small incremental
     slice — the rebuild must override that and pull the whole initial-history window so the
-    recomputed statistics cover all history, not just since the last poll.
+    recomputed statistics cover all history, not just since the last poll. The fetch happens
+    before the purge (see test_rebuild_leaves_stats_intact_when_refetch_fails).
     """
     api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
     api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
@@ -288,11 +316,14 @@ async def test_rebuild_purges_then_refetches_full_history(hass: HomeAssistant) -
     assert coordinator._force_full_history is False
 
 
-async def test_rebuild_raises_when_refetch_fails_but_still_purged(hass: HomeAssistant) -> None:
-    """If the re-fetch fails, the purge already happened and the caller gets a clear error.
+async def test_rebuild_leaves_stats_intact_when_refetch_fails(hass: HomeAssistant) -> None:
+    """A failed re-fetch must NOT purge — the existing statistics stay put.
 
-    The service surfaces this to the user; the stats then repopulate on the next successful
-    poll (or another rebuild). We assert both: the purge ran, and the error propagates.
+    Regression guard for the destructive-rebuild bug: the utility's resource server is
+    intermittently flaky, and clearing before a fetch that then fails wiped the user's
+    history with no way to recover (the incremental window sits ahead of the utility's
+    lagged data). Fetching first makes a failed rebuild a no-op, and the caller still gets a
+    clear error.
     """
     api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
     api.fetch_usage = AsyncMock(side_effect=OpenGbApiError("upstream 502"))  # type: ignore[method-assign]
@@ -313,5 +344,81 @@ async def test_rebuild_raises_when_refetch_fails_but_still_purged(hass: HomeAssi
     ):
         await coordinator.async_rebuild_statistics()
 
-    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
-    import_mock.assert_not_awaited()  # fetch failed before the import step
+    clear_mock.assert_not_awaited()  # fetch failed first → nothing purged
+    import_mock.assert_not_awaited()
+    # The one-shot flag is cleared even on the failure path.
+    assert coordinator._force_full_history is False
+
+
+async def test_cursor_advances_to_newest_reading_not_wall_clock(hass: HomeAssistant) -> None:
+    """The incremental cursor is anchored to the newest reading, never to wall-clock `now`.
+
+    Regression guard for the window-outruns-data bug: if the cursor advanced to `now`, then
+    `published-min` (= cursor − overlap) would march past a utility that publishes on a lag,
+    and every later poll would return nothing.
+    """
+    newest = datetime(2026, 7, 4, 5, 0, tzinfo=UTC)
+    older = datetime(2026, 7, 3, 5, 0, tzinfo=UTC)
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        return_value=_response_with_readings(older, newest)
+    )
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+
+    # Cursor is the newest reading start — well behind wall-clock now (2026-07-06).
+    assert entry.data[CONF_LAST_FETCHED_AT] == newest.isoformat()
+
+
+async def test_cursor_not_advanced_on_empty_response(hass: HomeAssistant) -> None:
+    """An empty (0-reading) response must leave the cursor pinned to the last real data.
+
+    Otherwise the window would creep forward on every empty poll and permanently outrun a
+    lagging utility's not-yet-published data.
+    """
+    prior = "2026-06-01T00:00:00+00:00"
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_LAST_FETCHED_AT: prior})
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+
+    assert entry.data[CONF_LAST_FETCHED_AT] == prior  # unchanged
+
+
+async def test_cursor_never_regresses_on_late_partial_window(hass: HomeAssistant) -> None:
+    """A window that only returns older readings must not pull the cursor backwards."""
+    prior_dt = datetime(2026, 7, 4, 5, 0, tzinfo=UTC)
+    older = datetime(2026, 7, 2, 5, 0, tzinfo=UTC)
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        return_value=_response_with_readings(older)
+    )
+
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_LAST_FETCHED_AT: prior_dt.isoformat()}
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+
+    assert entry.data[CONF_LAST_FETCHED_AT] == prior_dt.isoformat()  # held, not regressed

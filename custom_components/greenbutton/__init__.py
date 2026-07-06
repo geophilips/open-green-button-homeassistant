@@ -74,7 +74,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # poll loop running.
     entry.async_on_unload(coordinator.async_add_listener(lambda: None))
 
-    entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))
+    # NOTE: deliberately NO `add_update_listener(...reload...)` here. The coordinator writes
+    # bookkeeping (CONF_LAST_FETCHED_AT, rotated credentials) into entry.data on every poll;
+    # a blanket reload-on-update listener would tear the entry down and re-set it up on each
+    # of those writes. Reauth reloads itself via the config flow's
+    # `async_update_reload_and_abort`, and there is no options flow, so nothing else needs a
+    # reload on data change.
     _async_register_services(hass)
     _LOGGER.info(
         "Set up Open Green Button entry %s for utility %s",
@@ -151,8 +156,3 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             entry.entry_id,
             owned,
         )
-
-
-async def _async_reload_on_update(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when its data changes (e.g. after a reauth or options update)."""
-    await hass.config_entries.async_reload(entry.entry_id)
