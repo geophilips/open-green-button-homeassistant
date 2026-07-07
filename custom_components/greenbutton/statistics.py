@@ -134,17 +134,26 @@ async def import_usage_statistics(
     entry: ConfigEntry,
     response: UsageResponse,
     utility_display_name: str,
+    *,
+    fresh: bool = False,
 ) -> None:
     """Push every series in [response] into HA long-term statistics.
 
     Idempotent on (statistic_id, hour) — re-importing a previously-imported hour is a no-op,
     so the coordinator can pull overlapping windows on every poll without worrying about
     duplicates.
+
+    ``fresh=True`` means "the store was just cleared; import from a zero baseline". It skips
+    the per-series resume-point read entirely. That read (``get_last_statistics``) is what a
+    rebuild raced against: if it observed the pre-clear cursor, every reading in the re-fetched
+    full-history feed looked "already imported" and got skipped, importing nothing. On a
+    rebuild there is by definition no prior data to resume from, so reading it is both
+    unnecessary and the source of the race — bypass it.
     """
     for up in response.usage_points:
         for series in up.series:
-            await _import_series(hass, entry, up, series, utility_display_name)
-        await _import_cost_summaries(hass, entry, up, utility_display_name)
+            await _import_series(hass, entry, up, series, utility_display_name, fresh=fresh)
+        await _import_cost_summaries(hass, entry, up, utility_display_name, fresh=fresh)
 
 
 async def _import_series(
@@ -153,6 +162,8 @@ async def _import_series(
     up: UsagePoint,
     series: MeterReadingSeries,
     utility_display_name: str,
+    *,
+    fresh: bool = False,
 ) -> None:
     if not series.readings:
         return  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
@@ -187,7 +198,9 @@ async def _import_series(
     if _MEAN_TYPE_NONE is not None:
         metadata["mean_type"] = _MEAN_TYPE_NONE
 
-    resume_from_sum, resume_after_epoch = await _resume_point(hass, statistic_id)
+    resume_from_sum, resume_after_epoch = (
+        (0.0, None) if fresh else await _resume_point(hass, statistic_id)
+    )
 
     stats: list[StatisticData] = []
     running = resume_from_sum
@@ -288,6 +301,8 @@ async def _import_cost_summaries(
     entry: ConfigEntry,
     up: UsagePoint,
     utility_display_name: str,
+    *,
+    fresh: bool = False,
 ) -> None:
     """Write a cumulative-cost statistic from this UsagePoint's BillingSummary entries.
 
@@ -363,7 +378,9 @@ async def _import_cost_summaries(
         return
     forward_readings.sort(key=lambda x: x[0])
 
-    resume_from_sum, resume_after_epoch = await _resume_point(hass, statistic_id)
+    resume_from_sum, resume_after_epoch = (
+        (0.0, None) if fresh else await _resume_point(hass, statistic_id)
+    )
 
     stats: list[StatisticData] = []
     running = resume_from_sum

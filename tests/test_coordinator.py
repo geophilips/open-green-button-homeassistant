@@ -305,6 +305,9 @@ async def test_rebuild_refetches_full_history_then_purges(hass: HomeAssistant) -
     clear_mock.assert_awaited_once_with(hass, entry.entry_id)
     api.fetch_usage.assert_awaited_once()
     import_mock.assert_awaited_once()
+    # Rebuild imports from a zero baseline — fresh=True bypasses the resume-point read that a
+    # rebuild raced against (stale cursor → every reading skipped → empty store).
+    assert import_mock.await_args.kwargs["fresh"] is True
 
     # published_min looks back the full initial window, NOT to the 2026-06-01 cursor.
     now = datetime.now(UTC)

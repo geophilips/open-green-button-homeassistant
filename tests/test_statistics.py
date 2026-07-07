@@ -7,13 +7,26 @@ where a recorder is wired up; these focus on the pure-function bits that don't n
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from custom_components.greenbutton.api import BillingSummary
+from custom_components.greenbutton.api import (
+    BillingSummary,
+    MeterReadingSeries,
+    NormalizedReadingType,
+    UsagePoint,
+    UsageReading,
+    UsageResponse,
+)
 from custom_components.greenbutton.statistics import (
     _select_billing_summaries,
+    import_usage_statistics,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
 )
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
 
 _DAY = 86400
 
@@ -32,6 +45,74 @@ def _summary(start: datetime, duration_days: int, total_dollars: float) -> Billi
 
 _APR2 = datetime(2026, 4, 2, tzinfo=UTC)
 _MAY4 = datetime(2026, 5, 4, tzinfo=UTC)
+
+
+def _one_reading_response() -> UsageResponse:
+    """A response with a single FORWARD electricity reading, enough to drive an import."""
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="mr1",
+        reading_type=reading_type,
+        readings=[
+            UsageReading(
+                start=datetime(2026, 7, 5, 5, tzinfo=UTC), duration_seconds=3600, value=1000.0
+            )
+        ],
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def test_fresh_import_bypasses_resume_point(hass: HomeAssistant) -> None:
+    """`fresh=True` must NOT read the resume point — that read is the rebuild race.
+
+    Regression guard: a rebuild clears the store then re-imports the full-history feed. If the
+    resume-point read observed the pre-clear cursor, every reading looked "already imported"
+    and got skipped, importing nothing. `fresh=True` skips the read and imports from zero.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point", new=AsyncMock()
+        ) as resume_mock,
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass, entry, _one_reading_response(), utility_display_name="X", fresh=True
+        )
+
+    resume_mock.assert_not_awaited()  # the racy read is skipped entirely
+    add_mock.assert_called_once()  # and the reading is still written
+    _metadata, stats = add_mock.call_args.args[1], add_mock.call_args.args[2]
+    assert len(stats) == 1
+
+
+async def test_incremental_import_reads_resume_point(hass: HomeAssistant) -> None:
+    """The normal (non-fresh) poll path still resumes from stored totals."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ) as resume_mock,
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics"),
+    ):
+        await import_usage_statistics(
+            hass, entry, _one_reading_response(), utility_display_name="X"
+        )
+
+    resume_mock.assert_awaited()  # incremental imports must still read the resume point
 
 
 def test_statistic_id_is_scoped_per_entry() -> None:

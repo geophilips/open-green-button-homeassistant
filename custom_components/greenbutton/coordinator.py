@@ -253,11 +253,13 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
           1. Re-fetch the full initial-history window. **This happens FIRST**, so a failed
              fetch can never leave the store emptied.
           2. Only once we hold the replacement data: clear this entry's energy + cost stats.
-          3. Block until the recorder has committed the delete. The per-series resume point
-             ([statistics._resume_point]) reads the last stored cumulative sum on a separate
-             DB executor thread; if we re-imported before the clear committed, it could resume
-             on top of the stale totals we're trying to discard.
-          4. Import the freshly-fetched response into the now-empty store.
+          3. Block until the recorder has committed the delete.
+          4. Import the freshly-fetched response into the now-empty store with ``fresh=True``,
+             which imports from a zero baseline and skips the per-series resume-point read.
+             That read ([statistics._resume_point], on a DB executor thread) is what a rebuild
+             raced against: if it observed the pre-clear cursor, every reading in the
+             full-history feed looked "already imported" and got skipped — importing nothing
+             and leaving the store empty. ``fresh=True`` removes the race entirely.
 
         The earlier implementation cleared *before* re-fetching, so a failed fetch (the
         utility's resource server is intermittently flaky) wiped the user's history — and the
@@ -291,6 +293,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         finally:
             self._force_full_history = False
 
+        total_readings = sum(len(s.readings) for up in response.usage_points for s in up.series)
+        _LOGGER.info(
+            "Rebuild for entry %s: fetched %d usage point(s) with %d total reading(s)",
+            self.entry.entry_id,
+            len(response.usage_points),
+            total_readings,
+        )
+
         # The fetch succeeded — now it's safe to purge and re-import from a clean slate.
         cleared = await async_clear_statistics_for_entry(self.hass, self.entry.entry_id)
         await get_instance(self.hass).async_block_till_done()
@@ -299,11 +309,16 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self.entry.entry_id,
             len(cleared),
         )
+        # fresh=True: we just cleared the store, so import from a zero baseline and skip the
+        # per-series resume-point read. That read is what a rebuild raced against — if it saw
+        # the pre-clear cursor, every reading in the re-fetched full-history feed looked
+        # "already imported" and got skipped, importing nothing.
         await import_usage_statistics(
             self.hass,
             self.entry,
             response,
             utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
+            fresh=True,
         )
         self._async_clear_background_load_issue()
         self._advance_cursor(response)
