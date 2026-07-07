@@ -25,11 +25,13 @@ import voluptuous as vol
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 
 from .api import OpenGbApi
 from .const import (
     ATTR_CONFIG_ENTRY_ID,
     CONF_SERVER_BASE_URL,
+    DEFAULT_SCAN_INTERVAL,
     DEFAULT_SERVER_BASE_URL,
     DOMAIN,
     SERVICE_REBUILD_STATISTICS,
@@ -67,12 +69,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     # This integration owns no entities, so nothing subscribes to the coordinator. HA's
-    # DataUpdateCoordinator only re-arms its periodic refresh when it has ≥1 listener (see
-    # update_coordinator._async_refresh: `if ... self._listeners: self._schedule_refresh()`).
-    # Without a listener the coordinator fetches exactly once at setup and never polls again.
-    # Register a no-op listener for the entry's lifetime to keep the DEFAULT_SCAN_INTERVAL
-    # poll loop running.
-    entry.async_on_unload(coordinator.async_add_listener(lambda: None))
+    # DataUpdateCoordinator only arms its internal poll timer when it has ≥1 listener AND the
+    # entry's `pref_disable_polling` is off (update_coordinator._schedule_refresh). Relying on
+    # that gated scheduler is fragile for a poll-only integration — a stray "disable polling"
+    # system-option silently stops all data updates. So we drive the periodic refresh
+    # ourselves with an unconditional time interval that HA can't turn off. The first fetch
+    # already ran above via async_config_entry_first_refresh; this covers every fetch after.
+    async def _async_poll(_now) -> None:
+        await coordinator.async_refresh()
+
+    entry.async_on_unload(async_track_time_interval(hass, _async_poll, DEFAULT_SCAN_INTERVAL))
 
     # NOTE: deliberately NO `add_update_listener(...reload...)` here. The coordinator writes
     # bookkeeping (CONF_LAST_FETCHED_AT, rotated credentials) into entry.data on every poll;

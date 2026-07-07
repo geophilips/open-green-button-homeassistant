@@ -7,12 +7,17 @@ selection and validation (the rebuild mechanics themselves live in test_coordina
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import ServiceValidationError
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.greenbutton import _async_register_services
 from custom_components.greenbutton.api import UsageResponse
@@ -22,6 +27,7 @@ from custom_components.greenbutton.const import (
     CONF_PROXY_TOKEN,
     CONF_UTILITY_ID,
     CONF_UTILITY_NAME,
+    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     SERVICE_REBUILD_STATISTICS,
 )
@@ -36,12 +42,13 @@ def _stub_coordinator() -> MagicMock:
     return coord
 
 
-async def test_setup_arms_periodic_polling(hass: HomeAssistant) -> None:
-    """Regression: an entity-less coordinator must keep a listener so it re-schedules polls.
+async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
+    """Regression: the entity-less integration must keep polling on its own timer.
 
-    HA's DataUpdateCoordinator only re-arms its periodic refresh when it has ≥1 listener.
-    This integration owns no entities, so setup must register a keep-alive listener —
-    otherwise the coordinator fetches once at setup and never polls again.
+    It owns no entities, so HA's DataUpdateCoordinator won't self-schedule (its poll timer is
+    gated on having a listener AND `pref_disable_polling` being off). Setup therefore drives
+    the refresh with an explicit time interval. We assert real behaviour: a first fetch at
+    setup, then another fetch once the scan interval elapses.
     """
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -55,11 +62,9 @@ async def test_setup_arms_periodic_polling(hass: HomeAssistant) -> None:
     entry.add_to_hass(hass)
 
     empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
+    fetch = AsyncMock(return_value=empty)
     with (
-        patch(
-            "custom_components.greenbutton.OpenGbApi.fetch_usage",
-            new=AsyncMock(return_value=empty),
-        ),
+        patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
             new=AsyncMock(),
@@ -67,11 +72,14 @@ async def test_setup_arms_periodic_polling(hass: HomeAssistant) -> None:
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
+        assert fetch.await_count == 1  # async_config_entry_first_refresh
 
-    coordinator = hass.data[DOMAIN][entry.entry_id]
-    # A live listener is what keeps _schedule_refresh firing at DEFAULT_SCAN_INTERVAL.
-    assert coordinator._listeners, "coordinator has no listener; periodic polling won't re-arm"
-    assert coordinator._unsub_refresh is not None, "next refresh is not scheduled"
+        # Advance past the scan interval → the explicit time-interval poll must fire.
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + DEFAULT_SCAN_INTERVAL + timedelta(minutes=1)
+        )
+        await hass.async_block_till_done()
+        assert fetch.await_count == 2, "periodic poll did not fire on the scan interval"
 
 
 async def test_service_is_registered(hass: HomeAssistant) -> None:
