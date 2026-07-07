@@ -220,7 +220,20 @@ class UsageResponse:
 
 
 class OpenGbApiError(Exception):
-    """Catch-all proxy-server error."""
+    """Catch-all proxy-server error.
+
+    Carries any rotated credentials the proxy returned on the *error* response (the
+    ``OpenGB-New-*`` headers). The proxy refreshes the access token — and the utility may
+    redeem a one-time refresh token (e.g. savagedata's OpenIddict) — *before* the resource
+    fetch, so an upstream failure can still come with a fresh blob. The caller MUST persist
+    ``new_credentials`` before treating the error as retryable; otherwise the next attempt
+    reuses a burned refresh token and cascades into a spurious reauth.
+    """
+
+    def __init__(self, *args: object, new_credentials: NewCredentials | None = None) -> None:
+        """Standard exception args plus optional rotated credentials from the response headers."""
+        super().__init__(*args)
+        self.new_credentials = new_credentials
 
 
 class OpenGbClaimNotFoundError(OpenGbApiError):
@@ -340,14 +353,24 @@ class OpenGbApi:
 
         headers = {**self.headers, "Authorization": f"Bearer {proxy_token}"}
         async with self._session.post(url, headers=headers, json=body) as resp:
+            # Rotated credentials can accompany ANY response, not just 200. The proxy refreshes
+            # the access token (and the utility may redeem a one-time refresh token) BEFORE the
+            # resource fetch, so a subsequent upstream failure still carries a new blob we must
+            # not drop. Read the headers up front and attach them to every error so the
+            # coordinator can persist them before retrying.
+            new_credentials = _new_credentials_from_headers(resp.headers)
             if resp.status == 401:
                 text = await resp.text()
                 error_code = _safe_json_error(text)
                 if error_code == "utility_auth_expired":
                     raise OpenGbAuthExpiredError(
                         "Utility refresh token expired; user must re-authorize",
+                        new_credentials=new_credentials,
                     )
-                raise OpenGbApiError(f"POST /proxy/usage returned 401 ({error_code}): {text[:200]}")
+                raise OpenGbApiError(
+                    f"POST /proxy/usage returned 401 ({error_code}): {text[:200]}",
+                    new_credentials=new_credentials,
+                )
             if resp.status == 202:
                 # The proxy passes the utility's 202 Accepted through as `utility_data_pending`:
                 # the dataset is large enough that the utility is assembling it out-of-band
@@ -359,13 +382,16 @@ class OpenGbApi:
                     "Utility is preparing data asynchronously (HTTP 202, "
                     f"{error_code or 'utility_data_pending'}); background data loads are not "
                     "yet supported",
+                    new_credentials=new_credentials,
                 )
             if resp.status != 200:
                 text = await resp.text()
-                raise OpenGbApiError(f"POST /proxy/usage returned {resp.status}: {text[:200]}")
+                raise OpenGbApiError(
+                    f"POST /proxy/usage returned {resp.status}: {text[:200]}",
+                    new_credentials=new_credentials,
+                )
 
             xml_bytes = await resp.read()
-            new_credentials = _new_credentials_from_headers(resp.headers)
 
         if raw_xml_sink is not None:
             # Persist before parsing so a parse-failure path still leaves a debuggable

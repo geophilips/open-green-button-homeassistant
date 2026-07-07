@@ -170,6 +170,39 @@ async def test_generic_api_error_becomes_update_failed(hass: HomeAssistant) -> N
         await coordinator._async_update_data()
 
 
+async def test_rotated_credentials_persisted_on_upstream_error(hass: HomeAssistant) -> None:
+    """A post-refresh upstream failure still rotates a one-time refresh token. The coordinator
+    must persist the rotated blob (carried on the error) even though it raises UpdateFailed —
+    otherwise the retry reuses the burned token and cascades into a spurious reauth.
+    """
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbApiError(
+            "upstream 502",
+            new_credentials=NewCredentials(
+                encrypted_refresh_blob="rotated_blob",
+                proxy_token="rotated_token",  # noqa: S106
+            ),
+        ),
+    )
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    # The burned token was replaced despite the failed refresh, so the next poll uses the fresh one.
+    assert entry.data[CONF_ENCRYPTED_REFRESH_BLOB] == "rotated_blob"
+    assert entry.data[CONF_PROXY_TOKEN] == "rotated_token"
+
+
 async def test_data_pending_raises_repair_issue_and_update_failed(hass: HomeAssistant) -> None:
     """A 202 (async background load) → UpdateFailed + a non-fixable repair issue with the link.
 

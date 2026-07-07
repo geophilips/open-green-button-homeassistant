@@ -200,6 +200,29 @@ async def test_fetch_usage_treats_5xx_as_generic_error(
     assert not isinstance(exc_info.value, OpenGbAuthExpiredError)
 
 
+async def test_fetch_usage_carries_rotated_credentials_on_error(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """A one-time refresh token can be rotated (via OpenGB-New-* headers) even when the resource
+    fetch then fails: the proxy refreshes before fetching. The raised error must carry the new
+    credentials so the coordinator can persist them and retry, instead of reusing a burned token.
+    """
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        status=502,
+        json={"error": "utility_upstream_error"},
+        headers=ROTATED_HEADERS,
+    )
+
+    with pytest.raises(OpenGbApiError) as exc_info:
+        await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
+    creds = exc_info.value.new_credentials
+    assert creds is not None
+    assert creds.encrypted_refresh_blob == "rotated_blob_value"
+    assert creds.proxy_token == "rotated_proxy_token"  # noqa: S105
+
+
 async def test_fetch_usage_translates_202_to_data_pending_exception(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,

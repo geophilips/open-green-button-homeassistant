@@ -25,6 +25,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
+    NewCredentials,
     OpenGbApiError,
     OpenGbAuthExpiredError,
     OpenGbDataPendingError,
@@ -184,9 +185,11 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 raw_xml_sink=raw_xml_sink,
             )
         except OpenGbAuthExpiredError as err:
-            # HA turns ConfigEntryAuthFailed into a persistent notification + reauth flow;
-            # the user re-authorizes through the existing config flow, which updates the
-            # blob/token via _update_existing_entry().
+            # The refresh itself was rejected, so there's normally nothing to rotate — but
+            # persist defensively in case the proxy did surface a new blob. HA turns
+            # ConfigEntryAuthFailed into a persistent notification + reauth flow; the user
+            # re-authorizes through the existing config flow (updates blob/token).
+            self._persist_rotated_credentials(err.new_credentials)
             raise ConfigEntryAuthFailed(str(err)) from err
         except OpenGbDataPendingError as err:
             # The utility is assembling a large dataset out-of-band (ESPI async batch). We
@@ -194,31 +197,41 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             # issue linking to the tracking GitHub issue and ask the (rare) affected user to
             # comment — then fail this refresh so the entry shows as failed. Must be caught
             # BEFORE OpenGbApiError, of which it is a subclass.
+            self._persist_rotated_credentials(err.new_credentials)
             self._async_create_background_load_issue()
             raise UpdateFailed(str(err)) from err
         except OpenGbApiError as err:
+            # Crucial for one-time refresh tokens (savagedata/OpenIddict): the proxy may have
+            # refreshed — rotating and burning our stored refresh token — before the upstream
+            # fetch failed. Persist the rotated blob so the next poll retries with the fresh
+            # token instead of the dead one, which would otherwise force a spurious reauth.
+            self._persist_rotated_credentials(err.new_credentials)
             raise UpdateFailed(str(err)) from err
         except (TimeoutError, ConnectionError) as err:
             raise UpdateFailed(f"network error talking to the proxy: {err}") from err
 
-        # Persist rotated credentials FIRST. If a subsequent stats write fails we still want
-        # HA to remember the new token; otherwise the next poll uses the old (now invalid)
-        # token and we cascade into a spurious reauth.
-        if response.new_credentials is not None:
-            self.hass.config_entries.async_update_entry(
-                self.entry,
-                data={
-                    **self.entry.data,
-                    CONF_ENCRYPTED_REFRESH_BLOB: response.new_credentials.encrypted_refresh_blob,
-                    CONF_PROXY_TOKEN: response.new_credentials.proxy_token,
-                },
-            )
-            _LOGGER.info(
-                "Persisted rotated credentials for entry %s",
-                self.entry.entry_id,
-            )
-
+        self._persist_rotated_credentials(response.new_credentials)
         return response
+
+    def _persist_rotated_credentials(self, new_credentials: NewCredentials | None) -> None:
+        """Write rotated credentials into the config entry, if the proxy returned any.
+
+        Persisted on BOTH the success and error paths, and BEFORE anything else that can fail:
+        a one-time refresh token (e.g. savagedata's OpenIddict) is redeemed during the proxy's
+        token refresh, so dropping the rotated blob leaves the stored token dead and the next
+        poll cascades into a spurious reauth. No-op when nothing was rotated.
+        """
+        if new_credentials is None:
+            return
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={
+                **self.entry.data,
+                CONF_ENCRYPTED_REFRESH_BLOB: new_credentials.encrypted_refresh_blob,
+                CONF_PROXY_TOKEN: new_credentials.proxy_token,
+            },
+        )
+        _LOGGER.info("Persisted rotated credentials for entry %s", self.entry.entry_id)
 
     def _advance_cursor(self, response: UsageResponse) -> None:
         """Persist the incremental cursor as the newest reading start we've imported.
