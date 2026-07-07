@@ -33,6 +33,11 @@ RawXmlSink = Callable[[bytes], Awaitable[None]]
 
 _LOGGER = logging.getLogger(__name__)
 
+# How much of a proxy error body to keep in raised-exception messages. The proxy embeds the
+# utility's own error (status + body snippet) inside its JSON `message`, after a ~150-char URL —
+# so a tight cap hides the actual upstream reason (e.g. why a Data Custodian 400s a data request).
+_MAX_ERROR_CHARS = 1200
+
 
 @dataclass(frozen=True, slots=True)
 class UtilitySummary:
@@ -368,7 +373,7 @@ class OpenGbApi:
                         new_credentials=new_credentials,
                     )
                 raise OpenGbApiError(
-                    f"POST /proxy/usage returned 401 ({error_code}): {text[:200]}",
+                    f"POST /proxy/usage returned 401 ({error_code}): {text[:_MAX_ERROR_CHARS]}",
                     new_credentials=new_credentials,
                 )
             if resp.status == 202:
@@ -387,7 +392,7 @@ class OpenGbApi:
             if resp.status != 200:
                 text = await resp.text()
                 raise OpenGbApiError(
-                    f"POST /proxy/usage returned {resp.status}: {text[:200]}",
+                    f"POST /proxy/usage returned {resp.status}: {text[:_MAX_ERROR_CHARS]}",
                     new_credentials=new_credentials,
                 )
 
