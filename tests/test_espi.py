@@ -1,6 +1,17 @@
 """Parser regression tests for custodian-specific ESPI feed shapes."""
 
-from custom_components.greenbutton.espi import parse_usage_feed
+from custom_components.greenbutton.espi import _flow_direction, parse_usage_feed
+
+
+def test_flow_direction_codes_match_espi_xsd() -> None:
+    """NAESB ESPI FlowDirectionKind (espi.xsd): 1=forward, 4=net, 19=reverse, 20=total.
+
+    Guards against the earlier bug where 4/net and 20/total were swapped (net showed as "Total").
+    """
+    assert _flow_direction(1) == "FORWARD"
+    assert _flow_direction(4) == "NET"
+    assert _flow_direction(19) == "REVERSE"
+    assert _flow_direction(20) == "TOTAL"
 
 # savagedata-style feed: resources are nested in the URL path
 # (.../UsagePoint/{up}/MeterReading/{mr}/IntervalBlock/{ib}) and the MeterReading has NO flat

@@ -475,7 +475,10 @@ def _commodity(c: int | None) -> str:
 
 
 def _flow_direction(f: int | None) -> str:
-    return {1: "FORWARD", 4: "TOTAL", 19: "REVERSE", 20: "NET"}.get(-1 if f is None else f, "OTHER")
+    # Codes per NAESB ESPI FlowDirectionKind (espi.xsd <xs:appinfo>): 1=forward, 4=net (forward −
+    # reverse), 19=reverse, 20=total (forward + reverse). NOTE: 4/net and 20/total were previously
+    # swapped here, so a "net" register showed as "Total" (and vice versa).
+    return {1: "FORWARD", 4: "NET", 19: "REVERSE", 20: "TOTAL"}.get(-1 if f is None else f, "OTHER")
 
 
 def _accumulation(a: int | None) -> str:
