@@ -71,6 +71,11 @@ _TAG_INTERVAL_READING = f"{{{_ESPI_NS}}}IntervalReading"
 _TAG_DURATION = f"{{{_ESPI_NS}}}duration"
 _TAG_START = f"{{{_ESPI_NS}}}start"
 _TAG_VALUE = f"{{{_ESPI_NS}}}value"
+_TAG_COST = f"{{{_ESPI_NS}}}cost"
+
+# ESPI reports monetary amounts (IntervalReading/cost, UsageSummary line items) in 1/100,000 of the
+# currency unit.
+_ESPI_COST_SCALE = 100_000.0
 _TAG_ACCUM = f"{{{_ESPI_NS}}}accumulationBehaviour"
 _TAG_COMMODITY = f"{{{_ESPI_NS}}}commodity"
 _TAG_CURRENCY = f"{{{_ESPI_NS}}}currency"
@@ -321,7 +326,18 @@ def _parse_interval_readings(block: ET.Element):
             start=datetime.fromtimestamp(start_epoch, tz=UTC),
             duration_seconds=duration_seconds,
             value=value,
+            cost=_cost_amount(r.findtext(_TAG_COST)),
         )
+
+
+def _cost_amount(text: str | None) -> float | None:
+    """Per-interval `<cost>` (ESPI 1/100,000 currency units) → float currency amount, or None."""
+    if text is None:
+        return None
+    try:
+        return int(text) / _ESPI_COST_SCALE
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------------------
@@ -374,6 +390,7 @@ def _assemble(
                     start=r.start,
                     duration_seconds=r.duration_seconds,
                     value=r.value * scale,
+                    cost=r.cost,
                 )
                 for block in blocks_by_mr.get(mr_id, [])
                 for r in block.readings

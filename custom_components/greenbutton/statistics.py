@@ -153,7 +153,23 @@ async def import_usage_statistics(
     for up in response.usage_points:
         for series in up.series:
             await _import_series(hass, entry, up, series, utility_display_name, fresh=fresh)
-        await _import_cost_summaries(hass, entry, up, utility_display_name, fresh=fresh)
+        # Prefer per-interval <cost> — utilities like savagedata/Milton itemize actual hourly cost,
+        # which is more accurate than distributing a monthly UsageSummary total. Fall back to the
+        # summary distribution for utilities (Burlington) that only bill via a monthly summary.
+        if _has_interval_cost(up):
+            await _import_cost_from_readings(hass, entry, up, utility_display_name, fresh=fresh)
+        else:
+            await _import_cost_summaries(hass, entry, up, utility_display_name, fresh=fresh)
+
+
+def _has_interval_cost(up: UsagePoint) -> bool:
+    """True when any FORWARD reading on this UsagePoint carries a per-interval cost."""
+    return any(
+        r.cost is not None
+        for s in up.series
+        if s.reading_type.flow_direction == "FORWARD"
+        for r in s.readings
+    )
 
 
 async def _import_series(
@@ -416,6 +432,88 @@ async def _import_cost_summaries(
         statistic_id,
         currency_alpha,
         resume_from_sum,
+    )
+    async_add_external_statistics(hass, metadata, stats)
+
+
+async def _import_cost_from_readings(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    up: UsagePoint,
+    utility_display_name: str,
+    *,
+    fresh: bool = False,
+) -> None:
+    """Write a cumulative-cost statistic from per-interval `<cost>` on the FORWARD readings.
+
+    Utilities like savagedata/Milton itemize the actual cost on every IntervalReading — more
+    accurate and finer-grained than distributing a monthly UsageSummary total (and it works when
+    the summary only carries an "Amount Due" subtotal, which our summary path deliberately drops).
+    Costs are summed per hour across the UsagePoint's FORWARD series (multiple meters roll up into
+    one bill), then accumulated into the same cost stat the Energy dashboard reads.
+    """
+    currency_code = next(
+        (
+            s.reading_type.currency_numeric_code
+            for s in up.series
+            if s.reading_type.flow_direction == "FORWARD"
+            and s.reading_type.currency_numeric_code is not None
+        ),
+        None,
+    )
+    currency_alpha = _iso_4217_alpha(currency_code)
+    if currency_alpha is None:
+        _LOGGER.debug(
+            "Skipping per-interval cost for %s: currency %s has no ISO 4217 mapping",
+            up.usage_point_id,
+            currency_code,
+        )
+        return
+
+    cost_by_hour: dict[datetime, float] = {}
+    for series in up.series:
+        if series.reading_type.flow_direction != "FORWARD":
+            continue
+        for reading in series.readings:
+            if reading.cost is None:
+                continue
+            hour = _align_to_hour(reading.start)
+            cost_by_hour[hour] = cost_by_hour.get(hour, 0.0) + reading.cost
+    if not cost_by_hour:
+        return
+
+    statistic_id = statistic_id_for_cost(entry.entry_id, up.usage_point_id)
+    metadata: StatisticMetaData = {
+        "has_mean": False,
+        "has_sum": True,
+        "name": (
+            f"{utility_display_name} · {up.service_kind.title()} Cost ({up.usage_point_id[:8]})"
+        ),
+        "source": DOMAIN,
+        "statistic_id": statistic_id,
+        "unit_of_measurement": currency_alpha,
+        "unit_class": None,  # no monetary converter in HA; see _import_cost_summaries.
+    }
+    if _MEAN_TYPE_NONE is not None:
+        metadata["mean_type"] = _MEAN_TYPE_NONE
+
+    resume_from_sum, resume_after_epoch = (
+        (0.0, None) if fresh else await _resume_point(hass, statistic_id)
+    )
+    stats: list[StatisticData] = []
+    running = resume_from_sum
+    for hour in sorted(cost_by_hour):
+        if resume_after_epoch is not None and hour.timestamp() <= resume_after_epoch:
+            continue
+        running += cost_by_hour[hour]
+        stats.append(StatisticData(start=hour, state=running, sum=running))
+    if not stats:
+        return
+    _LOGGER.info(
+        "Importing %d per-interval cost rows for %s in %s",
+        len(stats),
+        statistic_id,
+        currency_alpha,
     )
     async_add_external_statistics(hass, metadata, stats)
 

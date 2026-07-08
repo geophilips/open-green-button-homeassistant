@@ -115,6 +115,112 @@ async def test_incremental_import_reads_resume_point(hass: HomeAssistant) -> Non
     resume_mock.assert_awaited()  # incremental imports must still read the resume point
 
 
+def _per_interval_cost_response() -> UsageResponse:
+    """A FORWARD electricity response where each reading itemizes a per-interval cost (Milton)."""
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="mr1",
+        reading_type=reading_type,
+        readings=[
+            UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0, cost=0.087),
+            UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0, cost=0.122),
+        ],
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def test_per_interval_cost_writes_cumulative_cost_stat(hass: HomeAssistant) -> None:
+    """Readings with per-interval <cost> drive a cumulative cost stat directly (no summary)."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass, entry, _per_interval_cost_response(), utility_display_name="X"
+        )
+
+    cost_calls = [
+        c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")
+    ]
+    assert len(cost_calls) == 1
+    metadata, stats = cost_calls[0].args[1], cost_calls[0].args[2]
+    assert metadata["unit_of_measurement"] == "CAD"
+    assert [round(s["sum"], 3) for s in stats] == [0.087, 0.209]  # cumulative
+
+
+def _summary_only_response() -> UsageResponse:
+    """FORWARD electricity with NO per-interval <cost>, plus a monthly UsageSummary.
+
+    This is the Burlington shape: cost must come from distributing the summary total across
+    hours by consumption, NOT the per-interval path.
+    """
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="mr1",
+        reading_type=reading_type,
+        readings=[  # 1 kWh then 3 kWh, and crucially NO cost on either
+            UsageReading(datetime(2026, 4, 3, 5, tzinfo=UTC), 3600, 1000.0),
+            UsageReading(datetime(2026, 4, 3, 6, tzinfo=UTC), 3600, 3000.0),
+        ],
+    )
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[series],
+        summaries=[_summary(datetime(2026, 4, 1, tzinfo=UTC), 30, total_dollars=40.0)],
+    )
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def test_summary_cost_path_preserved_without_per_interval_cost(hass: HomeAssistant) -> None:
+    """Backward-compat (Burlington): with no per-interval <cost>, cost is derived from the
+    UsageSummary and distributed across hours by consumption — unchanged by the Milton change."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass, entry, _summary_only_response(), utility_display_name="X"
+        )
+
+    cost_calls = [
+        c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")
+    ]
+    assert len(cost_calls) == 1  # summary path still writes a cost stat
+    stats = cost_calls[0].args[2]
+    # $40 split by consumption over 1 kWh + 3 kWh → $10 then $30 → cumulative 10, 40.
+    assert [round(s["sum"], 2) for s in stats] == [10.0, 40.0]
+
+
 def test_statistic_id_is_scoped_per_entry() -> None:
     """Two entries on the same utility point must produce distinct statistic IDs.
 

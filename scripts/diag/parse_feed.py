@@ -39,17 +39,22 @@ def main() -> int:
     print(f"feed updated : {updated}")
     print(f"usage points : {len(usage_points)}")
     grand_total = 0
+    grand_cost = 0.0
     for up in usage_points:
         total = sum(len(s.readings) for s in up.series)
+        n_cost = sum(1 for s in up.series for r in s.readings if r.cost is not None)
+        cost_sum = sum(r.cost for s in up.series for r in s.readings if r.cost is not None)
         grand_total += total
+        grand_cost += cost_sum
         print(
-            f"  {up.usage_point_id}  kind={up.service_kind}  "
-            f"series={len(up.series)}  readings={total}  summaries={len(up.summaries)}"
+            f"  {up.usage_point_id}  kind={up.service_kind}  series={len(up.series)}  "
+            f"readings={total}  summaries={len(up.summaries)}  "
+            f"readings_with_cost={n_cost}  cost_sum={cost_sum:.2f}"
         )
         for series in up.series[:3]:
             first = series.readings[0] if series.readings else None
             print(f"    {series.meter_reading_id}: {len(series.readings)} readings; first={first}")
-    print(f"TOTAL readings: {grand_total}")
+    print(f"TOTAL readings: {grand_total}  TOTAL per-interval cost: {grand_cost:.2f}")
     return 0
 
 

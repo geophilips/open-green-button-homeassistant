@@ -63,3 +63,12 @@ def test_hierarchical_urls_without_related_usagepoint_link_still_attach_readings
     readings = [r for series in usage_points[0].series for r in series.readings]
     assert len(readings) == 2, f"expected 2 readings, got {len(readings)}"
     assert [r.value for r in readings] == [795000.0, 5271000.0]
+
+
+def test_per_interval_cost_parsed_when_present_else_none() -> None:
+    """<cost> on an IntervalReading → UsageReading.cost (ESPI 1/100,000 → currency units);
+    absent → None (so utilities without per-interval cost, e.g. Burlington, keep cost=None)."""
+    _updated, usage_points = parse_usage_feed(_SAVAGEDATA_FEED)
+    readings = usage_points[0].series[0].readings
+    assert readings[0].cost == 0.087  # <cost>8700</cost>
+    assert readings[1].cost is None  # second reading has no <cost>

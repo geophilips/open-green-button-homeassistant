@@ -69,6 +69,10 @@ class UsageReading:
     start: datetime
     duration_seconds: int
     value: float
+    # Per-interval cost in the ReadingType's currency (float currency units, already divided out of
+    # ESPI's 1/100,000 raw). Present when the utility itemizes cost on each IntervalReading (e.g.
+    # savagedata/Milton); None when it only bills via a monthly UsageSummary (e.g. Burlington).
+    cost: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
