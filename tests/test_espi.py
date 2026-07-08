@@ -1,6 +1,10 @@
 """Parser regression tests for custodian-specific ESPI feed shapes."""
 
-from custom_components.greenbutton.espi import _flow_direction, parse_usage_feed
+from custom_components.greenbutton.espi import (
+    _flow_direction,
+    parse_customer_feed,
+    parse_usage_feed,
+)
 
 
 def test_flow_direction_codes_match_espi_xsd() -> None:
@@ -12,6 +16,7 @@ def test_flow_direction_codes_match_espi_xsd() -> None:
     assert _flow_direction(4) == "NET"
     assert _flow_direction(19) == "REVERSE"
     assert _flow_direction(20) == "TOTAL"
+
 
 # savagedata-style feed: resources are nested in the URL path
 # (.../UsagePoint/{up}/MeterReading/{mr}/IntervalBlock/{ib}) and the MeterReading has NO flat
@@ -72,3 +77,107 @@ def test_per_interval_cost_parsed_when_present_else_none() -> None:
     readings = usage_points[0].series[0].readings
     assert readings[0].cost == 0.087  # <cost>8700</cost>
     assert readings[1].cost is None  # second reading has no <cost>
+
+
+# A RetailCustomer (customer-data) feed in the ESPI customer namespace — mirrors the real shape
+# (CustomerAccount/accountId + ServiceLocation/mainAddress) used to distinguish two accounts at
+# the same utility. Structure taken from an anonymized Green Button "Download My Data" feed.
+_CUSTOMER_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:cust="http://naesb.org/espi/customer">
+  <entry>
+    <content>
+      <cust:Customer>
+        <cust:Organisation>
+          <cust:organisationName>Jane Doe</cust:organisationName>
+        </cust:Organisation>
+      </cust:Customer>
+    </content>
+  </entry>
+  <entry>
+    <content>
+      <cust:CustomerAccount>
+        <cust:accountId>100001-0000001</cust:accountId>
+      </cust:CustomerAccount>
+    </content>
+  </entry>
+  <entry>
+    <content>
+      <cust:ServiceLocation>
+        <cust:mainAddress>
+          <cust:streetDetail>
+            <cust:number>123</cust:number>
+            <cust:name>EXAMPLE ST</cust:name>
+            <cust:suiteNumber></cust:suiteNumber>
+          </cust:streetDetail>
+          <cust:townDetail>
+            <cust:name>MILTON</cust:name>
+            <cust:stateOrProvince>ON</cust:stateOrProvince>
+            <cust:country>CA</cust:country>
+          </cust:townDetail>
+          <cust:postalCode>L0L 0L0</cust:postalCode>
+        </cust:mainAddress>
+      </cust:ServiceLocation>
+    </content>
+  </entry>
+</feed>"""
+
+
+def test_parse_customer_feed_extracts_account_address_and_name() -> None:
+    """Account id, formatted service address, and organisation name all round-trip."""
+    info = parse_customer_feed(_CUSTOMER_FEED)
+    assert info is not None
+    assert info.account_id == "100001-0000001"
+    assert info.service_address == "123 EXAMPLE ST, MILTON ON, L0L 0L0"
+    assert info.customer_name == "Jane Doe"
+    # label prefers the service address (most human-recognizable).
+    assert info.label == "123 EXAMPLE ST, MILTON ON, L0L 0L0"
+
+
+def test_parse_customer_feed_falls_back_to_address_general() -> None:
+    """A streetDetail with only <addressGeneral> (no number/name) still yields a street line."""
+    feed = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:cust="http://naesb.org/espi/customer">
+  <entry>
+    <content>
+      <cust:ServiceLocation>
+        <cust:mainAddress>
+          <cust:streetDetail>
+            <cust:addressGeneral>456 GENERAL AVE</cust:addressGeneral>
+          </cust:streetDetail>
+          <cust:townDetail>
+            <cust:name>MILTON</cust:name>
+            <cust:stateOrProvince>ON</cust:stateOrProvince>
+          </cust:townDetail>
+        </cust:mainAddress>
+      </cust:ServiceLocation>
+    </content>
+  </entry>
+</feed>"""
+    info = parse_customer_feed(feed)
+    assert info is not None
+    assert info.service_address == "456 GENERAL AVE, MILTON ON"
+    # No account id / name → label falls back to the address.
+    assert info.label == "456 GENERAL AVE, MILTON ON"
+
+
+def test_parse_customer_feed_label_prefers_account_when_no_address() -> None:
+    """With no ServiceLocation, the label falls back to the account id."""
+    feed = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:cust="http://naesb.org/espi/customer">
+  <entry>
+    <content><cust:CustomerAccount><cust:accountId>ACC-42</cust:accountId></cust:CustomerAccount></content>
+  </entry>
+</feed>"""
+    info = parse_customer_feed(feed)
+    assert info is not None
+    assert info.service_address is None
+    assert info.label == "ACC-42"
+
+
+def test_parse_customer_feed_returns_none_when_nothing_recognizable() -> None:
+    """A feed with no customer payloads → None (nothing to label with)."""
+    feed = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:cust="http://naesb.org/espi/customer">
+  <entry><content><cust:LocalTimeParameters/></content></entry>
+</feed>"""
+    assert parse_customer_feed(feed) is None

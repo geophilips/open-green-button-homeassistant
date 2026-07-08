@@ -20,7 +20,7 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.greenbutton import _async_register_services
-from custom_components.greenbutton.api import UsageResponse
+from custom_components.greenbutton.api import CustomerResponse, UsageResponse
 from custom_components.greenbutton.const import (
     ATTR_CONFIG_ENTRY_ID,
     CONF_ENCRYPTED_REFRESH_BLOB,
@@ -65,6 +65,12 @@ async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
     fetch = AsyncMock(return_value=empty)
     with (
         patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
+        # The coordinator opportunistically fetches customer data once to label the entry;
+        # stub it so setup doesn't reach the network.
+        patch(
+            "custom_components.greenbutton.OpenGbApi.fetch_customer",
+            new=AsyncMock(return_value=CustomerResponse(customer=None, new_credentials=None)),
+        ),
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
             new=AsyncMock(),

@@ -33,6 +33,9 @@ from .api import (
 )
 from .const import (
     BACKGROUND_LOAD_ISSUE_URL,
+    CONF_CUSTOMER_ACCOUNT_ID,
+    CONF_CUSTOMER_ADDRESS,
+    CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_INITIAL_HISTORY_SECONDS,
     CONF_LAST_FETCHED_AT,
@@ -154,6 +157,10 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         # any background-load repair issue raised by a previous poll (no-op if none exists).
         self._async_clear_background_load_issue()
 
+        # One-time: give the entry a human-distinguishable title from its customer data. Cheap
+        # (guarded to run once) and best-effort — never lets a customer-fetch hiccup fail the poll.
+        await self._async_ensure_customer_label()
+
         # Advance the incremental cursor. Done LAST so a partial failure (stats write throwing)
         # doesn't move it and leave a gap.
         self._advance_cursor(response)
@@ -232,6 +239,93 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             },
         )
         _LOGGER.info("Persisted rotated credentials for entry %s", self.entry.entry_id)
+
+    async def _async_ensure_customer_label(self) -> None:
+        """One-time: fetch customer data and fold a distinguishing label into the entry title.
+
+        Two accounts at the same utility (e.g. Milton Hydro's two sandbox test customers)
+        otherwise present as identical entries — indistinguishable in the UI without downloading
+        diagnostics. We fetch the ESPI RetailCustomer feed once, derive a short label (service
+        address / account number) and append it to the title, and stash the raw account id +
+        address for diagnostics.
+
+        Best-effort by design:
+          - Runs only until a label is stored (``CONF_CUSTOMER_LABEL`` present — even as ``""``
+            when the utility exposes no customer data — so we don't refetch every poll).
+          - Any fetch failure is swallowed (the usage refresh has already succeeded); rotated
+            credentials from the attempt are still persisted, and we retry on the next poll —
+            EXCEPT a permanent "no customer resource" (proxy 400 `no_customer_uri`), which we
+            record as an empty label so it isn't retried forever.
+        """
+        if CONF_CUSTOMER_LABEL in self.entry.data:
+            return  # Already resolved (or determined unavailable) — don't refetch.
+
+        try:
+            result = await self.api.fetch_customer(
+                encrypted_refresh_blob=self.entry.data[CONF_ENCRYPTED_REFRESH_BLOB],
+                proxy_token=self.entry.data[CONF_PROXY_TOKEN],
+            )
+        except OpenGbApiError as err:
+            # Includes OpenGbAuthExpiredError — but the usage fetch already succeeded this poll,
+            # so a customer-fetch auth/upstream error is non-fatal here. Persist any rotated
+            # credentials so we don't burn a one-time refresh token.
+            self._persist_rotated_credentials(err.new_credentials)
+            if "no_customer_uri" in str(err):
+                # Permanent: the custodian advertises no customer resource. Record an empty
+                # label so we stop retrying every poll.
+                _LOGGER.debug(
+                    "No customer resource for entry %s; skipping label", self.entry.entry_id
+                )
+                self._store_customer_label(None, account_id=None, address=None)
+            else:
+                _LOGGER.debug(
+                    "Customer-data fetch failed for entry %s (will retry): %s",
+                    self.entry.entry_id,
+                    err,
+                )
+            return
+        except Exception as err:  # noqa: BLE001
+            # Deliberately broad: labeling is a non-critical enhancement layered on an
+            # already-successful usage poll, so NOTHING it does (a network error, a parse
+            # surprise) may propagate and fail the refresh. Swallow, log, and retry next poll.
+            _LOGGER.debug(
+                "Customer-data fetch error for entry %s (will retry): %s",
+                self.entry.entry_id,
+                err,
+            )
+            return
+
+        self._persist_rotated_credentials(result.new_credentials)
+        customer = result.customer
+        self._store_customer_label(
+            customer.label if customer else None,
+            account_id=customer.account_id if customer else None,
+            address=customer.service_address if customer else None,
+        )
+
+    def _store_customer_label(
+        self,
+        label: str | None,
+        account_id: str | None,
+        address: str | None,
+    ) -> None:
+        """Persist the resolved customer label + details, and retitle the entry when we got one."""
+        data = {
+            **self.entry.data,
+            CONF_CUSTOMER_LABEL: label or "",
+            CONF_CUSTOMER_ACCOUNT_ID: account_id,
+            CONF_CUSTOMER_ADDRESS: address,
+        }
+        if label:
+            # Base off the utility name (not the current title) so we never double-append on a
+            # later re-resolution.
+            base = self.entry.data.get(CONF_UTILITY_NAME) or self.entry.title
+            self.hass.config_entries.async_update_entry(
+                self.entry, data=data, title=f"{base} — {label}"
+            )
+            _LOGGER.info("Labeled entry %s with customer detail: %s", self.entry.entry_id, label)
+        else:
+            self.hass.config_entries.async_update_entry(self.entry, data=data)
 
     def _advance_cursor(self, response: UsageResponse) -> None:
         """Persist the incremental cursor as the newest reading start we've imported.

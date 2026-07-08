@@ -77,3 +77,11 @@ CONF_INITIAL_HISTORY_SECONDS = "initial_history_seconds"
 # refresh fetches everything (since this field is absent on a new entry), every subsequent
 # refresh asks the utility only for what's been published since last time.
 CONF_LAST_FETCHED_AT = "last_fetched_at"
+
+# Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
+# title so two accounts at the same utility are distinguishable (see
+# [coordinator.GreenButtonCoordinator._async_ensure_customer_label]). CONF_CUSTOMER_LABEL doubles
+# as the "already attempted" marker — present (even as "") means we've tried and won't refetch.
+CONF_CUSTOMER_LABEL = "customer_label"
+CONF_CUSTOMER_ACCOUNT_ID = "customer_account_id"
+CONF_CUSTOMER_ADDRESS = "customer_address"

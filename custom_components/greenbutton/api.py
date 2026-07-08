@@ -228,6 +228,41 @@ class UsageResponse:
     new_credentials: NewCredentials | None
 
 
+@dataclass(frozen=True, slots=True)
+class CustomerInfo:
+    """Identifying customer details parsed from an ESPI RetailCustomer (customer-data) feed.
+
+    Used to give otherwise-identical config entries a human-distinguishable label. Two accounts
+    at the same utility (e.g. Milton Hydro's two sandbox test customers) show up as identical
+    entries until we surface the service address / account number.
+    """
+
+    account_id: str | None
+    service_address: str | None
+    customer_name: str | None
+
+    @property
+    def label(self) -> str | None:
+        """Best short one-line distinguisher for this customer, or None if nothing usable.
+
+        Prefers the service address (most human-recognizable), then the account id, then the
+        customer/organisation name.
+        """
+        return self.service_address or self.account_id or self.customer_name
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerResponse:
+    """A successful POST /proxy/customer response.
+
+    ``customer`` is None when the feed carried no recognizable customer payload (the parse
+    yielded nothing) — distinct from a fetch failure, which raises.
+    """
+
+    customer: CustomerInfo | None
+    new_credentials: NewCredentials | None
+
+
 class OpenGbApiError(Exception):
     """Catch-all proxy-server error.
 
@@ -370,10 +405,15 @@ class OpenGbApi:
             new_credentials = _new_credentials_from_headers(resp.headers)
             if resp.status == 401:
                 text = await resp.text()
-                error_code = _safe_json_error(text)
+                error_code = _safe_json_field(text, "error")
                 if error_code == "utility_auth_expired":
+                    # Surface the utility's own reason (the token endpoint's error_description,
+                    # forwarded by the proxy in `message`) so HA shows *why* re-auth is needed
+                    # — e.g. "refresh token expired" vs "already been redeemed".
+                    detail = _safe_json_field(text, "message")
+                    reason = f" ({detail})" if detail else ""
                     raise OpenGbAuthExpiredError(
-                        "Utility refresh token expired; user must re-authorize",
+                        f"Utility rejected the refresh token; re-authorization required{reason}",
                         new_credentials=new_credentials,
                     )
                 raise OpenGbApiError(
@@ -386,7 +426,7 @@ class OpenGbApi:
                 # (ESPI async batch). We don't implement the Notification/BatchList retrieval
                 # flow yet, so raise a distinct error the coordinator turns into a repair issue.
                 text = await resp.text()
-                error_code = _safe_json_error(text)
+                error_code = _safe_json_field(text, "error")
                 raise OpenGbDataPendingError(
                     "Utility is preparing data asynchronously (HTTP 202, "
                     f"{error_code or 'utility_data_pending'}); background data loads are not "
@@ -416,19 +456,76 @@ class OpenGbApi:
             new_credentials=new_credentials,
         )
 
+    async def fetch_customer(
+        self,
+        encrypted_refresh_blob: str,
+        proxy_token: str,
+    ) -> CustomerResponse:
+        """Pull the customer-data (ESPI RetailCustomer) feed from the proxy.
 
-def _safe_json_error(text: str) -> str | None:
-    """Pull the `error` field out of a JSON body, if present, without raising on malformed input.
+        The proxy locates the customer resource from the ESPI Authorization resource's
+        ``customerResourceURI`` and streams back the raw customer Atom XML, which we parse
+        locally via [espi.parse_customer_feed]. Used to give an otherwise-identical config
+        entry a human-distinguishable label (service address / account number).
 
-    The proxy emits ``{"error": "...", "message": "..."}`` on 4xx/5xx, but we don't want to
+        Rotated credentials arrive the same way as [fetch_usage] — via ``OpenGB-New-*``
+        response headers — and are attached to any raised error so the caller can persist them.
+
+        Raises:
+            OpenGbAuthExpiredError: utility refused our refresh token (HTTP 401 with
+                `error=utility_auth_expired`).
+            OpenGbApiError: any other failure (network, other 4xx/5xx). Notably the proxy
+                returns 400 `no_customer_uri` when the custodian advertises no customer
+                resource — a permanent condition the caller should not keep retrying.
+        """
+        # Local import to avoid an import cycle (espi.py imports this module's dataclasses).
+        from .espi import parse_customer_feed
+
+        url = f"{self._base}/proxy/customer"
+        body: dict[str, Any] = {"encryptedRefreshBlob": encrypted_refresh_blob}
+        headers = {**self.headers, "Authorization": f"Bearer {proxy_token}"}
+        async with self._session.post(url, headers=headers, json=body) as resp:
+            new_credentials = _new_credentials_from_headers(resp.headers)
+            if resp.status == 401:
+                text = await resp.text()
+                error_code = _safe_json_field(text, "error")
+                if error_code == "utility_auth_expired":
+                    detail = _safe_json_field(text, "message")
+                    reason = f" ({detail})" if detail else ""
+                    raise OpenGbAuthExpiredError(
+                        f"Utility rejected the refresh token; re-authorization required{reason}",
+                        new_credentials=new_credentials,
+                    )
+                raise OpenGbApiError(
+                    f"POST /proxy/customer returned 401 ({error_code}): {text[:_MAX_ERROR_CHARS]}",
+                    new_credentials=new_credentials,
+                )
+            if resp.status != 200:
+                text = await resp.text()
+                raise OpenGbApiError(
+                    f"POST /proxy/customer returned {resp.status}: {text[:_MAX_ERROR_CHARS]}",
+                    new_credentials=new_credentials,
+                )
+            xml_bytes = await resp.read()
+
+        customer = parse_customer_feed(xml_bytes)
+        return CustomerResponse(customer=customer, new_credentials=new_credentials)
+
+
+def _safe_json_field(text: str, field: str) -> str | None:
+    """Pull a top-level string field out of a JSON body, without raising on malformed input.
+
+    The proxy emits ``{"error": "...", "message": "..."}`` on 4xx/5xx (the `message` carries the
+    utility's own error, e.g. the token endpoint's `error_description`), but we don't want to
     explode on an empty body or a different shape.
     """
     import json
 
     try:
-        return json.loads(text).get("error")
+        value = json.loads(text).get(field)
     except (ValueError, AttributeError):
         return None
+    return value if isinstance(value, str) else None
 
 
 _HEADER_NEW_ENCRYPTED_REFRESH_BLOB = "OpenGB-New-Encrypted-Refresh-Blob"

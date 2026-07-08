@@ -154,9 +154,7 @@ async def test_per_interval_cost_writes_cumulative_cost_stat(hass: HomeAssistant
             hass, entry, _per_interval_cost_response(), utility_display_name="X"
         )
 
-    cost_calls = [
-        c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")
-    ]
+    cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
     assert len(cost_calls) == 1
     metadata, stats = cost_calls[0].args[1], cost_calls[0].args[2]
     assert metadata["unit_of_measurement"] == "CAD"
@@ -212,9 +210,7 @@ async def test_summary_cost_path_preserved_without_per_interval_cost(hass: HomeA
             hass, entry, _summary_only_response(), utility_display_name="X"
         )
 
-    cost_calls = [
-        c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")
-    ]
+    cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
     assert len(cost_calls) == 1  # summary path still writes a cost stat
     stats = cost_calls[0].args[2]
     # $40 split by consumption over 1 kWh + 3 kWh → $10 then $30 → cumulative 10, 40.

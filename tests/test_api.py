@@ -168,7 +168,8 @@ async def test_fetch_usage_translates_utility_auth_expired_to_distinct_exception
         json={"error": "utility_auth_expired", "message": "refresh expired"},
     )
 
-    with pytest.raises(OpenGbAuthExpiredError):
+    # The utility's own reason (proxy `message`) is surfaced in the exception so HA shows why.
+    with pytest.raises(OpenGbAuthExpiredError, match="refresh expired"):
         await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
 
 

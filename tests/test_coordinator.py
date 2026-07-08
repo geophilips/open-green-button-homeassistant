@@ -18,6 +18,8 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.greenbutton.api import (
+    CustomerInfo,
+    CustomerResponse,
     MeterReadingSeries,
     NewCredentials,
     NormalizedReadingType,
@@ -29,6 +31,7 @@ from custom_components.greenbutton.api import (
     UsageResponse,
 )
 from custom_components.greenbutton.const import (
+    CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_LAST_FETCHED_AT,
     CONF_PROXY_TOKEN,
@@ -51,6 +54,10 @@ def _entry(hass: HomeAssistant) -> MockConfigEntry:
             CONF_UTILITY_NAME: "Example Utility",
             CONF_ENCRYPTED_REFRESH_BLOB: "original_blob",
             CONF_PROXY_TOKEN: "original_token",
+            # Mark customer-labeling as already resolved so the shared entry doesn't trigger a
+            # (real) fetch_customer during these lifecycle tests. The dedicated customer-label
+            # tests use a fresh entry without this key.
+            CONF_CUSTOMER_LABEL: "",
         },
     )
     entry.add_to_hass(hass)
@@ -458,3 +465,169 @@ async def test_cursor_never_regresses_on_late_partial_window(hass: HomeAssistant
         await coordinator.async_refresh()
 
     assert entry.data[CONF_LAST_FETCHED_AT] == prior_dt.isoformat()  # held, not regressed
+
+
+# ---------------------------------------------------------------------------------------
+# Customer-labeling: give two otherwise-identical entries a distinguishable title.
+# These use a fresh entry WITHOUT CONF_CUSTOMER_LABEL so the one-time fetch actually runs.
+# ---------------------------------------------------------------------------------------
+
+
+def _fresh_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """An entry with no customer label yet — triggers the one-time customer fetch."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Milton Hydro (SANDBOX for testing only)",
+        data={
+            CONF_UTILITY_ID: "milton_hydro",
+            CONF_UTILITY_NAME: "Milton Hydro (SANDBOX for testing only)",
+            CONF_ENCRYPTED_REFRESH_BLOB: "original_blob",
+            CONF_PROXY_TOKEN: "original_token",
+        },
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+async def test_customer_label_retitles_entry_and_persists_details(hass: HomeAssistant) -> None:
+    """First successful refresh fetches customer data and folds a distinguisher into the title."""
+    from custom_components.greenbutton.const import (
+        CONF_CUSTOMER_ACCOUNT_ID,
+        CONF_CUSTOMER_ADDRESS,
+    )
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        return_value=CustomerResponse(
+            customer=CustomerInfo(
+                account_id="100001-0000001",
+                service_address="123 EXAMPLE ST, MILTON ON, L0L 0L0",
+                customer_name=None,
+            ),
+            new_credentials=None,
+        )
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+
+    api.fetch_customer.assert_awaited_once()
+    # Title gains the service address (the label's first preference).
+    assert entry.title == (
+        "Milton Hydro (SANDBOX for testing only) — 123 EXAMPLE ST, MILTON ON, L0L 0L0"
+    )
+    assert entry.data[CONF_CUSTOMER_LABEL] == "123 EXAMPLE ST, MILTON ON, L0L 0L0"
+    assert entry.data[CONF_CUSTOMER_ACCOUNT_ID] == "100001-0000001"
+    assert entry.data[CONF_CUSTOMER_ADDRESS] == "123 EXAMPLE ST, MILTON ON, L0L 0L0"
+
+
+async def test_customer_label_fetched_only_once(hass: HomeAssistant) -> None:
+    """Once a label is stored, later refreshes don't refetch customer data."""
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        return_value=CustomerResponse(
+            customer=CustomerInfo(account_id="ACC-1", service_address=None, customer_name=None),
+            new_credentials=None,
+        )
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+        await coordinator.async_refresh()
+
+    api.fetch_customer.assert_awaited_once()
+    assert entry.title == "Milton Hydro (SANDBOX for testing only) — ACC-1"
+
+
+async def test_customer_label_no_customer_uri_marks_unavailable(hass: HomeAssistant) -> None:
+    """A permanent `no_customer_uri` records an empty label so it isn't retried every poll."""
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbApiError("POST /proxy/customer returned 400: no_customer_uri")
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+        await coordinator.async_refresh()
+
+    # Attempted once, recorded unavailable, never retried; title unchanged.
+    api.fetch_customer.assert_awaited_once()
+    assert entry.data[CONF_CUSTOMER_LABEL] == ""
+    assert entry.title == "Milton Hydro (SANDBOX for testing only)"
+
+
+async def test_customer_label_transient_error_is_retried(hass: HomeAssistant) -> None:
+    """A transient customer-fetch failure leaves no label stored, so the next poll retries."""
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            OpenGbApiError("POST /proxy/customer returned 502: utility_upstream_error"),
+            CustomerResponse(
+                customer=CustomerInfo(account_id="ACC-9", service_address=None, customer_name=None),
+                new_credentials=None,
+            ),
+        ]
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+        assert CONF_CUSTOMER_LABEL not in entry.data  # transient → not marked, will retry
+        await coordinator.async_refresh()
+
+    assert api.fetch_customer.await_count == 2
+    assert entry.title == "Milton Hydro (SANDBOX for testing only) — ACC-9"
+
+
+async def test_customer_label_persists_rotated_credentials(hass: HomeAssistant) -> None:
+    """The customer fetch can rotate a one-time refresh token; the coordinator must persist it."""
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        return_value=CustomerResponse(
+            customer=CustomerInfo(account_id="ACC-1", service_address=None, customer_name=None),
+            new_credentials=NewCredentials(
+                encrypted_refresh_blob="rotated_blob",
+                proxy_token="rotated_token",  # noqa: S106
+            ),
+        )
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+
+    assert entry.data[CONF_ENCRYPTED_REFRESH_BLOB] == "rotated_blob"
+    assert entry.data[CONF_PROXY_TOKEN] == "rotated_token"  # noqa: S105

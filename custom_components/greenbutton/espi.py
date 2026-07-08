@@ -20,9 +20,11 @@ What's parsed:
   - UsageSummary (billing-period total + per-line-item cost breakdown for the Energy
                   dashboard's Cost column — see [statistics._import_cost_summaries])
 
-What's deliberately ignored (this round):
+What's deliberately ignored by the usage parser:
   - LocalTimeParameters (HA uses its own configured TZ)
-  - Customer-namespace payloads (not needed for the Energy dashboard)
+  - Customer-namespace payloads — these ride in a *separate* RetailCustomer feed and are
+    parsed by [parse_customer_feed] (account number + service address, used only to label
+    the config entry), not needed for the Energy dashboard itself.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from defusedxml.ElementTree import iterparse as _safe_iterparse
 from .api import (
     BillingSummary,
     CostDetail,
+    CustomerInfo,
     MeterReadingSeries,
     NormalizedReadingType,
     UsagePoint,
@@ -51,6 +54,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 _ESPI_NS = "http://naesb.org/espi"
+_CUST_NS = "http://naesb.org/espi/customer"
 
 _TAG_FEED = f"{{{_ATOM_NS}}}feed"
 _TAG_ENTRY = f"{{{_ATOM_NS}}}entry"
@@ -92,6 +96,23 @@ _TAG_AMOUNT = f"{{{_ESPI_NS}}}amount"
 _TAG_NOTE = f"{{{_ESPI_NS}}}note"
 _TAG_ITEM_KIND = f"{{{_ESPI_NS}}}itemKind"
 _TAG_UNIT_COST = f"{{{_ESPI_NS}}}unitCost"
+
+# Customer-namespace payloads (RetailCustomer feed) — parsed by [parse_customer_feed], not the
+# usage parser. See the ESPI customer schema (`http://naesb.org/espi/customer`).
+_TAG_CUST_CUSTOMER = f"{{{_CUST_NS}}}Customer"
+_TAG_CUST_ACCOUNT = f"{{{_CUST_NS}}}CustomerAccount"
+_TAG_CUST_SERVICE_LOCATION = f"{{{_CUST_NS}}}ServiceLocation"
+_TAG_CUST_ORGANISATION = f"{{{_CUST_NS}}}Organisation"
+_TAG_CUST_ORGANISATION_NAME = f"{{{_CUST_NS}}}organisationName"
+_TAG_CUST_ACCOUNT_ID = f"{{{_CUST_NS}}}accountId"
+_TAG_CUST_MAIN_ADDRESS = f"{{{_CUST_NS}}}mainAddress"
+_TAG_CUST_STREET_DETAIL = f"{{{_CUST_NS}}}streetDetail"
+_TAG_CUST_TOWN_DETAIL = f"{{{_CUST_NS}}}townDetail"
+_TAG_CUST_NUMBER = f"{{{_CUST_NS}}}number"
+_TAG_CUST_NAME = f"{{{_CUST_NS}}}name"
+_TAG_CUST_ADDRESS_GENERAL = f"{{{_CUST_NS}}}addressGeneral"
+_TAG_CUST_STATE_OR_PROVINCE = f"{{{_CUST_NS}}}stateOrProvince"
+_TAG_CUST_POSTAL_CODE = f"{{{_CUST_NS}}}postalCode"
 
 
 # Intermediate types — accumulated during iterparse and resolved into the public api.py
@@ -183,6 +204,114 @@ def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[U
         raw_interval_blocks,
         raw_summaries,
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Customer-data feed parsing — a small RetailCustomer feed carrying the account number and
+# service address, used only to label the config entry. Independent of the usage parser.
+# ---------------------------------------------------------------------------------------
+
+
+def parse_customer_feed(source: IO[bytes] | bytes) -> CustomerInfo | None:
+    """Parse an ESPI RetailCustomer (customer-data) Atom feed into a [CustomerInfo].
+
+    Extracts the first account id (``CustomerAccount/accountId``), the first service address
+    (``ServiceLocation/mainAddress``), and the customer/organisation name (``Customer``) — the
+    identifying bits used to distinguish two accounts at the same utility. Returns None when the
+    feed carried none of these (nothing recognizable to label with).
+    """
+    stream = io.BytesIO(source) if isinstance(source, bytes) else source
+
+    account_id: str | None = None
+    service_address: str | None = None
+    customer_name: str | None = None
+
+    for _event, elem in _safe_iterparse(stream, events=("end",)):
+        if elem.tag != _TAG_ENTRY:
+            continue
+        payload = _entry_payload(elem)
+        if payload is not None:
+            if payload.tag == _TAG_CUST_ACCOUNT and account_id is None:
+                account_id = _clean(payload.findtext(_TAG_CUST_ACCOUNT_ID))
+            elif payload.tag == _TAG_CUST_SERVICE_LOCATION and service_address is None:
+                service_address = _format_address(payload.find(_TAG_CUST_MAIN_ADDRESS))
+            elif payload.tag == _TAG_CUST_CUSTOMER and customer_name is None:
+                customer_name = _customer_name(payload)
+        elem.clear()
+
+    if account_id is None and service_address is None and customer_name is None:
+        return None
+    return CustomerInfo(
+        account_id=account_id,
+        service_address=service_address,
+        customer_name=customer_name,
+    )
+
+
+def _entry_payload(entry: ET.Element) -> ET.Element | None:
+    """The first child of an Atom ``<content>`` wrapper — the typed ESPI payload, or None."""
+    content = entry.find(f"{{{_ATOM_NS}}}content")
+    if content is None:
+        return None
+    return next(iter(content), None)
+
+
+def _customer_name(customer: ET.Element) -> str | None:
+    """Organisation name from a `<cust:Customer>` payload, if it carries one."""
+    org = customer.find(_TAG_CUST_ORGANISATION)
+    if org is None:
+        return None
+    return _clean(org.findtext(_TAG_CUST_ORGANISATION_NAME))
+
+
+def _format_address(address: ET.Element | None) -> str | None:
+    """Format a `<cust:mainAddress>` (or similar) element into a one-line address string.
+
+    Joins street ("123 EXAMPLE ST"), town+province ("BURLINGTON ON") and postal code with
+    commas, skipping any part that's absent — e.g. ``"123 EXAMPLE ST, BURLINGTON ON, L0L 0L0"``.
+    """
+    if address is None:
+        return None
+    parts: list[str] = []
+    street = _street_line(address.find(_TAG_CUST_STREET_DETAIL))
+    if street:
+        parts.append(street)
+    town = address.find(_TAG_CUST_TOWN_DETAIL)
+    if town is not None:
+        town_line = " ".join(
+            p
+            for p in (
+                _clean(town.findtext(_TAG_CUST_NAME)),
+                _clean(town.findtext(_TAG_CUST_STATE_OR_PROVINCE)),
+            )
+            if p
+        )
+        if town_line:
+            parts.append(town_line)
+    postal = _clean(address.findtext(_TAG_CUST_POSTAL_CODE))
+    if postal:
+        parts.append(postal)
+    return ", ".join(parts) or None
+
+
+def _street_line(street_detail: ET.Element | None) -> str | None:
+    """Street portion of an address: ``<number> <name>`` if present, else ``<addressGeneral>``."""
+    if street_detail is None:
+        return None
+    number = _clean(street_detail.findtext(_TAG_CUST_NUMBER))
+    name = _clean(street_detail.findtext(_TAG_CUST_NAME))
+    numbered = " ".join(p for p in (number, name) if p)
+    if numbered:
+        return numbered
+    return _clean(street_detail.findtext(_TAG_CUST_ADDRESS_GENERAL))
+
+
+def _clean(text: str | None) -> str | None:
+    """Whitespace-collapse a text value; return None when it's absent or blank."""
+    if text is None:
+        return None
+    collapsed = " ".join(text.split())
+    return collapsed or None
 
 
 # ---------------------------------------------------------------------------------------
