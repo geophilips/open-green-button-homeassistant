@@ -217,7 +217,14 @@ def _classify_entry(
             return
         meter_readings[mr_id] = _RawMeterReading(
             meter_reading_id=mr_id,
-            usage_point_id=_related_id(entry, "espi-entry/UsagePoint", "UsagePoint"),
+            # savagedata nests resources in the URL path
+            # (.../UsagePoint/{up}/MeterReading/{mr}) and omits the flat rel="related"
+            # espi-entry/UsagePoint link, so derive the parent UsagePoint from the self href first;
+            # fall back to the related link for custodians (Burlington) using flat resources.
+            usage_point_id=(
+                _id_from(self_link, "UsagePoint")
+                or _related_id(entry, "espi-entry/UsagePoint", "UsagePoint")
+            ),
             reading_type_id=_related_id(entry, "espi-entry/ReadingType", "ReadingType"),
         )
     elif payload.tag == _TAG_INTERVAL_BLOCK:
