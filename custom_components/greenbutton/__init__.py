@@ -75,10 +75,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # system-option silently stops all data updates. So we drive the periodic refresh
     # ourselves with an unconditional time interval that HA can't turn off. The first fetch
     # already ran above via async_config_entry_first_refresh; this covers every fetch after.
-    async def _async_poll(_now) -> None:
+    async def _async_poll(now) -> None:
+        _LOGGER.debug(
+            "Periodic poll firing for entry %s (scheduled tick %s)", entry.entry_id, now
+        )
         await coordinator.async_refresh()
 
     entry.async_on_unload(async_track_time_interval(hass, _async_poll, DEFAULT_SCAN_INTERVAL))
+    # Emitted once, immediately, on every successful setup. If you do NOT see this line in the
+    # log right after an HA (full) restart, the running code is stale — the deployed files or the
+    # loaded module predate the timer. A config-entry *reload* is not enough; Python caches the
+    # module, so only a full HA restart re-imports this file.
+    _LOGGER.info(
+        "Armed periodic poll for entry %s: every %s", entry.entry_id, DEFAULT_SCAN_INTERVAL
+    )
 
     # NOTE: deliberately NO `add_update_listener(...reload...)` here. The coordinator writes
     # bookkeeping (CONF_LAST_FETCHED_AT, rotated credentials) into entry.data on every poll;
