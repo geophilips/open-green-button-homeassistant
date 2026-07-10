@@ -29,6 +29,7 @@ MOCK_CLAIM_RESPONSE = {
 }
 
 PROXY_USAGE_URL = f"{SERVER_BASE_URL}/proxy/usage"
+PROXY_CUSTOMER_URL = f"{SERVER_BASE_URL}/proxy/customer"
 
 # Minimal but realistic /proxy/usage XML body — one UsagePoint (electricity), one
 # MeterReading, one IntervalBlock with two hourly readings, one ReadingType. After parsing

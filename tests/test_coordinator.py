@@ -26,6 +26,7 @@ from custom_components.greenbutton.api import (
     OpenGbApi,
     OpenGbApiError,
     OpenGbAuthExpiredError,
+    OpenGbPermanentError,
     UsagePoint,
     UsageReading,
     UsageResponse,
@@ -553,28 +554,35 @@ async def test_customer_label_fetched_only_once(hass: HomeAssistant) -> None:
     assert entry.title == "Milton Hydro (SANDBOX for testing only) — ACC-1"
 
 
-async def test_customer_label_no_customer_uri_marks_unavailable(hass: HomeAssistant) -> None:
-    """A permanent `no_customer_uri` records an empty label so it isn't retried every poll."""
-    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
-    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
-    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
-        side_effect=OpenGbApiError("POST /proxy/customer returned 400: no_customer_uri")
-    )
+async def test_customer_label_permanent_error_marks_unavailable(hass: HomeAssistant) -> None:
+    """A permanent (4xx) customer failure records an empty label so it isn't retried every poll.
 
-    entry = _fresh_entry(hass)
-    coordinator = GreenButtonCoordinator(hass, api, entry)
-
-    with patch(
-        "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+    Covers both real cases the proxy now surfaces as a propagated 4xx → OpenGbPermanentError:
+    the custodian advertising no customer resource (proxy 400 `no_customer_uri`) and refusing one
+    our scope can't access (Burlington's upstream 403 `access_denied`).
+    """
+    for err in (
+        OpenGbPermanentError("POST /proxy/customer returned 400 (permanent): no_customer_uri"),
+        OpenGbPermanentError("POST /proxy/customer returned 403 (permanent): access_denied"),
     ):
-        await coordinator.async_refresh()
-        await coordinator.async_refresh()
+        api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+        api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+        api.fetch_customer = AsyncMock(side_effect=err)  # type: ignore[method-assign]
 
-    # Attempted once, recorded unavailable, never retried; title unchanged.
-    api.fetch_customer.assert_awaited_once()
-    assert entry.data[CONF_CUSTOMER_LABEL] == ""
-    assert entry.title == "Milton Hydro (SANDBOX for testing only)"
+        entry = _fresh_entry(hass)
+        coordinator = GreenButtonCoordinator(hass, api, entry)
+
+        with patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ):
+            await coordinator.async_refresh()
+            await coordinator.async_refresh()
+
+        # Attempted once, recorded unavailable, never retried; title unchanged.
+        api.fetch_customer.assert_awaited_once()
+        assert entry.data[CONF_CUSTOMER_LABEL] == ""
+        assert entry.title == "Milton Hydro (SANDBOX for testing only)"
 
 
 async def test_customer_label_transient_error_is_retried(hass: HomeAssistant) -> None:

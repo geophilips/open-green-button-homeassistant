@@ -303,6 +303,18 @@ class OpenGbDataPendingError(OpenGbApiError):
     """
 
 
+class OpenGbPermanentError(OpenGbApiError):
+    """The request failed with a permanent (4xx) status — retrying will not help.
+
+    The proxy propagates the resource server's own HTTP status (it no longer collapses every
+    upstream failure to 502). A 4xx therefore means the utility gave a definitive client-error
+    answer for this request/scope/credential — e.g. Burlington's ``403 access_denied`` for a
+    customer-data resource our OAuth scope doesn't cover — as opposed to a transient 5xx. The
+    caller should stop retrying rather than loop forever. (``408 Request Timeout`` and ``429
+    Too Many Requests`` are excluded — those 4xx *are* retryable — see [fetch_customer].)
+    """
+
+
 class OpenGbApi:
     """Async client for the Open Green Button proxy server."""
 
@@ -502,6 +514,17 @@ class OpenGbApi:
                 )
             if resp.status != 200:
                 text = await resp.text()
+                # The proxy propagates the resource server's own status. A 4xx is permanent for
+                # this scope/credential (e.g. 403 access_denied on a customer resource the utility
+                # won't grant us) — raise a distinct error so the caller stops retrying, rather
+                # than a generic (retryable) OpenGbApiError. 408/429 are the retryable 4xx, so
+                # they stay transient. 5xx stays transient too.
+                if 400 <= resp.status < 500 and resp.status not in (408, 429):
+                    raise OpenGbPermanentError(
+                        f"POST /proxy/customer returned {resp.status} (permanent): "
+                        f"{text[:_MAX_ERROR_CHARS]}",
+                        new_credentials=new_credentials,
+                    )
                 raise OpenGbApiError(
                     f"POST /proxy/customer returned {resp.status}: {text[:_MAX_ERROR_CHARS]}",
                     new_credentials=new_credentials,

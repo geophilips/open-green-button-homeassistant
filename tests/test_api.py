@@ -19,10 +19,12 @@ from custom_components.greenbutton.api import (
     OpenGbApiError,
     OpenGbAuthExpiredError,
     OpenGbDataPendingError,
+    OpenGbPermanentError,
 )
 
 from .const import (
     MOCK_USAGE_XML,
+    PROXY_CUSTOMER_URL,
     PROXY_USAGE_URL,
     ROTATED_HEADERS,
     SERVER_BASE_URL,
@@ -199,6 +201,35 @@ async def test_fetch_usage_treats_5xx_as_generic_error(
     with pytest.raises(OpenGbApiError) as exc_info:
         await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
     assert not isinstance(exc_info.value, OpenGbAuthExpiredError)
+
+
+@pytest.mark.parametrize("status", [400, 403, 404])
+async def test_fetch_customer_treats_4xx_as_permanent(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    status: int,
+) -> None:
+    """A propagated 4xx (e.g. Burlington's 403 access_denied) is permanent — a distinct error the
+    coordinator uses to stop retrying customer data every poll."""
+    aioclient_mock.post(PROXY_CUSTOMER_URL, status=status, json={"error": "utility_upstream_error"})
+
+    with pytest.raises(OpenGbPermanentError):
+        await _api(hass).fetch_customer("blob_value", "token_value")  # noqa: S106
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 408, 429])
+async def test_fetch_customer_treats_5xx_and_retryable_4xx_as_transient(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    status: int,
+) -> None:
+    """5xx (server error) and the retryable 4xx (408 timeout, 429 rate-limited) stay transient —
+    a plain OpenGbApiError, so the label fetch is retried on the next poll rather than abandoned."""
+    aioclient_mock.post(PROXY_CUSTOMER_URL, status=status, json={"error": "utility_upstream_error"})
+
+    with pytest.raises(OpenGbApiError) as exc_info:
+        await _api(hass).fetch_customer("blob_value", "token_value")  # noqa: S106
+    assert not isinstance(exc_info.value, OpenGbPermanentError)
 
 
 async def test_fetch_usage_carries_rotated_credentials_on_error(

@@ -76,9 +76,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ourselves with an unconditional time interval that HA can't turn off. The first fetch
     # already ran above via async_config_entry_first_refresh; this covers every fetch after.
     async def _async_poll(now) -> None:
-        _LOGGER.debug(
-            "Periodic poll firing for entry %s (scheduled tick %s)", entry.entry_id, now
-        )
+        _LOGGER.debug("Periodic poll firing for entry %s (scheduled tick %s)", entry.entry_id, now)
         await coordinator.async_refresh()
 
     entry.async_on_unload(async_track_time_interval(hass, _async_poll, DEFAULT_SCAN_INTERVAL))
