@@ -477,6 +477,12 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         persisted any rotated credentials before raising.
         """
         probe_max = min(frontier + PROBE_WINDOW, now + PUBLISHED_MAX_LOOKAHEAD)
+        _LOGGER.debug(
+            "Cost probe for entry %s: fetching [%s, %s] to check for cost settled past frontier",
+            self.entry.entry_id,
+            frontier.isoformat(),
+            probe_max.isoformat(),
+        )
         try:
             response = await self._fetch(frontier, probe_max)
         except (UpdateFailed, ConfigEntryAuthFailed) as err:
@@ -487,7 +493,17 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             )
             return False
         newest_cost = _newest_cost_reading_start(response)
-        return newest_cost is not None and newest_cost > frontier
+        settled = newest_cost is not None and newest_cost > frontier
+        _LOGGER.debug(
+            "Cost probe for entry %s: newest costed reading=%s vs frontier=%s → %s",
+            self.entry.entry_id,
+            newest_cost.isoformat() if newest_cost is not None else None,
+            frontier.isoformat(),
+            "settled past frontier — widening this poll"
+            if settled
+            else "nothing new — staying tight",
+        )
+        return settled
 
     async def async_rebuild_statistics(self) -> None:
         """Rebuild this entry's statistics from a full re-fetch — non-destructively.
