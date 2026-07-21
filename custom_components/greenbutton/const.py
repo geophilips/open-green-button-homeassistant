@@ -32,9 +32,18 @@ INITIAL_FETCH_LOOKBACK = timedelta(days=2 * 365)
 # minutes in our future, and we don't want to miss it on the next sliding-window poll.
 PUBLISHED_MAX_LOOKAHEAD = timedelta(days=1)
 
-# The default cadence at which the (future) DataUpdateCoordinator polls the proxy for new
-# usage data. Configurable later via the options flow.
-DEFAULT_SCAN_INTERVAL = timedelta(hours=6)
+# The default cadence at which the DataUpdateCoordinator polls the proxy for new usage data.
+# The authoritative, per-utility value comes from the server in the claim response and is stored
+# as `CONF_POLL_INTERVAL_SECONDS`; this constant is used ONLY when that value is absent (entries
+# created before the server exposed it, or a self-hosted server that doesn't). Utilities publish
+# on a multi-hour-to-multi-day lag, so a daily poll captures everything without over-polling.
+DEFAULT_SCAN_INTERVAL = timedelta(days=1)
+
+# How far past a trailing metric frontier the coordinator's cheap "has anything settled?" probe
+# reaches (see coordinator._settled_past_frontier). A narrow historical window — 48 hourly rows —
+# is enough because settlement is contiguous oldest-first, so the first hour past the frontier is
+# the first to gain data; the couple-day span is just alignment margin.
+PROBE_WINDOW = timedelta(days=2)
 
 # The hosted proxy server. May be overridden per-config-entry for self-hosters via the
 # server_base_url in entry.data.
@@ -72,11 +81,31 @@ CONF_LAST_IMPORTED = "last_imported"
 # back to INITIAL_FETCH_LOOKBACK. (Re-authorizing an existing entry refreshes this value.)
 CONF_INITIAL_HISTORY_SECONDS = "initial_history_seconds"
 
+# Per-utility poll cadence, in seconds, from the claim response (`pollIntervalSeconds`). Drives
+# the coordinator's update_interval (single interval — there is no separate slow cadence; each
+# poll cheaply probes the trailing frontier and only widens when data actually settled). Absent on
+# entries created before the server exposed it → coordinator falls back to DEFAULT_SCAN_INTERVAL.
+# (Re-auth refreshes it.)
+CONF_POLL_INTERVAL_SECONDS = "poll_interval_seconds"
+
 # UTC ISO 8601 timestamp of the most recent successful /proxy/usage call. The coordinator
 # uses this to scope subsequent requests via ESPI's `published-min` query param — first
 # refresh fetches everything (since this field is absent on a new entry), every subsequent
 # refresh asks the utility only for what's been published since last time.
+#
+# There is one frontier cursor PER METRIC, because metrics settle on different clocks:
+#   - CONF_LAST_FETCHED_AT  — the *usage* frontier: the newest reading start we've imported.
+#   - CONF_COST_FETCHED_AT  — the *cost* frontier: the newest FORWARD reading that carried a
+#     settled `<cost>`. Advances only when a poll actually retrieves cost.
+# A metric that settles late (usually cost, a billing cycle behind usage) leaves its frontier
+# trailing. Each poll fetches the routine slice from the leading frontier to now, and cheaply
+# probes just past any trailing frontier (see coordinator._settled_past_frontier); when the probe
+# shows the utility has settled new data there, that one fetch widens its `published-min` back to
+# the trailing frontier to pull the tail. The split is required because ESPI's published-min
+# filters by data date, not change date, so a single leader-anchored cursor could never re-see a
+# metric retroactively settled onto old intervals.
 CONF_LAST_FETCHED_AT = "last_fetched_at"
+CONF_COST_FETCHED_AT = "cost_fetched_at"
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

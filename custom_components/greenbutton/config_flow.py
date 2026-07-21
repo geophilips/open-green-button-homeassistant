@@ -44,6 +44,7 @@ from .const import (
     CONF_CLAIM_CODE,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_INITIAL_HISTORY_SECONDS,
+    CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
     CONF_SCOPE,
     CONF_SERVER_BASE_URL,
@@ -283,4 +284,5 @@ def _entry_data(
         CONF_SCOPE: claim.scope,
         CONF_API_VERSION: claim.current_api_version,
         CONF_INITIAL_HISTORY_SECONDS: claim.initial_history_seconds,
+        CONF_POLL_INTERVAL_SECONDS: claim.poll_interval_seconds,
     }

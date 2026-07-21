@@ -8,7 +8,7 @@ mode, when to persist rotated credentials, etc.).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
@@ -32,14 +32,19 @@ from custom_components.greenbutton.api import (
     UsageResponse,
 )
 from custom_components.greenbutton.const import (
+    CONF_COST_FETCHED_AT,
     CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_LAST_FETCHED_AT,
+    CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_ID,
     CONF_UTILITY_NAME,
+    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     INITIAL_FETCH_LOOKBACK,
+    LAST_FETCHED_OVERLAP,
+    PROBE_WINDOW,
 )
 from custom_components.greenbutton.coordinator import GreenButtonCoordinator
 
@@ -639,3 +644,296 @@ async def test_customer_label_persists_rotated_credentials(hass: HomeAssistant) 
 
     assert entry.data[CONF_ENCRYPTED_REFRESH_BLOB] == "rotated_blob"
     assert entry.data[CONF_PROXY_TOKEN] == "rotated_token"  # noqa: S105
+
+
+# ---------------------------------------------------------------------------------------
+# Single-interval polling with a cheap probe: routine window + probe-then-widen for cost.
+# ---------------------------------------------------------------------------------------
+
+
+def _response_with_cost(*pairs: tuple[datetime, float | None]) -> UsageResponse:
+    """A FORWARD series with (start, cost) readings; cost=None ⇒ not yet settled by the utility."""
+    readings = [
+        UsageReading(start=s, duration_seconds=3600, value=1000.0, cost=c) for s, c in pairs
+    ]
+    series = MeterReadingSeries(
+        meter_reading_id="mr1", reading_type=_reading_type(), readings=readings
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def _api_returning(response: UsageResponse) -> OpenGbApi:
+    """API whose fetch_usage returns `response` for every call (probe and main alike)."""
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=response)  # type: ignore[method-assign]
+    return api
+
+
+def _api_sequence(*responses: object) -> OpenGbApi:
+    """API whose fetch_usage yields each item in turn (probe = call 0, main = call 1)."""
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(side_effect=list(responses))  # type: ignore[method-assign]
+    return api
+
+
+async def test_update_interval_uses_server_poll_interval(hass: HomeAssistant) -> None:
+    """The coordinator polls at the per-utility cadence the server sent in the claim response."""
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_POLL_INTERVAL_SECONDS: 3600}
+    )
+    coordinator = GreenButtonCoordinator(hass, _api_returning(_empty_response()), entry)
+    assert coordinator.update_interval == timedelta(seconds=3600)
+
+
+async def test_update_interval_falls_back_to_default(hass: HomeAssistant) -> None:
+    """An entry without the server-supplied cadence uses the local default (daily)."""
+    entry = _entry(hass)  # no CONF_POLL_INTERVAL_SECONDS
+    coordinator = GreenButtonCoordinator(hass, _api_returning(_empty_response()), entry)
+    assert coordinator.update_interval == DEFAULT_SCAN_INTERVAL
+
+
+async def test_probe_skipped_when_cost_caught_up(hass: HomeAssistant) -> None:
+    """No trailing frontier ⇒ no probe: a single fetch anchored at the usage frontier."""
+    frontier = datetime(2026, 7, 18, 5, 0, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: frontier.isoformat(),
+            CONF_COST_FETCHED_AT: frontier.isoformat(),  # level with usage
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()
+    ):
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()  # probe skipped — one call only
+    assert api.fetch_usage.await_args.kwargs["published_min"] == frontier - LAST_FETCHED_OVERLAP
+
+
+async def test_routine_poll_stays_tight_when_probe_finds_nothing(hass: HomeAssistant) -> None:
+    """Cost frontier trails, but the probe shows nothing new ⇒ main fetch stays at usage frontier.
+
+    This is the steady state: cheap probe every poll, no month-wide reach-back until cost settles.
+    """
+    usage_frontier = datetime(2026, 7, 18, 5, 0, tzinfo=UTC)
+    cost_frontier = datetime(2026, 6, 1, 23, 0, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: usage_frontier.isoformat(),
+            CONF_COST_FETCHED_AT: cost_frontier.isoformat(),
+        },
+    )
+    api = _api_returning(_empty_response())  # probe returns no cost past the frontier
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()
+    ):
+        await coordinator.async_refresh()
+
+    assert api.fetch_usage.await_count == 2  # probe + main
+    # Main fetch (the last call) stays tight at the usage frontier.
+    assert (
+        api.fetch_usage.await_args.kwargs["published_min"] == usage_frontier - LAST_FETCHED_OVERLAP
+    )
+
+
+async def test_probe_targets_just_past_the_cost_frontier(hass: HomeAssistant) -> None:
+    """The probe's window is [cost_frontier, cost_frontier + PROBE_WINDOW] — narrow, not to now."""
+    usage_frontier = datetime(2026, 7, 18, 5, 0, tzinfo=UTC)
+    cost_frontier = datetime(2026, 6, 1, 23, 0, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: usage_frontier.isoformat(),
+            CONF_COST_FETCHED_AT: cost_frontier.isoformat(),
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()
+    ):
+        await coordinator.async_refresh()
+
+    probe_call = api.fetch_usage.await_args_list[0]  # first call is the probe
+    assert probe_call.kwargs["published_min"] == cost_frontier
+    assert probe_call.kwargs["published_max"] == cost_frontier + PROBE_WINDOW
+
+
+async def test_probe_hit_widens_main_fetch_and_pulls_settled_cost(hass: HomeAssistant) -> None:
+    """When the probe finds cost settled past the frontier, the main fetch reaches back to it.
+
+    This is the whole point: newly-settled cost is detected within one poll (not a 7-day wait),
+    and the wide fetch happens only because data actually appeared.
+    """
+    usage_frontier = datetime(2026, 7, 18, 5, 0, tzinfo=UTC)
+    cost_frontier = datetime(2026, 6, 1, 23, 0, tzinfo=UTC)
+    settled = _response_with_cost(
+        (datetime(2026, 6, 1, 23, 0, tzinfo=UTC), 0.5),  # the frontier hour (already had cost)
+        (datetime(2026, 6, 2, 5, 0, tzinfo=UTC), 0.6),  # newly settled — strictly past the frontier
+    )
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: usage_frontier.isoformat(),
+            CONF_COST_FETCHED_AT: cost_frontier.isoformat(),
+        },
+    )
+    api = _api_sequence(settled, settled)  # probe sees it → widen; main pulls it
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()
+    ):
+        await coordinator.async_refresh()
+
+    # Main fetch reached back to the cost frontier...
+    assert (
+        api.fetch_usage.await_args.kwargs["published_min"] == cost_frontier - LAST_FETCHED_OVERLAP
+    )
+    # ...and the cost cursor advanced onto the newly-settled hour.
+    assert entry.data[CONF_COST_FETCHED_AT] == datetime(2026, 6, 2, 5, 0, tzinfo=UTC).isoformat()
+
+
+async def test_probe_failure_is_swallowed_and_routine_poll_proceeds(hass: HomeAssistant) -> None:
+    """A failed probe never blocks the routine import — it just skips the reach-back this poll."""
+    usage_frontier = datetime(2026, 7, 18, 5, 0, tzinfo=UTC)
+    cost_frontier = datetime(2026, 6, 1, 23, 0, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: usage_frontier.isoformat(),
+            CONF_COST_FETCHED_AT: cost_frontier.isoformat(),
+        },
+    )
+    api = _api_sequence(UpdateFailed("probe boom"), _empty_response())  # probe raises, main ok
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()
+    ):
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None  # the poll still succeeded
+    # Main fetch went ahead at the usage frontier (no widen, since the probe couldn't confirm).
+    assert (
+        api.fetch_usage.await_args.kwargs["published_min"] == usage_frontier - LAST_FETCHED_OVERLAP
+    )
+
+
+async def test_cost_cursor_advances_only_to_newest_costed_reading(hass: HomeAssistant) -> None:
+    """The two frontiers diverge: usage tracks the newest reading, cost the newest *costed* one."""
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_LAST_FETCHED_AT: "2026-05-31T05:00:00+00:00"}
+    )
+    api = _api_returning(
+        _response_with_cost(
+            (datetime(2026, 6, 1, 5, 0, tzinfo=UTC), 0.5),
+            (datetime(2026, 6, 2, 5, 0, tzinfo=UTC), 0.6),
+            (datetime(2026, 6, 3, 5, 0, tzinfo=UTC), None),  # settled cost hasn't reached here
+        )
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with (
+        patch("custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()),
+        # No stored cost frontier and none to recover ⇒ no probe; just verify cursor advancement.
+        patch(
+            "custom_components.greenbutton.coordinator.async_cost_frontier_for_entry",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        await coordinator.async_refresh()
+
+    assert entry.data[CONF_COST_FETCHED_AT] == datetime(2026, 6, 2, 5, 0, tzinfo=UTC).isoformat()
+    assert entry.data[CONF_LAST_FETCHED_AT] == datetime(2026, 6, 3, 5, 0, tzinfo=UTC).isoformat()
+
+
+async def test_cost_cursor_held_when_window_has_no_cost(hass: HomeAssistant) -> None:
+    """A routine poll of recent, uncosted data must not disturb the cost frontier."""
+    prior_cost = "2026-06-01T23:00:00+00:00"
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: "2026-07-17T05:00:00+00:00",
+            CONF_COST_FETCHED_AT: prior_cost,
+        },
+    )
+    api = _api_returning(_response_with_cost((datetime(2026, 7, 18, 5, 0, tzinfo=UTC), None)))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()
+    ):
+        await coordinator.async_refresh()
+
+    assert entry.data[CONF_COST_FETCHED_AT] == prior_cost  # unchanged
+
+
+async def test_cost_frontier_bootstrapped_from_statistics_when_absent(
+    hass: HomeAssistant,
+) -> None:
+    """A pre-cursor entry (cost already imported, no cost_fetched_at) self-heals its frontier.
+
+    The frontier is recovered from the recorder so the probe has something to check — no rebuild,
+    no reauth. Migration path for entries that existed before the cost cursor.
+    """
+    usage_frontier = datetime(2026, 7, 18, 5, 0, tzinfo=UTC)
+    derived = datetime(2026, 6, 1, 23, 0, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_LAST_FETCHED_AT: usage_frontier.isoformat()}
+    )
+    api = _api_returning(_empty_response())  # probe finds nothing new this poll
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with (
+        patch("custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()),
+        patch(
+            "custom_components.greenbutton.coordinator.async_cost_frontier_for_entry",
+            new=AsyncMock(return_value=derived),
+        ),
+    ):
+        await coordinator.async_refresh()
+
+    # Cursor was seeded from stats (so subsequent probes have a frontier to check).
+    assert entry.data[CONF_COST_FETCHED_AT] == derived.isoformat()
+
+
+async def test_cost_bootstrap_is_noop_when_no_prior_cost_stats(hass: HomeAssistant) -> None:
+    """With no cost history to recover, no frontier is set and no probe runs (single fetch)."""
+    usage_frontier = datetime(2026, 7, 18, 5, 0, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_LAST_FETCHED_AT: usage_frontier.isoformat()}
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with (
+        patch("custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()),
+        patch(
+            "custom_components.greenbutton.coordinator.async_cost_frontier_for_entry",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        await coordinator.async_refresh()
+
+    assert CONF_COST_FETCHED_AT not in entry.data
+    api.fetch_usage.assert_awaited_once()  # no probe — single fetch
+    assert (
+        api.fetch_usage.await_args.kwargs["published_min"] == usage_frontier - LAST_FETCHED_OVERLAP
+    )

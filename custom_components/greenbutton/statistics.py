@@ -119,6 +119,39 @@ async def async_clear_statistics_for_entry(hass: HomeAssistant, entry_id: str) -
     return owned
 
 
+async def async_cost_frontier_for_entry(hass: HomeAssistant, entry_id: str) -> datetime | None:
+    """Newest already-imported cost hour for this entry, across all its cost statistics.
+
+    The coordinator's cost cursor (`CONF_COST_FETCHED_AT`) is normally advanced as cost is
+    imported — but entries that imported cost *before* the two-cursor polling existed have no
+    stored cursor. Their cost frontier is nonetheless recoverable: it's the newest hour of the
+    entry's `_cost` statistic. This lets the coordinator bootstrap the cursor from the recorder
+    on the first sweep, so pre-existing entries pick up settlement-lagged cost with no rebuild.
+
+    Returns the MINIMUM of the per-usage-point frontiers (the least-caught-up cost series) so a
+    single sweep window reaches back far enough to cover every one. None when the entry has no
+    cost rows yet (never had cost, or a brand-new entry) — the sweep then stays a no-op.
+    """
+    prefix = statistic_id_prefix_for_entry(entry_id)
+    all_ids = await async_list_statistic_ids(hass)
+    cost_ids = [
+        item["statistic_id"]
+        for item in all_ids
+        if item.get("source") == DOMAIN
+        and item["statistic_id"].startswith(prefix)
+        and item["statistic_id"].endswith("_cost")
+    ]
+    frontier: datetime | None = None
+    for statistic_id in cost_ids:
+        _, last_start_epoch = await _resume_point(hass, statistic_id)
+        if last_start_epoch is None:
+            continue
+        last_start = datetime.fromtimestamp(last_start_epoch, tz=UTC)
+        if frontier is None or last_start < frontier:
+            frontier = last_start
+    return frontier
+
+
 def _slugify(component: str) -> str:
     """Lowercase + replace non-alphanumeric with underscore.
 

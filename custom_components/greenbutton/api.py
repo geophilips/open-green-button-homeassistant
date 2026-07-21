@@ -60,6 +60,9 @@ class ClaimResponse:
     # Per-utility initial-backfill window in seconds. Older servers omit it → None, and the
     # coordinator falls back to its local default.
     initial_history_seconds: int | None = None
+    # Per-utility poll cadence in seconds. Older servers omit it → None, and the coordinator
+    # falls back to DEFAULT_SCAN_INTERVAL.
+    poll_interval_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +364,7 @@ class OpenGbApi:
             scope=payload.get("scope"),
             current_api_version=payload["currentApiVersion"],
             initial_history_seconds=payload.get("initialHistorySeconds"),
+            poll_interval_seconds=payload.get("pollIntervalSeconds"),
         )
 
     async def fetch_usage(

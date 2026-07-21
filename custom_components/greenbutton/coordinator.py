@@ -5,7 +5,10 @@ long-term statistics so the data shows up in the Energy dashboard. The coordinat
 that fetch + write into HA's standard refresh/retry/reauth lifecycle.
 
 Behaviour summary:
-  - Polls the proxy at ``DEFAULT_SCAN_INTERVAL`` (currently 6h).
+  - Polls the proxy at the per-utility cadence from the claim response (``pollIntervalSeconds``,
+    default daily), falling back to ``DEFAULT_SCAN_INTERVAL``. Each poll also cheaply probes just
+    past the trailing metric frontier and, only when the utility has settled new data there,
+    widens that fetch's `published-min` to pick up the settlement-lagged tail (usually cost).
   - On ``OpenGbAuthExpiredError`` → raises ``ConfigEntryAuthFailed``, which HA turns into
     a reauth notification + flow.
   - On any other ``OpenGbApiError`` / network error → raises ``UpdateFailed`` (transient).
@@ -34,21 +37,28 @@ from .api import (
 )
 from .const import (
     BACKGROUND_LOAD_ISSUE_URL,
+    CONF_COST_FETCHED_AT,
     CONF_CUSTOMER_ACCOUNT_ID,
     CONF_CUSTOMER_ADDRESS,
     CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_INITIAL_HISTORY_SECONDS,
     CONF_LAST_FETCHED_AT,
+    CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
+    PROBE_WINDOW,
     PUBLISHED_MAX_LOOKAHEAD,
 )
-from .statistics import async_clear_statistics_for_entry, import_usage_statistics
+from .statistics import (
+    async_clear_statistics_for_entry,
+    async_cost_frontier_for_entry,
+    import_usage_statistics,
+)
 from .storage import xml_cache_path
 
 if TYPE_CHECKING:
@@ -76,6 +86,32 @@ def _newest_reading_start(response: UsageResponse) -> datetime | None:
     return newest
 
 
+def _newest_cost_reading_start(response: UsageResponse) -> datetime | None:
+    """Return the latest FORWARD reading ``start`` that carried a settled ``cost``, or None.
+
+    This is the *cost frontier* — the point up to which the utility has itemized per-interval
+    cost. It trails [_newest_reading_start] (the usage frontier) because cost settles a billing
+    cycle late. Anchors the cost cursor (see
+    [GreenButtonCoordinator._advance_cost_cursor]); REVERSE flow is excluded for the same reason
+    it is in the cost importer — export isn't part of consumption cost.
+
+    Assumes the utility settles cost contiguously oldest-first (Burlington does — verified: a
+    clean per-month cliff, no interior gaps). If a custodian ever left a hole behind the newest
+    costed hour, taking the max would step the cursor past it; revisit only if that shows up.
+    """
+    newest: datetime | None = None
+    for up in response.usage_points:
+        for series in up.series:
+            if series.reading_type.flow_direction != "FORWARD":
+                continue
+            for reading in series.readings:
+                if reading.cost is None:
+                    continue
+                if newest is None or reading.start > newest:
+                    newest = reading.start
+    return newest
+
+
 def _parse_iso_or_none(raw: object) -> datetime | None:
     """Parse a stored ISO 8601 timestamp, tolerating None / non-str / corrupt values."""
     if not isinstance(raw, str):
@@ -84,6 +120,18 @@ def _parse_iso_or_none(raw: object) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _seconds_or_default(raw: object, default: timedelta) -> timedelta:
+    """A stored positive-number seconds value as a timedelta, else ``default``.
+
+    Used for the server-supplied poll cadence (`CONF_POLL_INTERVAL_SECONDS`): absent (older server
+    / pre-existing entry) or malformed ⇒ the client's local default, so the server stays the single
+    source of truth without a second place to configure the window.
+    """
+    if isinstance(raw, (int, float)) and raw > 0:
+        return timedelta(seconds=raw)
+    return default
 
 
 def _write_xml_sync(path: str, data: bytes) -> None:
@@ -115,7 +163,11 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             # "passing the ConfigEntry to your DataUpdateCoordinator".
             config_entry=entry,
             name=DOMAIN,
-            update_interval=DEFAULT_SCAN_INTERVAL,
+            # Per-utility cadence from the claim response (server is the source of truth);
+            # DEFAULT_SCAN_INTERVAL only for entries created before the server exposed it.
+            update_interval=_seconds_or_default(
+                entry.data.get(CONF_POLL_INTERVAL_SECONDS), DEFAULT_SCAN_INTERVAL
+            ),
         )
         self.api = api
         self.entry = entry
@@ -127,7 +179,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
     async def _async_update_data(self) -> UsageResponse:
         """Fetch, persist rotated credentials, then write statistics."""
         now = datetime.now(UTC)
-        published_min = self._published_min(now)
+        published_min = await self._published_min(now)
         published_max = now + PUBLISHED_MAX_LOOKAHEAD
 
         _LOGGER.info(
@@ -162,9 +214,10 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         # (guarded to run once) and best-effort — never lets a customer-fetch hiccup fail the poll.
         await self._async_ensure_customer_label()
 
-        # Advance the incremental cursor. Done LAST so a partial failure (stats write throwing)
-        # doesn't move it and leave a gap.
+        # Advance the incremental cursors. Done LAST so a partial failure (stats write throwing)
+        # doesn't move them and leave a gap.
         self._advance_cursor(response)
+        self._advance_cost_cursor(response)
         # A full-history rebuild has now landed; revert to incremental polling.
         self._force_full_history = False
         return response
@@ -358,6 +411,84 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             data={**self.entry.data, CONF_LAST_FETCHED_AT: cursor_iso},
         )
 
+    def _advance_cost_cursor(self, response: UsageResponse) -> None:
+        """Persist the cost frontier — the newest FORWARD reading start that carried a cost.
+
+        Mirrors [_advance_cursor] but for cost, which settles a billing cycle behind usage. Moves
+        forward only, and only on a response that actually carried cost — so a routine poll of
+        recent, uncosted data leaves it untouched, and it advances only when a probe-triggered
+        reach-back pulls newly-settled cost. That trailing frontier is what the next poll's probe
+        checks and, on a hit, reaches `published-min` back to; see [_published_min].
+        """
+        newest = _newest_cost_reading_start(response)
+        if newest is None:
+            return  # No cost in this window — leave the frontier where it is.
+        prior_raw = self.entry.data.get(CONF_COST_FETCHED_AT)
+        prior = _parse_iso_or_none(prior_raw)
+        cursor = newest if prior is None else max(prior, newest)
+        cursor_iso = cursor.isoformat()
+        if cursor_iso == prior_raw:
+            return  # No forward movement — avoid a no-op entry write.
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_COST_FETCHED_AT: cursor_iso},
+        )
+
+    async def _bootstrap_cost_cursor_if_missing(self) -> None:
+        """Seed `CONF_COST_FETCHED_AT` from existing statistics when it's absent.
+
+        Migration path for entries that imported cost before the cost cursor existed: without a
+        stored frontier a sweep can't widen (it doesn't know how far back cost coverage reaches),
+        and a routine poll of recent, uncosted data would never set one — so the fix would never
+        self-activate. The frontier is recoverable from the recorder (the newest hour of the
+        entry's `_cost` statistic), so derive it once. No-op when the cursor is already set or the
+        entry has no cost rows yet (a genuinely new entry seeds the cursor from its first import).
+        """
+        if _parse_iso_or_none(self.entry.data.get(CONF_COST_FETCHED_AT)) is not None:
+            return
+        frontier = await async_cost_frontier_for_entry(self.hass, self.entry.entry_id)
+        if frontier is None:
+            return
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_COST_FETCHED_AT: frontier.isoformat()},
+        )
+        _LOGGER.info(
+            "Bootstrapped cost frontier for entry %s from existing statistics: %s",
+            self.entry.entry_id,
+            frontier.isoformat(),
+        )
+
+    async def _settled_past_frontier(self, frontier: datetime, now: datetime) -> bool:
+        """Cheap probe: has the utility settled cost past `frontier`?
+
+        Fetches a narrow window just past the frontier ([frontier, frontier + PROBE_WINDOW]) — 48
+        rows, not a reach-to-now — and reports whether a FORWARD reading beyond the frontier now
+        carries `<cost>`. This lets the routine poll stay tight while still detecting, within one
+        poll, that the lagging metric advanced; the caller then widens the *main* fetch's
+        `published-min` back to `frontier` to pull the settled tail. `published-min` filters by
+        data date, so this narrow historical query is legal and light.
+
+        The `> frontier` test is load-bearing: the frontier hour itself is in-window and already
+        costed, so only a costed reading *strictly after* it signals genuinely new settlement.
+
+        Errors are swallowed (→ False): a flaky probe must never block the routine import. The main
+        fetch that follows surfaces any real auth/transient failure, and `_fetch` has already
+        persisted any rotated credentials before raising.
+        """
+        probe_max = min(frontier + PROBE_WINDOW, now + PUBLISHED_MAX_LOOKAHEAD)
+        try:
+            response = await self._fetch(frontier, probe_max)
+        except (UpdateFailed, ConfigEntryAuthFailed) as err:
+            _LOGGER.debug(
+                "Cost probe for entry %s failed (%s); skipping reach-back this poll",
+                self.entry.entry_id,
+                err,
+            )
+            return False
+        newest_cost = _newest_cost_reading_start(response)
+        return newest_cost is not None and newest_cost > frontier
+
     async def async_rebuild_statistics(self) -> None:
         """Rebuild this entry's statistics from a full re-fetch — non-destructively.
 
@@ -391,7 +522,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         now = datetime.now(UTC)
         self._force_full_history = True
         try:
-            published_min = self._published_min(now)
+            published_min = await self._published_min(now)
             published_max = now + PUBLISHED_MAX_LOOKAHEAD
             _LOGGER.info(
                 "Rebuild for entry %s: re-fetching full history (published-min=%s) before purge",
@@ -437,8 +568,11 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         )
         self._async_clear_background_load_issue()
         self._advance_cursor(response)
+        # The full-history re-fetch spans every frontier, so re-anchor the cost cursor too —
+        # otherwise it'd be stale relative to the freshly-imported data.
+        self._advance_cost_cursor(response)
         # Publish the fresh response into the coordinator (updates .data, marks the update
-        # successful, notifies listeners, and re-arms the 6h poll) without a second fetch.
+        # successful, notifies listeners, and re-arms the poll) without a second fetch.
         self.async_set_updated_data(response)
         _LOGGER.info("Rebuild complete for entry %s", self.entry.entry_id)
 
@@ -493,7 +627,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
 
         return sink
 
-    def _published_min(self, now: datetime) -> datetime:
+    async def _published_min(self, now: datetime) -> datetime:
         """Return the `published_min` value to send on the next /proxy/usage call.
 
         Always returns a concrete instant — never None. This is a deliberate workaround for
@@ -505,14 +639,22 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         `_force_full_history` — we look back by the per-utility initial-history window the
         server supplied in the claim response: a bounded initial import that keeps the
         utility's data-collection job and our statistics write manageable. Subsequent refreshes
-        ask for the slice since the cursor, minus a small overlap that absorbs clock skew and
-        any late-arriving corrections.
+        ask for the slice since the usage frontier, minus a small overlap that absorbs clock skew
+        and any late-arriving corrections.
 
-        The cursor (`CONF_LAST_FETCHED_AT`) is the newest *reading* we've imported, NOT the
-        wall-clock time of the last poll (see [_advance_cursor]). Anchoring it to the data
-        frontier is load-bearing: utilities publish on a multi-day lag, so a wall-clock cursor
-        would push `published-min` past the not-yet-published data and every later poll would
-        come back empty.
+        The usage frontier (`CONF_LAST_FETCHED_AT`) is the newest *reading* we've imported, NOT
+        wall-clock (see [_advance_cursor]). Anchoring to the data frontier is load-bearing:
+        utilities publish on a multi-day lag, so a wall-clock cursor would push `published-min`
+        past not-yet-published data and every later poll would come back empty.
+
+        Cost settles a billing cycle behind usage, and `published-min` filters by data date (not
+        change date), so a usage-anchored window can never re-see cost the utility settles onto old
+        intervals after the fact. Rather than pay a monthly-wide fetch on a schedule, each poll
+        cheaply probes just past the trailing cost frontier ([_settled_past_frontier]); only when
+        that probe shows new settlement do we reach `published-min` back to the cost frontier so
+        this one fetch also pulls the settled tail. So the routine window stays tight, newly-settled
+        cost is caught within a single poll, and the wide fetch happens only when data actually
+        appeared — never on an empty schedule.
         """
         if self._force_full_history:
             return now - self._initial_lookback()
@@ -520,7 +662,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         if raw is None:
             return now - self._initial_lookback()
         try:
-            last_fetched = datetime.fromisoformat(raw)
+            usage_frontier = datetime.fromisoformat(raw)
         except ValueError:
             # Stored value is corrupt — drop back to a full refetch rather than silently
             # losing the historical window.
@@ -530,7 +672,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 raw,
             )
             return now - self._initial_lookback()
-        return last_fetched - LAST_FETCHED_OVERLAP
+        # Recover the cost frontier for entries that imported cost before the cursor existed, so
+        # the probe below has a frontier to check (one-shot per entry; see the method docstring).
+        await self._bootstrap_cost_cursor_if_missing()
+        start = usage_frontier
+        cost_frontier = _parse_iso_or_none(self.entry.data.get(CONF_COST_FETCHED_AT))
+        if (
+            cost_frontier is not None
+            and cost_frontier < usage_frontier
+            and await self._settled_past_frontier(cost_frontier, now)
+        ):
+            start = cost_frontier
+        return start - LAST_FETCHED_OVERLAP
 
     def _initial_lookback(self) -> timedelta:
         """How far back to backfill on the first fetch.

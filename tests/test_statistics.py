@@ -18,8 +18,10 @@ from custom_components.greenbutton.api import (
     UsageReading,
     UsageResponse,
 )
+from custom_components.greenbutton.const import DOMAIN
 from custom_components.greenbutton.statistics import (
     _select_billing_summaries,
+    async_cost_frontier_for_entry,
     import_usage_statistics,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
@@ -29,6 +31,61 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 _DAY = 86400
+
+
+async def test_cost_frontier_is_min_last_hour_across_an_entrys_cost_stats(
+    hass: HomeAssistant,
+) -> None:
+    """The derived frontier is the least-caught-up cost series, ignoring non-cost/foreign ids.
+
+    A sweep window has to reach the *oldest* cost frontier so it covers every usage point, so the
+    helper returns the MIN of the per-cost-stat last hours — and only for this entry's `_cost`
+    statistics (not its energy series, and not another entry or source).
+    """
+    prefix = statistic_id_prefix_for_entry("01ENTRY")
+    a_cost = f"{prefix}up_a_cost"
+    b_cost = f"{prefix}up_b_cost"
+    ids = [
+        {"statistic_id": a_cost, "source": DOMAIN},
+        {"statistic_id": b_cost, "source": DOMAIN},
+        {"statistic_id": f"{prefix}up_a_forward", "source": DOMAIN},  # energy, not cost
+        {"statistic_id": "greenbutton:01other_up_z_cost", "source": DOMAIN},  # different entry
+        {"statistic_id": f"{prefix}up_c_cost", "source": "sensor"},  # foreign source
+    ]
+    june1 = datetime(2026, 6, 1, 23, tzinfo=UTC)
+    may15 = datetime(2026, 5, 15, 23, tzinfo=UTC)
+
+    async def fake_resume(_hass: object, statistic_id: str) -> tuple[float, float | None]:
+        return {
+            a_cost: (0.0, june1.timestamp()),
+            b_cost: (0.0, may15.timestamp()),
+        }.get(statistic_id, (0.0, None))
+
+    with (
+        patch(
+            "custom_components.greenbutton.statistics.async_list_statistic_ids",
+            new=AsyncMock(return_value=ids),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(side_effect=fake_resume),
+        ),
+    ):
+        frontier = await async_cost_frontier_for_entry(hass, "01ENTRY")
+
+    assert frontier == may15  # the older of the two cost frontiers
+
+
+async def test_cost_frontier_is_none_when_no_cost_stats(hass: HomeAssistant) -> None:
+    """No `_cost` statistics for the entry ⇒ None (the sweep then stays a no-op)."""
+    prefix = statistic_id_prefix_for_entry("01ENTRY")
+    ids = [{"statistic_id": f"{prefix}up_a_forward", "source": DOMAIN}]
+    with patch(
+        "custom_components.greenbutton.statistics.async_list_statistic_ids",
+        new=AsyncMock(return_value=ids),
+    ):
+        frontier = await async_cost_frontier_for_entry(hass, "01ENTRY")
+    assert frontier is None
 
 
 def _summary(start: datetime, duration_days: int, total_dollars: float) -> BillingSummary:
