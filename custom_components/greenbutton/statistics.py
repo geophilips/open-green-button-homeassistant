@@ -21,6 +21,7 @@ from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     async_list_statistic_ids,
     get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
@@ -119,39 +120,6 @@ async def async_clear_statistics_for_entry(hass: HomeAssistant, entry_id: str) -
     return owned
 
 
-async def async_cost_frontier_for_entry(hass: HomeAssistant, entry_id: str) -> datetime | None:
-    """Newest already-imported cost hour for this entry, across all its cost statistics.
-
-    The coordinator's cost cursor (`CONF_COST_FETCHED_AT`) is normally advanced as cost is
-    imported — but entries that imported cost *before* the two-cursor polling existed have no
-    stored cursor. Their cost frontier is nonetheless recoverable: it's the newest hour of the
-    entry's `_cost` statistic. This lets the coordinator bootstrap the cursor from the recorder
-    on the first sweep, so pre-existing entries pick up settlement-lagged cost with no rebuild.
-
-    Returns the MINIMUM of the per-usage-point frontiers (the least-caught-up cost series) so a
-    single sweep window reaches back far enough to cover every one. None when the entry has no
-    cost rows yet (never had cost, or a brand-new entry) — the sweep then stays a no-op.
-    """
-    prefix = statistic_id_prefix_for_entry(entry_id)
-    all_ids = await async_list_statistic_ids(hass)
-    cost_ids = [
-        item["statistic_id"]
-        for item in all_ids
-        if item.get("source") == DOMAIN
-        and item["statistic_id"].startswith(prefix)
-        and item["statistic_id"].endswith("_cost")
-    ]
-    frontier: datetime | None = None
-    for statistic_id in cost_ids:
-        _, last_start_epoch = await _resume_point(hass, statistic_id)
-        if last_start_epoch is None:
-            continue
-        last_start = datetime.fromtimestamp(last_start_epoch, tz=UTC)
-        if frontier is None or last_start < frontier:
-            frontier = last_start
-    return frontier
-
-
 def _slugify(component: str) -> str:
     """Lowercase + replace non-alphanumeric with underscore.
 
@@ -186,9 +154,20 @@ async def import_usage_statistics(
     for up in response.usage_points:
         for series in up.series:
             await _import_series(hass, entry, up, series, utility_display_name, fresh=fresh)
+
+    # Cost is written after usage, in a second pass. A monthly UsageSummary arrives long after its
+    # billing period (Burlington publishes it ~2-3 weeks later), so the period's usage is NOT in
+    # this response — it's already in the recorder. [_import_cost_summaries] reads it back to
+    # distribute the bill, so the usage writes above must be committed first. Block once here; on a
+    # fresh rebuild the period's usage was written moments ago and would otherwise not be visible.
+    if any(not _has_interval_cost(up) and up.summaries for up in response.usage_points):
+        await get_instance(hass).async_block_till_done()
+
+    for up in response.usage_points:
         # Prefer per-interval <cost> — utilities like savagedata/Milton itemize actual hourly cost,
-        # which is more accurate than distributing a monthly UsageSummary total. Fall back to the
-        # summary distribution for utilities (Burlington) that only bill via a monthly summary.
+        # which is more accurate and is self-contained on the reading. Fall back to distributing a
+        # monthly UsageSummary total over the period's recorded usage for utilities (Burlington)
+        # that only bill via a summary.
         if _has_interval_cost(up):
             await _import_cost_from_readings(hass, entry, up, utility_display_name, fresh=fresh)
         else:
@@ -345,6 +324,48 @@ def _select_billing_summaries(summaries: list[BillingSummary]) -> list[BillingSu
     return accepted
 
 
+async def _recorded_forward_hours(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    up: UsagePoint,
+    period_start: datetime,
+    period_end: datetime,
+) -> list[tuple[datetime, float]]:
+    """Per-hour FORWARD consumption ``(hour, kWh)`` for ``[period_start, period_end)``.
+
+    Read from the recorder, not the response: a UsageSummary distributed here arrives long after
+    its period, whose readings are already imported into the FORWARD usage statistic. We recover
+    each hour's kWh as the delta of that statistic's cumulative ``sum`` — querying one hour before
+    ``period_start`` so the first in-period hour has a predecessor to diff against.
+
+    Hours with no forward movement (a gap, or a duplicate) are dropped; the result feeds only the
+    proportional cost distribution, so approximate weights across a small gap are harmless.
+    """
+    stat_id = statistic_id_for_series(entry.entry_id, up.usage_point_id, "FORWARD")
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        period_start - timedelta(hours=1),
+        period_end,
+        {stat_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    hours: list[tuple[datetime, float]] = []
+    prev_sum: float | None = None
+    for row in by_id.get(stat_id, []):
+        total = row.get("sum")
+        if total is None:
+            continue
+        start = row["start"]
+        hour = start if isinstance(start, datetime) else datetime.fromtimestamp(start, tz=UTC)
+        if prev_sum is not None and period_start <= hour < period_end and total > prev_sum:
+            hours.append((hour, total - prev_sum))
+        prev_sum = total
+    return hours
+
+
 async def _import_cost_summaries(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -371,6 +392,12 @@ async def _import_cost_summaries(
     accuracy depends on whether the utility's pricing is flat or TOU; the test lab is
     flat, while production TOU pricing would want richer cost-detail handling
     (future work).
+
+    The period's usage comes from the **recorder**, not this response: a UsageSummary is
+    published weeks after its period closes, so an incremental poll that carries a freshly-
+    published summary does NOT carry that period's readings (they were imported long ago). We
+    read them back from the usage statistic ([_recorded_forward_hours]) to distribute over.
+    This is why a plain published-min poll is enough to keep cost current — no reach-back needed.
 
     Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary
     to accounts they bill; meter-only test profiles often won't), or when the currency code
@@ -409,24 +436,6 @@ async def _import_cost_summaries(
     if _MEAN_TYPE_NONE is not None:
         metadata["mean_type"] = _MEAN_TYPE_NONE
 
-    # Gather all FORWARD-flow energy readings on this UsagePoint, indexed by start, in kWh.
-    # REVERSE flow (solar export) isn't part of consumption cost — utilities credit it back
-    # under a separate accounting that doesn't go through UsageSummary's billLastPeriod.
-    forward_readings: list[tuple[datetime, float]] = []
-    for series in up.series:
-        if series.reading_type.flow_direction != "FORWARD":
-            continue
-        for reading in series.readings:
-            forward_readings.append(
-                (
-                    _align_to_hour(reading.start),
-                    _to_ha_units(reading.value, series.reading_type),
-                )
-            )
-    if not forward_readings:
-        return
-    forward_readings.sort(key=lambda x: x[0])
-
     resume_from_sum, resume_after_epoch = (
         (0.0, None) if fresh else await _resume_point(hass, statistic_id)
     )
@@ -441,9 +450,14 @@ async def _import_cost_summaries(
             continue
         period_start = summary.billing_period_start
         period_end = period_start + timedelta(seconds=summary.billing_period_duration_seconds)
-        in_period = [(s, k) for (s, k) in forward_readings if period_start <= s < period_end]
+        # FORWARD consumption for the period, read back from the recorder (see the docstring).
+        # REVERSE flow (solar export) isn't part of consumption cost, so the usage stat we read
+        # here — the FORWARD series — is the right basis.
+        in_period = await _recorded_forward_hours(hass, entry, up, period_start, period_end)
         total_period_kwh = sum(k for (_, k) in in_period)
         if total_period_kwh <= 0:
+            # No recorded usage for this period yet (e.g. a bill whose period predates our usage
+            # backfill) — nothing to distribute the cost over; skip until/if the usage exists.
             continue
 
         # Per-hour cost = per-kWh TOU rate (zero if not a TOU bucket) + per-kWh non-TOU rate

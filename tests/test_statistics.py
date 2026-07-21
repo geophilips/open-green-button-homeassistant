@@ -6,9 +6,15 @@ where a recorder is wired up; these focus on the pure-function bits that don't n
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from homeassistant.components.recorder.models import StatisticMeanType
+from homeassistant.components.recorder.statistics import async_add_external_statistics
+from pytest_homeassistant_custom_component.components.recorder.common import (
+    async_wait_recording_done,
+)
 
 from custom_components.greenbutton.api import (
     BillingSummary,
@@ -20,8 +26,8 @@ from custom_components.greenbutton.api import (
 )
 from custom_components.greenbutton.const import DOMAIN
 from custom_components.greenbutton.statistics import (
+    _recorded_forward_hours,
     _select_billing_summaries,
-    async_cost_frontier_for_entry,
     import_usage_statistics,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
@@ -33,59 +39,42 @@ if TYPE_CHECKING:
 _DAY = 86400
 
 
-async def test_cost_frontier_is_min_last_hour_across_an_entrys_cost_stats(
-    hass: HomeAssistant,
-) -> None:
-    """The derived frontier is the least-caught-up cost series, ignoring non-cost/foreign ids.
+async def test_recorded_forward_hours_reconstructs_hourly_kwh(hass: HomeAssistant) -> None:
+    """`_recorded_forward_hours` reads the FORWARD usage stat back and diffs it into per-hour kWh.
 
-    A sweep window has to reach the *oldest* cost frontier so it covers every usage point, so the
-    helper returns the MIN of the per-cost-stat last hours — and only for this entry's `_cost`
-    statistics (not its energy series, and not another entry or source).
+    Round-trips a real recorder (not mocked) to validate the statistics_during_period call shape
+    and the cumulative-sum → per-hour delta reconstruction the summary-cost path relies on.
     """
-    prefix = statistic_id_prefix_for_entry("01ENTRY")
-    a_cost = f"{prefix}up_a_cost"
-    b_cost = f"{prefix}up_b_cost"
-    ids = [
-        {"statistic_id": a_cost, "source": DOMAIN},
-        {"statistic_id": b_cost, "source": DOMAIN},
-        {"statistic_id": f"{prefix}up_a_forward", "source": DOMAIN},  # energy, not cost
-        {"statistic_id": "greenbutton:01other_up_z_cost", "source": DOMAIN},  # different entry
-        {"statistic_id": f"{prefix}up_c_cost", "source": "sensor"},  # foreign source
-    ]
-    june1 = datetime(2026, 6, 1, 23, tzinfo=UTC)
-    may15 = datetime(2026, 5, 15, 23, tzinfo=UTC)
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[])
+    stat_id = statistic_id_for_series("01TESTENTRY", "up1", "FORWARD")
+    base = datetime(2026, 4, 3, 4, 0, tzinfo=UTC)
+    metadata = {
+        "has_mean": False,
+        "has_sum": True,
+        "name": "test usage",
+        "source": DOMAIN,
+        "statistic_id": stat_id,
+        "unit_of_measurement": "kWh",
+        "unit_class": "energy",
+        "mean_type": StatisticMeanType.NONE,
+    }
+    # Cumulative sums 0, 2, 5, 6 → per-hour deltas 2, 3, 1 for the three hours after `base`.
+    async_add_external_statistics(
+        hass,
+        metadata,
+        [
+            {"start": base + timedelta(hours=i), "state": s, "sum": s}
+            for i, s in enumerate((0.0, 2.0, 5.0, 6.0))
+        ],
+    )
+    await async_wait_recording_done(hass)
 
-    async def fake_resume(_hass: object, statistic_id: str) -> tuple[float, float | None]:
-        return {
-            a_cost: (0.0, june1.timestamp()),
-            b_cost: (0.0, may15.timestamp()),
-        }.get(statistic_id, (0.0, None))
-
-    with (
-        patch(
-            "custom_components.greenbutton.statistics.async_list_statistic_ids",
-            new=AsyncMock(return_value=ids),
-        ),
-        patch(
-            "custom_components.greenbutton.statistics._resume_point",
-            new=AsyncMock(side_effect=fake_resume),
-        ),
-    ):
-        frontier = await async_cost_frontier_for_entry(hass, "01ENTRY")
-
-    assert frontier == may15  # the older of the two cost frontiers
-
-
-async def test_cost_frontier_is_none_when_no_cost_stats(hass: HomeAssistant) -> None:
-    """No `_cost` statistics for the entry ⇒ None (the sweep then stays a no-op)."""
-    prefix = statistic_id_prefix_for_entry("01ENTRY")
-    ids = [{"statistic_id": f"{prefix}up_a_forward", "source": DOMAIN}]
-    with patch(
-        "custom_components.greenbutton.statistics.async_list_statistic_ids",
-        new=AsyncMock(return_value=ids),
-    ):
-        frontier = await async_cost_frontier_for_entry(hass, "01ENTRY")
-    assert frontier is None
+    hours = await _recorded_forward_hours(
+        hass, entry, up, base + timedelta(hours=1), base + timedelta(hours=4)
+    )
+    assert [(h.hour, round(k, 1)) for h, k in hours] == [(5, 2.0), (6, 3.0), (7, 1.0)]
 
 
 def _summary(start: datetime, duration_days: int, total_dollars: float) -> BillingSummary:
@@ -219,47 +208,41 @@ async def test_per_interval_cost_writes_cumulative_cost_stat(hass: HomeAssistant
 
 
 def _summary_only_response() -> UsageResponse:
-    """FORWARD electricity with NO per-interval <cost>, plus a monthly UsageSummary.
+    """A monthly UsageSummary with NO per-interval <cost> and NO readings in the response.
 
-    This is the Burlington shape: cost must come from distributing the summary total across
-    hours by consumption, NOT the per-interval path.
+    This is the Burlington shape *as an incremental poll sees it*: the summary is published weeks
+    after its period, so the period's readings aren't here — they're already in the recorder, and
+    the importer reads them back to distribute the bill.
     """
-    reading_type = NormalizedReadingType(
-        commodity="ELECTRICITY_SECONDARY_METERED",
-        flow_direction="FORWARD",
-        accumulation_behaviour="DELTA_DATA",
-        interval_length_seconds=3600,
-        unit_of_measure="WATT_HOURS",
-        unit_of_measure_symbol="Wh",
-        power_of_ten_multiplier=0,
-        currency_numeric_code=124,
-    )
-    series = MeterReadingSeries(
-        meter_reading_id="mr1",
-        reading_type=reading_type,
-        readings=[  # 1 kWh then 3 kWh, and crucially NO cost on either
-            UsageReading(datetime(2026, 4, 3, 5, tzinfo=UTC), 3600, 1000.0),
-            UsageReading(datetime(2026, 4, 3, 6, tzinfo=UTC), 3600, 3000.0),
-        ],
-    )
     up = UsagePoint(
         usage_point_id="up1",
         service_kind="electricity",
-        series=[series],
+        series=[],
         summaries=[_summary(datetime(2026, 4, 1, tzinfo=UTC), 30, total_dollars=40.0)],
     )
     return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
 
 
-async def test_summary_cost_path_preserved_without_per_interval_cost(hass: HomeAssistant) -> None:
-    """Backward-compat (Burlington): with no per-interval <cost>, cost is derived from the
-    UsageSummary and distributed across hours by consumption — unchanged by the Milton change."""
+async def test_summary_cost_distributes_over_recorded_usage(hass: HomeAssistant) -> None:
+    """Burlington: a UsageSummary total is spread across the period's *recorded* usage.
+
+    The period's readings are not in this response (a bill publishes weeks late); the importer
+    recovers them from the recorder. $40 over 1 kWh + 3 kWh → $10 then $30 → cumulative 10, 40.
+    """
     entry = MagicMock()
     entry.entry_id = "01TESTENTRY"
+    recorded = [
+        (datetime(2026, 4, 3, 5, tzinfo=UTC), 1.0),
+        (datetime(2026, 4, 3, 6, tzinfo=UTC), 3.0),
+    ]
     with (
         patch(
             "custom_components.greenbutton.statistics._resume_point",
             new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(return_value=recorded),
         ),
         patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
     ):
@@ -268,10 +251,32 @@ async def test_summary_cost_path_preserved_without_per_interval_cost(hass: HomeA
         )
 
     cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
-    assert len(cost_calls) == 1  # summary path still writes a cost stat
+    assert len(cost_calls) == 1  # summary path writes a cost stat from recorded usage
     stats = cost_calls[0].args[2]
-    # $40 split by consumption over 1 kWh + 3 kWh → $10 then $30 → cumulative 10, 40.
     assert [round(s["sum"], 2) for s in stats] == [10.0, 40.0]
+
+
+async def test_summary_cost_skipped_when_no_recorded_usage(hass: HomeAssistant) -> None:
+    """A bill whose period has no recorded usage yet (e.g. predates the backfill) writes nothing."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass, entry, _summary_only_response(), utility_display_name="X"
+        )
+
+    cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
+    assert not cost_calls
 
 
 def test_statistic_id_is_scoped_per_entry() -> None:
