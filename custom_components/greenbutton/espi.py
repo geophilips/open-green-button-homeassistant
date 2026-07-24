@@ -96,6 +96,7 @@ _TAG_AMOUNT = f"{{{_ESPI_NS}}}amount"
 _TAG_NOTE = f"{{{_ESPI_NS}}}note"
 _TAG_ITEM_KIND = f"{{{_ESPI_NS}}}itemKind"
 _TAG_UNIT_COST = f"{{{_ESPI_NS}}}unitCost"
+_TAG_MEASUREMENT = f"{{{_ESPI_NS}}}measurement"
 
 # Customer-namespace payloads (RetailCustomer feed) — parsed by [parse_customer_feed], not the
 # usage parser. See the ESPI customer schema (`http://naesb.org/espi/customer`).
@@ -425,12 +426,23 @@ def _parse_usage_summary(payload: ET.Element) -> BillingSummary | None:
 
 
 def _parse_cost_detail(elem: ET.Element) -> CostDetail:
-    """One <espi:costAdditionalDetailLastPeriod> → CostDetail."""
+    """One <espi:costAdditionalDetailLastPeriod> → CostDetail.
+
+    savagedata/Elexicon feeds nest a ``<measurement><powerOfTenMultiplier>`` that scales the
+    line's ``<amount>`` (Delivery at -6, TOU peaks at -3, …); Burlington-style feeds omit it
+    and use bare 1/100,000 amounts. Capture the multiplier when present so [CostDetail.amount]
+    scales correctly and [BillingSummary.total_cost] can tell the two encodings apart.
+    """
+    measurement = elem.find(_TAG_MEASUREMENT)
+    amount_power_of_ten = (
+        _int_text(measurement.find(_TAG_POW10)) if measurement is not None else None
+    )
     return CostDetail(
         amount_raw=_int_text(elem.find(_TAG_AMOUNT)) or 0,
         note=elem.findtext(_TAG_NOTE),
         item_kind=_int_text(elem.find(_TAG_ITEM_KIND)),
         unit_cost_raw=_int_text(elem.find(_TAG_UNIT_COST)),
+        amount_power_of_ten=amount_power_of_ten,
     )
 
 

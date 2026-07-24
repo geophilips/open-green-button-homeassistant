@@ -102,16 +102,25 @@ class MeterReadingSeries:
     readings: list[UsageReading]
 
 
+# Default ESPI cost scale: monetary amounts are reported in 1/100,000 of the currency unit.
+# savagedata/Elexicon feeds override this per line via <measurement><powerOfTenMultiplier>;
+# see [CostDetail.amount].
+_ESPI_COST_SCALE = 100_000.0
+
 # Normalized (lowercased, whitespace-collapsed) notes for UsageSummary detail lines that are
 # NOT this period's charges: running-balance bookkeeping and subtotals that already aggregate
 # the real charge lines. Summing these back in is what triples a bill. See
 # [CostDetail.is_period_charge].
+#
+# "total amount due" is Burlington's grand-total subtotal; "amount due" is Elexicon's (same
+# role, different wording) — both must be excluded or the itemized sum double-counts the bill.
 _NON_CHARGE_NOTES = frozenset(
     {
         "balance forward",
         "payments received",
         "new charges this period",
         "total amount due",
+        "amount due",
     }
 )
 
@@ -120,20 +129,32 @@ _NON_CHARGE_NOTES = frozenset(
 class CostDetail:
     """One line item in a UsageSummary's cost breakdown.
 
-    ESPI reports cost amounts in **1/100,000 of the parent's currency unit** — see
-    [`amount`][] for the float currency value. The raw integer is preserved for callers
-    that want to inspect or round differently.
+    Two amount encodings appear in real feeds — see [`amount`][] for the resolved value:
+
+      - **Bare** (Burlington and most ESPI feeds): the raw integer is 1/100,000 of the
+        currency unit.
+      - **Per-line scaled** (savagedata/Elexicon): the line nests a
+        ``<measurement><powerOfTenMultiplier>`` (e.g. ``-6`` for Delivery, ``-3`` for TOU
+        peaks) and the amount is ``amount_raw × 10^power``. ``amount_power_of_ten`` is None
+        for the bare encoding.
     """
 
     amount_raw: int
     note: str | None
     item_kind: int | None
     unit_cost_raw: int | None
+    amount_power_of_ten: int | None = None
 
     @property
     def amount(self) -> float:
-        """Amount in currency units (e.g. dollars). Raw value divided by 100,000."""
-        return self.amount_raw / 100_000.0
+        """Amount in currency units (e.g. dollars).
+
+        When the line carries its own ``powerOfTenMultiplier`` (savagedata/Elexicon), scale
+        by that; otherwise fall back to the default ESPI 1/100,000 scale (Burlington).
+        """
+        if self.amount_power_of_ten is not None:
+            return self.amount_raw * (10.0**self.amount_power_of_ten)
+        return self.amount_raw / _ESPI_COST_SCALE
 
     @property
     def normalized_note(self) -> str:
@@ -181,27 +202,48 @@ class BillingSummary:
     def total_cost(self) -> float:
         """Best-effort total cost for *this billing period* in currency units.
 
-        Order of preference:
+        Two feed families need different rules:
+
+        **Per-line-scaled feeds (savagedata/Elexicon).** Each charge line carries its own
+        ``powerOfTenMultiplier`` (see [`CostDetail.amount`]) and the itemized charges reconcile
+        exactly to the bill. Here ``billLastPeriod`` is reported in a *different* scale (1/1,000,
+        i.e. ``172030`` for a $172.03 bill) that we cannot distinguish in-band from the default
+        1/100,000 — dividing it by 100,000 gives $1.72, 100× too small, which flatlines the
+        Energy dashboard's cost at ~$0.05/day. So we ignore ``billLastPeriod`` entirely and
+        trust the per-line-scaled itemized charges. We detect this family by the presence of a
+        line that has *both* a per-line multiplier and a non-zero amount (Burlington's
+        multiplier-bearing lines are all zero-amount meter-reading metadata).
+
+        **Bare feeds (Burlington and most ESPI).** Amounts are bare 1/100,000 integers:
 
         1. ``billLastPeriod`` when present and positive — some utilities put the grand total
-           here directly.
-        2. The sum of the genuine charge line items — every detail except running-balance
-           bookkeeping and subtotals (see [`CostDetail.is_period_charge`]).
+           here directly (and under-itemize the details, so the sum would be wrong).
+        2. Otherwise the sum of the genuine charge line items — every detail except
+           running-balance bookkeeping and subtotals (see [`CostDetail.is_period_charge`]).
 
         We deliberately do NOT trust the feed's own "New Charges This Period" / "Total Amount
-        Due" subtotal lines. Burlington Hydro stamps a corrupt value there on roughly every
-        other bill: a period whose itemized charges sum to $187.73 is reported as "New Charges
-        This Period = $502.29", with no line item for the $314.56 difference — and the bill's
-        own H.S.T. line (13% of the pre-rebate subtotal) only reconciles against the itemized
-        $187.73, confirming the subtotal is the wrong number. Summing the itemized charges is
-        correct there and identical to the subtotal on well-formed bills, so it's the single
-        rule for every feed. (A utility that under-itemizes — putting a real total only in the
-        subtotal — would need revisiting, but none in scope does.)
+        Due" / "Amount Due" subtotal lines. Burlington Hydro stamps a corrupt value there on
+        roughly every other bill: a period whose itemized charges sum to $187.73 is reported as
+        "New Charges This Period = $502.29", with no line item for the $314.56 difference — and
+        the bill's own H.S.T. line (13% of the pre-rebate subtotal) only reconciles against the
+        itemized $187.73, confirming the subtotal is the wrong number.
         """
-        bill = (self.bill_last_period_raw or 0) / 100_000.0
+        charges = sum(d.amount for d in self.cost_details if d.is_period_charge)
+
+        # savagedata/Elexicon: per-line-scaled amounts; billLastPeriod is in an untrustworthy
+        # scale, so the itemized charges are authoritative.
+        uses_per_line_scale = any(
+            d.amount_power_of_ten is not None and d.amount_raw != 0 for d in self.cost_details
+        )
+        if uses_per_line_scale:
+            return charges
+
+        # Bare feeds: prefer a populated grand total, else fall back to the itemized charges
+        # (Burlington stamps billLastPeriod=0).
+        bill = (self.bill_last_period_raw or 0) / _ESPI_COST_SCALE
         if bill > 0:
             return bill
-        return sum(d.amount for d in self.cost_details if d.is_period_charge)
+        return charges
 
 
 @dataclass(frozen=True, slots=True)

@@ -16,6 +16,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from defusedxml.ElementTree import fromstring as _xml_fromstring
+
+from custom_components.greenbutton import espi
 from custom_components.greenbutton.api import BillingSummary, CostDetail
 
 
@@ -130,5 +133,133 @@ def test_is_period_charge_classifies_line_items() -> None:
     assert not _detail("Payments Received", -1).is_period_charge
     assert not _detail("New Charges This Period", 1).is_period_charge
     assert not _detail("Total Amount Due", 1).is_period_charge
+    # Elexicon's grand-total subtotal is worded "Amount Due" (Burlington's is "Total Amount
+    # Due"); both must be excluded or the itemized sum double-counts the bill.
+    assert not _detail("Amount Due", 1).is_period_charge
     # Matching is case- and whitespace-insensitive.
     assert not _detail("  TOTAL  AMOUNT   DUE ", 1).is_period_charge
+
+
+# --- Elexicon / savagedata per-line-scaled encoding -------------------------------------------
+#
+# Unlike Burlington's bare 1/100,000 amounts, savagedata (Elexicon) scales each charge line by
+# its own <measurement><powerOfTenMultiplier> and reports billLastPeriod in a 1/1,000 scale.
+# This is the real first-summary of a user's Elexicon feed. The bug this guards: the client
+# ignored the per-line multiplier and divided billLastPeriod by 100,000, yielding $1.72 for the
+# whole month (~$0.05/day on the Energy dashboard) instead of the true $172.03.
+_ELEXICON_USAGE_SUMMARY_XML = """
+<UsageSummary xmlns="http://naesb.org/espi">
+  <billingPeriod>
+    <duration>2592000</duration>
+    <start>1778934402</start>
+  </billingPeriod>
+  <billLastPeriod>172030</billLastPeriod>
+  <costAdditionalLastPeriod>172030</costAdditionalLastPeriod>
+  <!-- Zero-amount meter-reading metadata: carries a multiplier but must NOT flip the feed
+       into per-line-scaled detection (that hinges on a non-zero amount). -->
+  <costAdditionalDetailLastPeriod>
+    <note>Current Meter Read</note>
+    <measurement><powerOfTenMultiplier>-2</powerOfTenMultiplier><uom>72</uom><value>17579193</value></measurement>
+    <itemKind>10</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>17203</amount><note>Amount Due</note>
+    <measurement><powerOfTenMultiplier>-2</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>10</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>21432</amount><note>Balance Forward</note>
+    <measurement><powerOfTenMultiplier>-2</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>4</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>45950000</amount><note>DELIVERY CHARGE</note>
+    <measurement><powerOfTenMultiplier>-6</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>2</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>2499</amount><note>HST</note>
+    <measurement><powerOfTenMultiplier>-2</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>5</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>20150</amount><note>MID-PEAK</note>
+    <measurement><powerOfTenMultiplier>-3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>3</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>58980</amount><note>OFF-PEAK</note>
+    <measurement><powerOfTenMultiplier>-3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>3</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>39520</amount><note>ON-PEAK</note>
+    <measurement><powerOfTenMultiplier>-3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>3</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>-4517</amount><note>ONTARIO ELECTRICITY REBATE</note>
+    <measurement><powerOfTenMultiplier>-2</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>8</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>830000</amount><note>REGULATORY CHARGE</note>
+    <measurement><powerOfTenMultiplier>-6</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>4</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>9570000</amount><note>TRANSMISSION CONNECTION CHARGE</note>
+    <measurement><powerOfTenMultiplier>-6</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>2</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>12670000</amount><note>TRANSMISSION NETWORK CHARGE</note>
+    <measurement><powerOfTenMultiplier>-6</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>2</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>4540000</amount><note>WHOLESALE MARKET SERVICE CHARGE</note>
+    <measurement><powerOfTenMultiplier>-6</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>4</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <currency>124</currency>
+</UsageSummary>
+"""
+
+
+def _parse_elexicon_summary() -> BillingSummary:
+    summary = espi._parse_usage_summary(_xml_fromstring(_ELEXICON_USAGE_SUMMARY_XML))
+    assert summary is not None
+    return summary
+
+
+def test_elexicon_per_line_multiplier_scales_each_amount() -> None:
+    """Each charge amount is scaled by its own powerOfTenMultiplier, not a flat 1/100,000."""
+    by_note = {d.note: d for d in _parse_elexicon_summary().cost_details}
+    assert round(by_note["DELIVERY CHARGE"].amount, 2) == 45.95  # 45950000 × 10^-6
+    assert round(by_note["HST"].amount, 2) == 24.99  # 2499 × 10^-2
+    assert round(by_note["OFF-PEAK"].amount, 2) == 58.98  # 58980 × 10^-3
+    assert round(by_note["ONTARIO ELECTRICITY REBATE"].amount, 2) == -45.17
+
+
+def test_elexicon_total_cost_uses_itemized_charges_not_misscaled_bill_last_period() -> None:
+    """total_cost is the reconciled itemized bill ($172.03), not billLastPeriod/100,000 ($1.72).
+
+    Reproduces the user-reported "cost shows ~$0.05/day" symptom: dividing Elexicon's
+    billLastPeriod (172030, a 1/1,000 value) by 100,000 gives $1.72 for the month.
+    """
+    summary = _parse_elexicon_summary()
+    assert round(summary.total_cost, 2) == 172.03
+    # The bug's wrong answer — must not resurface.
+    assert round(summary.bill_last_period_raw / 100_000, 2) == 1.72
+    assert round(summary.total_cost, 2) != 1.72
+
+
+def test_elexicon_excludes_amount_due_and_balance_forward_subtotals() -> None:
+    """The "Amount Due" grand total and "Balance Forward" carry-over are not period charges."""
+    summary = _parse_elexicon_summary()
+    charged_notes = {d.note for d in summary.cost_details if d.is_period_charge}
+    assert "Amount Due" not in charged_notes
+    assert "Balance Forward" not in charged_notes
+    # If "Amount Due" ($172.03) leaked in, the total would double to ~$344.
+    assert round(summary.total_cost, 2) == 172.03
