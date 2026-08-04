@@ -179,9 +179,57 @@ def _per_interval_cost_response() -> UsageResponse:
         readings=[
             UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0, cost=0.087),
             UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0, cost=0.122),
+            UsageReading(datetime(2026, 7, 5, 7, tzinfo=UTC), 3600, 500.0, cost=0.0),
         ],
     )
     up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def _milton_mixed_series_response(*, with_summary: bool = False) -> UsageResponse:
+    """Milton's hourly deltas plus its daily cumulative register snapshot."""
+    delta_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    bulk_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="BULK_QUANTITY",
+        interval_length_seconds=_DAY,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    delta_series = MeterReadingSeries(
+        meter_reading_id="hourly",
+        reading_type=delta_type,
+        readings=[
+            UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0),
+            UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0),
+        ],
+    )
+    bulk_series = MeterReadingSeries(
+        meter_reading_id="register",
+        reading_type=bulk_type,
+        readings=[UsageReading(datetime(2026, 7, 5, tzinfo=UTC), _DAY, 9_876_543.0, cost=0.0)],
+    )
+    summaries = (
+        [_summary(datetime(2026, 7, 1, tzinfo=UTC), 31, total_dollars=50.0)] if with_summary else []
+    )
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[delta_series, bulk_series],
+        summaries=summaries,
+    )
     return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
 
 
@@ -204,7 +252,66 @@ async def test_per_interval_cost_writes_cumulative_cost_stat(hass: HomeAssistant
     assert len(cost_calls) == 1
     metadata, stats = cost_calls[0].args[1], cost_calls[0].args[2]
     assert metadata["unit_of_measurement"] == "CAD"
-    assert [round(s["sum"], 3) for s in stats] == [0.087, 0.209]  # cumulative
+    assert [round(s["sum"], 3) for s in stats] == [0.087, 0.209, 0.209]  # cumulative
+
+
+async def test_bulk_register_series_is_not_added_to_interval_usage(hass: HomeAssistant) -> None:
+    """Milton's cumulative daily register must not inflate its hourly consumption statistic."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass, entry, _milton_mixed_series_response(), utility_display_name="Milton Hydro"
+        )
+
+    usage_calls = [
+        call
+        for call in add_mock.call_args_list
+        if not call.args[1]["statistic_id"].endswith("_cost")
+    ]
+    assert len(usage_calls) == 1
+    stats = usage_calls[0].args[2]
+    assert [round(s["sum"], 3) for s in stats] == [1.0, 2.5]
+
+
+async def test_bulk_zero_cost_falls_back_to_billing_summary(hass: HomeAssistant) -> None:
+    """Milton's zero-cost register placeholder must not suppress its real billing summary."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    recorded = [
+        (datetime(2026, 7, 5, 5, tzinfo=UTC), 1.0),
+        (datetime(2026, 7, 5, 6, tzinfo=UTC), 1.5),
+    ]
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(return_value=recorded),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass,
+            entry,
+            _milton_mixed_series_response(with_summary=True),
+            utility_display_name="Milton Hydro",
+        )
+
+    cost_calls = [
+        call for call in add_mock.call_args_list if call.args[1]["statistic_id"].endswith("_cost")
+    ]
+    assert len(cost_calls) == 1
+    stats = cost_calls[0].args[2]
+    assert [round(s["sum"], 2) for s in stats] == [20.0, 50.0]
 
 
 def _summary_only_response() -> UsageResponse:

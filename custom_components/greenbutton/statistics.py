@@ -138,7 +138,7 @@ async def import_usage_statistics(
     *,
     fresh: bool = False,
 ) -> None:
-    """Push every series in [response] into HA long-term statistics.
+    """Push interval-delta series in [response] into HA long-term statistics.
 
     Idempotent on (statistic_id, hour) — re-importing a previously-imported hour is a no-op,
     so the coordinator can pull overlapping windows on every poll without worrying about
@@ -153,6 +153,14 @@ async def import_usage_statistics(
     """
     for up in response.usage_points:
         for series in up.series:
+            if not _is_interval_consumption_series(series):
+                _LOGGER.debug(
+                    "Skipping meter reading %s: accumulation behaviour %s is not "
+                    "interval consumption",
+                    series.meter_reading_id,
+                    series.reading_type.accumulation_behaviour,
+                )
+                continue
             await _import_series(hass, entry, up, series, utility_display_name, fresh=fresh)
 
     # Cost is written after usage, in a second pass. A monthly UsageSummary arrives long after its
@@ -164,22 +172,37 @@ async def import_usage_statistics(
         await get_instance(hass).async_block_till_done()
 
     for up in response.usage_points:
-        # Prefer per-interval <cost> — utilities like savagedata/Milton itemize actual hourly cost,
-        # which is more accurate and is self-contained on the reading. Fall back to distributing a
-        # monthly UsageSummary total over the period's recorded usage for utilities (Burlington)
-        # that only bill via a summary.
+        # Prefer genuine per-interval <cost>, which is more accurate and self-contained on the
+        # reading. Fall back to distributing a monthly UsageSummary total over the period's
+        # recorded usage when interval costs are absent or only zero-valued placeholders exist.
         if _has_interval_cost(up):
             await _import_cost_from_readings(hass, entry, up, utility_display_name, fresh=fresh)
         else:
             await _import_cost_summaries(hass, entry, up, utility_display_name, fresh=fresh)
 
 
+def _is_interval_consumption_series(series: MeterReadingSeries) -> bool:
+    """True for readings that represent consumption during each interval.
+
+    ``BULK_QUANTITY`` readings are cumulative register snapshots. Adding those values to the
+    running statistic alongside hourly ``DELTA_DATA`` produces enormous false consumption spikes,
+    as seen in Milton Hydro feeds that publish both series for the same meter.
+    """
+    return series.reading_type.accumulation_behaviour == "DELTA_DATA"
+
+
 def _has_interval_cost(up: UsagePoint) -> bool:
-    """True when any FORWARD reading on this UsagePoint carries a per-interval cost."""
+    """True when interval consumption carries at least one non-zero cost.
+
+    Some utilities attach ``cost=0`` to a cumulative ``BULK_QUANTITY`` register reading while
+    reporting the actual bill in ``UsageSummary``. A zero placeholder must not select the
+    per-interval path and suppress that summary. Legitimate zero-cost hours remain included once
+    another interval establishes that the series genuinely itemizes costs.
+    """
     return any(
-        r.cost is not None
+        r.cost is not None and r.cost != 0
         for s in up.series
-        if s.reading_type.flow_direction == "FORWARD"
+        if s.reading_type.flow_direction == "FORWARD" and _is_interval_consumption_series(s)
         for r in s.readings
     )
 
@@ -493,17 +516,18 @@ async def _import_cost_from_readings(
 ) -> None:
     """Write a cumulative-cost statistic from per-interval `<cost>` on the FORWARD readings.
 
-    Utilities like savagedata/Milton itemize the actual cost on every IntervalReading — more
-    accurate and finer-grained than distributing a monthly UsageSummary total (and it works when
-    the summary only carries an "Amount Due" subtotal, which our summary path deliberately drops).
-    Costs are summed per hour across the UsagePoint's FORWARD series (multiple meters roll up into
-    one bill), then accumulated into the same cost stat the Energy dashboard reads.
+    Some utilities itemize the actual cost on every IntervalReading — more accurate and
+    finer-grained than distributing a monthly UsageSummary total (and it works when the summary
+    only carries an "Amount Due" subtotal, which our summary path deliberately drops). Costs are
+    summed per hour across the UsagePoint's FORWARD interval-delta series (multiple meters roll up
+    into one bill), then accumulated into the same cost stat the Energy dashboard reads.
     """
     currency_code = next(
         (
             s.reading_type.currency_numeric_code
             for s in up.series
             if s.reading_type.flow_direction == "FORWARD"
+            and _is_interval_consumption_series(s)
             and s.reading_type.currency_numeric_code is not None
         ),
         None,
@@ -519,7 +543,9 @@ async def _import_cost_from_readings(
 
     cost_by_hour: dict[datetime, float] = {}
     for series in up.series:
-        if series.reading_type.flow_direction != "FORWARD":
+        if series.reading_type.flow_direction != "FORWARD" or not _is_interval_consumption_series(
+            series
+        ):
             continue
         for reading in series.readings:
             if reading.cost is None:
