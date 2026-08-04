@@ -22,7 +22,14 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.greenbutton import _async_register_services
 from custom_components.greenbutton.api import CustomerResponse, UsageResponse
 from custom_components.greenbutton.const import (
+    ATTR_ACTIVE_PERIOD_START,
     ATTR_CONFIG_ENTRY_ID,
+    ATTR_CURRENCY_ALPHA,
+    ATTR_PREDICTED_DAYS,
+    ATTR_RESIDUAL_RATE,
+    ATTR_TIER_ONE_KWH_PER_DAY,
+    ATTR_TIER_ONE_RATE,
+    ATTR_TIER_TWO_RATE,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_ID,
@@ -30,6 +37,7 @@ from custom_components.greenbutton.const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     SERVICE_REBUILD_STATISTICS,
+    SERVICE_SET_TIER_COST_ESTIMATE,
 )
 
 if TYPE_CHECKING:
@@ -89,9 +97,44 @@ async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
 
 
 async def test_service_is_registered(hass: HomeAssistant) -> None:
-    """_async_register_services exposes greenbutton.rebuild_statistics."""
+    """_async_register_services exposes both maintenance services."""
     _async_register_services(hass)
     assert hass.services.has_service(DOMAIN, SERVICE_REBUILD_STATISTICS)
+    assert hass.services.has_service(DOMAIN, SERVICE_SET_TIER_COST_ESTIMATE)
+
+
+async def test_set_tier_cost_estimate_seeds_loaded_entry(hass: HomeAssistant) -> None:
+    """A verified manual profile is stored and applied to the coordinator response."""
+    coordinator = _stub_coordinator()
+    coordinator.entry = MagicMock()
+    coordinator.entry.data = {CONF_UTILITY_NAME: "Example Utility"}
+    coordinator.data = UsageResponse(updated=None, usage_points=[], new_credentials=None)
+    hass.data[DOMAIN] = {"entry_a": coordinator}
+    _async_register_services(hass)
+
+    seed = AsyncMock()
+    with patch("custom_components.greenbutton.async_seed_tiered_estimate", new=seed):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_SET_TIER_COST_ESTIMATE,
+            {
+                ATTR_CONFIG_ENTRY_ID: "entry_a",
+                ATTR_ACTIVE_PERIOD_START: "2026-07-09T04:00:00+00:00",
+                ATTR_PREDICTED_DAYS: 30,
+                ATTR_CURRENCY_ALPHA: "CAD",
+                ATTR_TIER_ONE_RATE: 0.12,
+                ATTR_TIER_TWO_RATE: 0.142,
+                ATTR_TIER_ONE_KWH_PER_DAY: 20,
+                ATTR_RESIDUAL_RATE: 0.06,
+            },
+            blocking=True,
+        )
+
+    seed.assert_awaited_once()
+    assert seed.await_args.kwargs["active_period_start"].isoformat() == (
+        "2026-07-09T04:00:00+00:00"
+    )
+    assert seed.await_args.kwargs["predicted_days"] == 30
 
 
 async def test_service_targets_a_single_entry(hass: HomeAssistant) -> None:

@@ -19,6 +19,7 @@ the same utility (sandbox / test account beside a real account, or multi-meter h
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
@@ -29,22 +30,47 @@ from homeassistant.helpers.event import async_track_time_interval
 
 from .api import OpenGbApi
 from .const import (
+    ATTR_ACTIVE_PERIOD_START,
     ATTR_CONFIG_ENTRY_ID,
+    ATTR_CURRENCY_ALPHA,
+    ATTR_PREDICTED_DAYS,
+    ATTR_RESIDUAL_RATE,
+    ATTR_TIER_ONE_KWH_PER_DAY,
+    ATTR_TIER_ONE_RATE,
+    ATTR_TIER_TWO_RATE,
+    ATTR_USAGE_POINT_ID,
     CONF_SERVER_BASE_URL,
+    CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SERVER_BASE_URL,
     DOMAIN,
     SERVICE_REBUILD_STATISTICS,
+    SERVICE_SET_TIER_COST_ESTIMATE,
 )
 from .coordinator import GreenButtonCoordinator
 from .diagnostics import async_remove_xml_cache
-from .statistics import async_clear_statistics_for_entry
+from .statistics import async_clear_statistics_for_entry, async_seed_tiered_estimate
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant, ServiceCall
 
 _REBUILD_STATISTICS_SCHEMA = vol.Schema({vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.string})
+_SET_TIER_COST_ESTIMATE_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_CONFIG_ENTRY_ID): cv.string,
+        vol.Optional(ATTR_USAGE_POINT_ID): cv.string,
+        vol.Required(ATTR_ACTIVE_PERIOD_START): cv.string,
+        vol.Required(ATTR_PREDICTED_DAYS): vol.All(vol.Coerce(float), vol.Range(min=1, max=62)),
+        vol.Required(ATTR_CURRENCY_ALPHA): cv.string,
+        vol.Required(ATTR_TIER_ONE_RATE): vol.All(vol.Coerce(float), vol.Range(min=0, max=1)),
+        vol.Required(ATTR_TIER_TWO_RATE): vol.All(vol.Coerce(float), vol.Range(min=0, max=1)),
+        vol.Required(ATTR_TIER_ONE_KWH_PER_DAY): vol.All(
+            vol.Coerce(float), vol.Range(min=0.1, max=100)
+        ),
+        vol.Required(ATTR_RESIDUAL_RATE): vol.All(vol.Coerce(float), vol.Range(min=-1, max=1)),
+    }
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,8 +136,6 @@ def _async_register_services(hass: HomeAssistant) -> None:
     entries no-op. We deliberately don't deregister on unload: HA services normally persist
     for the integration's lifetime, and the handler already validates targets at call time.
     """
-    if hass.services.has_service(DOMAIN, SERVICE_REBUILD_STATISTICS):
-        return
 
     async def _handle_rebuild_statistics(call: ServiceCall) -> None:
         entry_id = call.data.get(ATTR_CONFIG_ENTRY_ID)
@@ -130,12 +154,48 @@ def _async_register_services(hass: HomeAssistant) -> None:
         for coordinator in targets:
             await coordinator.async_rebuild_statistics()
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_REBUILD_STATISTICS,
-        _handle_rebuild_statistics,
-        schema=_REBUILD_STATISTICS_SCHEMA,
-    )
+    async def _handle_set_tier_cost_estimate(call: ServiceCall) -> None:
+        entry_id = call.data[ATTR_CONFIG_ENTRY_ID]
+        coordinator = hass.data.get(DOMAIN, {}).get(entry_id)
+        if coordinator is None:
+            raise ServiceValidationError(
+                f"No loaded Open Green Button account with config entry id {entry_id!r}"
+            )
+        if coordinator.data is None:
+            raise ServiceValidationError("The account has no usage response to price yet")
+        try:
+            active_period_start = datetime.fromisoformat(call.data[ATTR_ACTIVE_PERIOD_START])
+            await async_seed_tiered_estimate(
+                hass,
+                coordinator.entry,
+                coordinator.data,
+                coordinator.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
+                active_period_start=active_period_start,
+                predicted_days=call.data[ATTR_PREDICTED_DAYS],
+                currency_alpha=call.data[ATTR_CURRENCY_ALPHA],
+                tier_one_rate=call.data[ATTR_TIER_ONE_RATE],
+                tier_two_rate=call.data[ATTR_TIER_TWO_RATE],
+                tier_one_kwh_per_day=call.data[ATTR_TIER_ONE_KWH_PER_DAY],
+                residual_rate=call.data[ATTR_RESIDUAL_RATE],
+                usage_point_id=call.data.get(ATTR_USAGE_POINT_ID),
+            )
+        except ValueError as err:
+            raise ServiceValidationError(str(err)) from err
+
+    if not hass.services.has_service(DOMAIN, SERVICE_REBUILD_STATISTICS):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_REBUILD_STATISTICS,
+            _handle_rebuild_statistics,
+            schema=_REBUILD_STATISTICS_SCHEMA,
+        )
+    if not hass.services.has_service(DOMAIN, SERVICE_SET_TIER_COST_ESTIMATE):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_TIER_COST_ESTIMATE,
+            _handle_set_tier_cost_estimate,
+            schema=_SET_TIER_COST_ESTIMATE_SCHEMA,
+        )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
