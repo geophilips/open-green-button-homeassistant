@@ -14,7 +14,9 @@ the id format — never construct one ad-hoc elsewhere.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from statistics import median
 from typing import TYPE_CHECKING
 
 from homeassistant.components.recorder.statistics import (
@@ -26,7 +28,7 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import CONF_TIER_COST_ESTIMATES, DOMAIN
 from .tou import cost_detail_tou_bucket, ontario_tou_bucket
 
 if TYPE_CHECKING:
@@ -55,6 +57,94 @@ except ImportError:  # pragma: no cover — older HA core, drop-through to has_m
     _MEAN_TYPE_NONE = None
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _TieredEstimateProfile:
+    """Rates inferred from the latest completed Ontario Tiered bill."""
+
+    tier_one_rate: float
+    tier_two_rate: float
+    tier_one_kwh_per_day: float
+    residual_rate: float
+
+
+@dataclass(frozen=True, slots=True)
+class _TieredEstimateState:
+    """Persisted inputs needed to cost an incremental open-period response."""
+
+    profile: _TieredEstimateProfile
+    active_period_start: datetime
+    predicted_days: float
+    currency_alpha: str
+
+
+def _load_tiered_estimate_state(
+    entry: ConfigEntry,
+    usage_point_id: str,
+) -> _TieredEstimateState | None:
+    """Load a validated per-usage-point estimator state from config-entry data."""
+    all_states = entry.data.get(CONF_TIER_COST_ESTIMATES)
+    if not isinstance(all_states, dict):
+        return None
+    raw = all_states.get(usage_point_id)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        active_period_start = datetime.fromisoformat(raw["active_period_start"])
+        if active_period_start.tzinfo is None:
+            active_period_start = active_period_start.replace(tzinfo=UTC)
+        profile = _TieredEstimateProfile(
+            tier_one_rate=float(raw["tier_one_rate"]),
+            tier_two_rate=float(raw["tier_two_rate"]),
+            tier_one_kwh_per_day=float(raw["tier_one_kwh_per_day"]),
+            residual_rate=float(raw["residual_rate"]),
+        )
+        state = _TieredEstimateState(
+            profile=profile,
+            active_period_start=active_period_start,
+            predicted_days=float(raw["predicted_days"]),
+            currency_alpha=str(raw["currency_alpha"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (
+        0 < state.profile.tier_one_rate < 1
+        and 0 < state.profile.tier_two_rate < 1
+        and state.profile.tier_one_kwh_per_day > 0
+        and -1 < state.profile.residual_rate < 1
+        and state.predicted_days > 0
+        and state.currency_alpha in _ISO_4217_ALPHA.values()
+    ):
+        return None
+    return state
+
+
+def _store_tiered_estimate_state(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    usage_point_id: str,
+    state: _TieredEstimateState,
+) -> None:
+    """Persist estimator state so summary-free incremental polls can keep costing usage."""
+    raw_states = entry.data.get(CONF_TIER_COST_ESTIMATES)
+    all_states = dict(raw_states) if isinstance(raw_states, dict) else {}
+    payload = {
+        "active_period_start": state.active_period_start.isoformat(),
+        "predicted_days": state.predicted_days,
+        "currency_alpha": state.currency_alpha,
+        "tier_one_rate": state.profile.tier_one_rate,
+        "tier_two_rate": state.profile.tier_two_rate,
+        "tier_one_kwh_per_day": state.profile.tier_one_kwh_per_day,
+        "residual_rate": state.profile.residual_rate,
+    }
+    if all_states.get(usage_point_id) == payload:
+        return
+    all_states[usage_point_id] = payload
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_TIER_COST_ESTIMATES: all_states},
+    )
 
 
 def statistic_id_for_series(
@@ -168,7 +258,11 @@ async def import_usage_statistics(
     # this response — it's already in the recorder. [_import_cost_summaries] reads it back to
     # distribute the bill, so the usage writes above must be committed first. Block once here; on a
     # fresh rebuild the period's usage was written moments ago and would otherwise not be visible.
-    if any(not _has_interval_cost(up) and up.summaries for up in response.usage_points):
+    if any(
+        not _has_interval_cost(up)
+        and (up.summaries or _load_tiered_estimate_state(entry, up.usage_point_id) is not None)
+        for up in response.usage_points
+    ):
         await get_instance(hass).async_block_till_done()
 
     for up in response.usage_points:
@@ -422,13 +516,18 @@ async def _import_cost_summaries(
     read them back from the usage statistic ([_recorded_forward_hours]) to distribute over.
     This is why a plain published-min poll is enough to keep cost current — no reach-back needed.
 
-    Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary
-    to accounts they bill; meter-only test profiles often won't), or when the currency code
-    isn't one we have an ISO 4217 alpha mapping for.
+    When an incremental poll has no summary, a previously inferred Tiered profile is loaded
+    from the config entry so the open-period estimate keeps advancing across polls/restarts.
+    Meter-only profiles without either summaries or saved estimate state are skipped.
     """
-    if not up.summaries:
+    saved_state = _load_tiered_estimate_state(entry, up.usage_point_id)
+    if not up.summaries and saved_state is None:
         return
-    currency_alpha = _iso_4217_alpha(up.summaries[0].currency_numeric_code)
+    currency_alpha = (
+        _iso_4217_alpha(up.summaries[0].currency_numeric_code)
+        if up.summaries
+        else saved_state.currency_alpha
+    )
     if currency_alpha is None:
         _LOGGER.debug(
             "Skipping cost stat for usage point %s: currency code %s has no ISO 4217 mapping",
@@ -463,9 +562,60 @@ async def _import_cost_summaries(
         (0.0, None) if fresh else await _resume_point(hass, statistic_id)
     )
 
+    if not up.summaries:
+        latest_forward_hour = _latest_forward_hour(up)
+        if latest_forward_hour is None:
+            return
+        open_hours = await _recorded_forward_hours(
+            hass,
+            entry,
+            up,
+            saved_state.active_period_start,
+            latest_forward_hour + timedelta(hours=1),
+        )
+        cost_at_hour = _tiered_estimated_costs(
+            open_hours,
+            saved_state.profile,
+            saved_state.predicted_days,
+        )
+        running = resume_from_sum
+        stats: list[StatisticData] = []
+        for hour_start, _kwh in open_hours:
+            if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
+                continue
+            running += cost_at_hour[hour_start]
+            stats.append(StatisticData(start=hour_start, state=running, sum=running))
+        if stats:
+            _LOGGER.info(
+                "Appending %d provisional tiered-cost rows for %s",
+                len(stats),
+                statistic_id,
+            )
+            async_add_external_statistics(hass, metadata, stats)
+        return
+
+    selected = _select_billing_summaries(up.summaries)
+    if not selected:
+        return
+
+    # The most recent completed bill may replace provisional hourly costs written while that
+    # period was still open. Rewrite that bill plus the new open period on every normal refresh,
+    # using the last cumulative value before it as the baseline. A fresh/first import still writes
+    # every bill from zero.
+    if fresh or resume_after_epoch is None:
+        summaries_to_write = selected
+        running = 0.0
+    else:
+        summaries_to_write = [selected[-1]]
+        running = await _cost_sum_before(
+            hass,
+            statistic_id,
+            selected[-1].billing_period_start,
+        )
+
     stats: list[StatisticData] = []
-    running = resume_from_sum
-    for summary in _select_billing_summaries(up.summaries):
+    latest_summary_hours: list[tuple[datetime, float]] = []
+    for summary in summaries_to_write:
         period_cost = summary.total_cost
         if period_cost == 0:
             # Test-lab fixtures often have $0 placeholders — skip rather than emit a
@@ -488,10 +638,60 @@ async def _import_cost_summaries(
         # costs across the period equals the period's total bill — verified by construction.
         cost_at_hour = _cost_distribution_for_period(summary, in_period, total_period_kwh)
         for hour_start, _kwh in in_period:
-            if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
-                continue
             running += cost_at_hour[hour_start]
             stats.append(StatisticData(start=hour_start, state=running, sum=running))
+        if summary is selected[-1]:
+            latest_summary_hours = in_period
+
+    # A UsageSummary is only published after the bill closes. Until then, infer the Ontario
+    # Tiered rates from the latest completed bill and append provisional hourly costs for the
+    # currently-open period. The next summary refresh rewrites this tail with the exact bill.
+    latest = selected[-1]
+    latest_end = latest.billing_period_start + timedelta(
+        seconds=latest.billing_period_duration_seconds
+    )
+    latest_forward_hour = _latest_forward_hour(up)
+    if latest_summary_hours:
+        profile = _tiered_estimate_profile(latest, latest_summary_hours)
+        if profile is not None:
+            predicted_days = _predicted_billing_days(selected, latest_end)
+            estimate_state = _TieredEstimateState(
+                profile=profile,
+                active_period_start=latest_end,
+                predicted_days=predicted_days,
+                currency_alpha=currency_alpha,
+            )
+            _store_tiered_estimate_state(hass, entry, up.usage_point_id, estimate_state)
+        else:
+            estimate_state = None
+        if (
+            estimate_state is not None
+            and latest_forward_hour is not None
+            and latest_forward_hour >= latest_end
+        ):
+            open_hours = await _recorded_forward_hours(
+                hass,
+                entry,
+                up,
+                latest_end,
+                latest_forward_hour + timedelta(hours=1),
+            )
+            cost_at_hour = _tiered_estimated_costs(
+                open_hours,
+                estimate_state.profile,
+                estimate_state.predicted_days,
+            )
+            for hour_start, _kwh in open_hours:
+                running += cost_at_hour[hour_start]
+                stats.append(StatisticData(start=hour_start, state=running, sum=running))
+            if open_hours:
+                _LOGGER.info(
+                    "Added %d provisional tiered-cost rows from %s using a %.0f-day "
+                    "billing-period estimate",
+                    len(open_hours),
+                    latest_end.isoformat(),
+                    estimate_state.predicted_days,
+                )
 
     if not stats:
         return
@@ -504,6 +704,158 @@ async def _import_cost_summaries(
         resume_from_sum,
     )
     async_add_external_statistics(hass, metadata, stats)
+
+
+async def _cost_sum_before(
+    hass: HomeAssistant,
+    statistic_id: str,
+    before: datetime,
+) -> float:
+    """Return the cumulative cost immediately before ``before``."""
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        before - timedelta(hours=2),
+        before,
+        {statistic_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    rows = by_id.get(statistic_id, [])
+    candidates: list[tuple[float, float]] = []
+    for row in rows:
+        total = row.get("sum")
+        start = row.get("start")
+        if total is None or start is None:
+            continue
+        epoch = start.timestamp() if isinstance(start, datetime) else float(start)
+        if epoch < before.timestamp():
+            candidates.append((epoch, float(total)))
+    return max(candidates, default=(0.0, 0.0))[1]
+
+
+def _latest_forward_hour(up: UsagePoint) -> datetime | None:
+    """Newest hour-aligned FORWARD interval-consumption reading in this response."""
+    hours = [
+        _align_to_hour(reading.start)
+        for series in up.series
+        if series.reading_type.flow_direction == "FORWARD"
+        and _is_interval_consumption_series(series)
+        for reading in series.readings
+    ]
+    return max(hours, default=None)
+
+
+def _tiered_estimate_profile(
+    summary: BillingSummary,
+    in_period: list[tuple[datetime, float]],
+) -> _TieredEstimateProfile | None:
+    """Infer Ontario Tiered rates and non-energy cost from a completed bill.
+
+    Milton-style UsageSummary details label the commodity charges as Block/Tier 1 and 2 but
+    omit their per-kWh rates. Ontario's residential lower-tier allowance is 600 kWh per 30
+    summer days and 1,000 kWh per 30 winter days; utilities prorate that allowance to the
+    actual number of billed days. Those quantities let us recover both rates exactly from a
+    completed bill, while the remaining bill total becomes an effective per-kWh estimate for
+    delivery, regulatory charges, HST, and rebates during the open period.
+    """
+    tier_cost = {1: 0.0, 2: 0.0}
+    seasons: set[str] = set()
+    for detail in summary.cost_details:
+        note = detail.normalized_note.replace("-", " ").replace("'", "")
+        tier: int | None = None
+        if "block 1" in note or "tier 1" in note:
+            tier = 1
+        elif "block 2" in note or "tier 2" in note:
+            tier = 2
+        if tier is None or detail.amount <= 0:
+            continue
+        tier_cost[tier] += detail.amount
+        if "summer" in note or "smr" in note:
+            seasons.add("summer")
+        if "winter" in note or "win" in note:
+            seasons.add("winter")
+
+    if tier_cost[1] <= 0 or tier_cost[2] <= 0 or len(seasons) != 1:
+        return None
+
+    # Billing thresholds are prorated by calendar days. A period spanning a DST boundary can
+    # contain 23/25-hour days, so round the elapsed seconds instead of treating the fractional
+    # UTC duration as a fractional billing day.
+    days = round(summary.billing_period_duration_seconds / 86400)
+    tier_one_kwh_per_day = 20.0 if "summer" in seasons else 1000.0 / 30.0
+    tier_one_kwh = tier_one_kwh_per_day * days
+    total_kwh = sum(kwh for _hour, kwh in in_period)
+    tier_two_kwh = total_kwh - tier_one_kwh
+    if days <= 0 or tier_two_kwh <= 0 or total_kwh <= 0:
+        return None
+
+    tier_one_rate = tier_cost[1] / tier_one_kwh
+    tier_two_rate = tier_cost[2] / tier_two_kwh
+    residual_rate = (summary.total_cost - tier_cost[1] - tier_cost[2]) / total_kwh
+    # Fail closed for malformed/non-Ontario line items instead of publishing implausible costs.
+    if not (0 < tier_one_rate < 1 and 0 < tier_two_rate < 1 and -1 < residual_rate < 1):
+        return None
+    return _TieredEstimateProfile(
+        tier_one_rate=tier_one_rate,
+        tier_two_rate=tier_two_rate,
+        tier_one_kwh_per_day=tier_one_kwh_per_day,
+        residual_rate=residual_rate,
+    )
+
+
+def _predicted_billing_days(
+    summaries: list[BillingSummary],
+    open_period_start: datetime,
+) -> float:
+    """Predict the open period length from the same cycle in the previous year.
+
+    Utilities use customer-specific read cycles rather than a fixed weekday. The closest
+    same-month start from an earlier year is the best available forecast; otherwise use the
+    median of recent completed periods. Calendar-day rounding removes one-hour DST artifacts.
+    """
+    prior_same_month = [
+        summary
+        for summary in summaries
+        if summary.billing_period_start.year < open_period_start.year
+        and summary.billing_period_start.month == open_period_start.month
+    ]
+    if prior_same_month:
+        closest = min(
+            prior_same_month,
+            key=lambda summary: (
+                open_period_start.year - summary.billing_period_start.year,
+                abs(open_period_start.day - summary.billing_period_start.day),
+            ),
+        )
+        return float(round(closest.billing_period_duration_seconds / 86400))
+
+    recent_days = [
+        round(summary.billing_period_duration_seconds / 86400) for summary in summaries[-12:]
+    ]
+    return float(round(median(recent_days))) if recent_days else 30.0
+
+
+def _tiered_estimated_costs(
+    hours: list[tuple[datetime, float]],
+    profile: _TieredEstimateProfile,
+    predicted_days: float,
+) -> dict[datetime, float]:
+    """Price open-period hours, splitting the hour that crosses the tier threshold."""
+    threshold = profile.tier_one_kwh_per_day * predicted_days
+    consumed = 0.0
+    out: dict[datetime, float] = {}
+    for hour_start, kwh in hours:
+        tier_one_kwh = max(0.0, min(kwh, threshold - consumed))
+        tier_two_kwh = kwh - tier_one_kwh
+        out[hour_start] = (
+            tier_one_kwh * profile.tier_one_rate
+            + tier_two_kwh * profile.tier_two_rate
+            + kwh * profile.residual_rate
+        )
+        consumed += kwh
+    return out
 
 
 async def _import_cost_from_readings(
