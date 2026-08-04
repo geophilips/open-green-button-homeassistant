@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState
 from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
 )
@@ -277,6 +279,62 @@ async def test_summary_cost_skipped_when_no_recorded_usage(hass: HomeAssistant) 
 
     cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
     assert not cost_calls
+
+
+async def test_summary_cost_deferred_until_hass_started(hass: HomeAssistant) -> None:
+    """Before HA has started, the cost pass must NOT block on the recorder — it defers.
+
+    Regression guard for the startup deadlock: the recorder thread doesn't drain its queue until
+    EVENT_HOMEASSISTANT_STARTED, and HA doesn't fire STARTED until config-entry setup returns, so
+    awaiting `async_block_till_done()` inside `async_config_entry_first_refresh()` hangs until HA's
+    300s setup timeout cancels the entry ("Setup of config entry ... cancelled"). The usage import
+    must still complete inline; only the recorder-dependent cost pass waits for start.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    recorded = [
+        (datetime(2026, 4, 3, 5, tzinfo=UTC), 1.0),
+        (datetime(2026, 4, 3, 6, tzinfo=UTC), 3.0),
+    ]
+    hass.set_state(CoreState.starting)
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(return_value=recorded),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics.get_instance",
+        ) as get_instance_mock,
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        get_instance_mock.return_value.async_block_till_done = AsyncMock()
+
+        await import_usage_statistics(
+            hass, entry, _summary_only_response(), utility_display_name="X"
+        )
+
+        # Nothing recorder-blocking may happen while HA is still starting.
+        get_instance_mock.return_value.async_block_till_done.assert_not_awaited()
+        assert not [
+            c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")
+        ]
+
+        # ...and the deferred pass runs (and blocks safely) once HA is up.
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+
+        get_instance_mock.return_value.async_block_till_done.assert_awaited_once()
+        cost_calls = [
+            c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")
+        ]
+
+    assert len(cost_calls) == 1
+    assert [round(s["sum"], 2) for s in cost_calls[0].args[2]] == [10.0, 40.0]
 
 
 def test_statistic_id_is_scoped_per_entry() -> None:

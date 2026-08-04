@@ -24,7 +24,8 @@ from homeassistant.components.recorder.statistics import (
     statistics_during_period,
 )
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers.start import async_at_started
 
 from .const import DOMAIN
 from .tou import cost_detail_tou_bucket, ontario_tou_bucket
@@ -160,9 +161,59 @@ async def import_usage_statistics(
     # this response — it's already in the recorder. [_import_cost_summaries] reads it back to
     # distribute the bill, so the usage writes above must be committed first. Block once here; on a
     # fresh rebuild the period's usage was written moments ago and would otherwise not be visible.
-    if any(not _has_interval_cost(up) and up.summaries for up in response.usage_points):
-        await get_instance(hass).async_block_till_done()
+    needs_recorder_flush = any(
+        not _has_interval_cost(up) and up.summaries for up in response.usage_points
+    )
 
+    if needs_recorder_flush and hass.state is not CoreState.running:
+        # DEADLOCK GUARD — do not await the recorder before HA has started.
+        #
+        # `Recorder._run()` blocks in `_wait_startup_or_shutdown()` until HOMEASSISTANT_STARTED
+        # and only then enters `_run_event_loop()`, which is what drains the queue. Our
+        # `async_block_till_done()` queues a SynchronizeTask and awaits it, so before start it can
+        # never complete. HA in turn doesn't fire STARTED until config-entry setup returns — and
+        # this runs inside `async_config_entry_first_refresh()`. That's a genuine deadlock, broken
+        # only by HA's SLOW_SETUP_MAX_WAIT (300s) cancelling the setup task:
+        #   "Setup of config entry '<title>' for greenbutton integration cancelled"
+        # which leaves the entry in SETUP_ERROR with no retry until the next restart.
+        #
+        # So defer the whole cost pass to just after start instead, where the block is safe.
+        # `async_at_started` fires on STARTED (or immediately if we somehow race into `running`),
+        # and its unsubscribe is tied to the entry so an unload cancels a still-pending pass.
+        async def _deferred_cost_pass(_hass: HomeAssistant) -> None:
+            _LOGGER.debug(
+                "Running deferred cost import for entry %s (HA has started)", entry.entry_id
+            )
+            await get_instance(hass).async_block_till_done()
+            await _import_costs(hass, entry, response, utility_display_name, fresh=fresh)
+
+        _LOGGER.debug(
+            "HA is %s, not running — deferring cost import for entry %s until after startup",
+            hass.state,
+            entry.entry_id,
+        )
+        entry.async_on_unload(async_at_started(hass, _deferred_cost_pass))
+        return
+
+    if needs_recorder_flush:
+        await get_instance(hass).async_block_till_done()
+    await _import_costs(hass, entry, response, utility_display_name, fresh=fresh)
+
+
+async def _import_costs(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    response: UsageResponse,
+    utility_display_name: str,
+    *,
+    fresh: bool = False,
+) -> None:
+    """Second-pass cost import for every usage point in [response].
+
+    Split out of [import_usage_statistics] so it can also run deferred, after
+    EVENT_HOMEASSISTANT_STARTED — see the deadlock guard there. Assumes the usage writes it
+    depends on have already been flushed to the recorder by the caller.
+    """
     for up in response.usage_points:
         # Prefer per-interval <cost> — utilities like savagedata/Milton itemize actual hourly cost,
         # which is more accurate and is self-contained on the reading. Fall back to distributing a
