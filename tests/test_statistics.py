@@ -33,6 +33,7 @@ from custom_components.greenbutton.statistics import (
     _tiered_estimate_profile,
     _tiered_estimated_costs,
     _TieredEstimateProfile,
+    async_seed_tiered_estimate,
     import_usage_statistics,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
@@ -164,6 +165,43 @@ async def test_incremental_import_reads_resume_point(hass: HomeAssistant) -> Non
         )
 
     resume_mock.assert_awaited()  # incremental imports must still read the resume point
+
+
+async def test_seed_tiered_estimate_persists_and_prices_current_response(
+    hass: HomeAssistant,
+) -> None:
+    """A manual bill-derived profile uses the same persistent incremental path as summaries."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    entry.data = {}
+    response = _one_reading_response()
+    importer = AsyncMock()
+    with (
+        patch.object(hass.config_entries, "async_update_entry") as update_entry,
+        patch(
+            "custom_components.greenbutton.statistics._import_cost_summaries",
+            new=importer,
+        ),
+    ):
+        usage_point_id = await async_seed_tiered_estimate(
+            hass,
+            entry,
+            response,
+            "Example Utility",
+            active_period_start=datetime(2026, 7, 9, 4, tzinfo=UTC),
+            predicted_days=30,
+            currency_alpha="cad",
+            tier_one_rate=0.12,
+            tier_two_rate=0.142,
+            tier_one_kwh_per_day=20,
+            residual_rate=0.06,
+        )
+
+    assert usage_point_id == "up1"
+    stored = update_entry.call_args.kwargs["data"][CONF_TIER_COST_ESTIMATES]["up1"]
+    assert stored["currency_alpha"] == "CAD"
+    assert stored["active_period_start"] == "2026-07-09T04:00:00+00:00"
+    importer.assert_awaited_once()
 
 
 def _per_interval_cost_response() -> UsageResponse:

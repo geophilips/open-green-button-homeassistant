@@ -10,9 +10,18 @@ DOMAIN = "greenbutton"
 # a full history re-fetch — the supported way to pick up a calculation-logic change (e.g. a
 # cost fix) without removing the entry and redoing the OAuth authorization.
 SERVICE_REBUILD_STATISTICS = "rebuild_statistics"
+SERVICE_SET_TIER_COST_ESTIMATE = "set_tier_cost_estimate"
 # Optional service field: which config entry to rebuild (via HA's config_entry selector).
 # Omitted → rebuild every loaded Open Green Button entry.
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"
+ATTR_ACTIVE_PERIOD_START = "active_period_start"
+ATTR_CURRENCY_ALPHA = "currency_alpha"
+ATTR_PREDICTED_DAYS = "predicted_days"
+ATTR_RESIDUAL_RATE = "residual_rate"
+ATTR_TIER_ONE_KWH_PER_DAY = "tier_one_kwh_per_day"
+ATTR_TIER_ONE_RATE = "tier_one_rate"
+ATTR_TIER_TWO_RATE = "tier_two_rate"
+ATTR_USAGE_POINT_ID = "usage_point_id"
 
 # How far back to overlap the window when re-fetching. Generous to absorb clock skew between
 # us and the utility, and to forgive late-arriving corrections. The statistics writer is

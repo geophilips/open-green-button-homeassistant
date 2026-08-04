@@ -108,16 +108,21 @@ def _load_tiered_estimate_state(
         )
     except (KeyError, TypeError, ValueError):
         return None
-    if not (
+    if not _is_valid_tiered_estimate_state(state):
+        return None
+    return state
+
+
+def _is_valid_tiered_estimate_state(state: _TieredEstimateState) -> bool:
+    """Return whether a persisted or manually supplied estimator state is safe."""
+    return (
         0 < state.profile.tier_one_rate < 1
         and 0 < state.profile.tier_two_rate < 1
         and state.profile.tier_one_kwh_per_day > 0
         and -1 < state.profile.residual_rate < 1
         and state.predicted_days > 0
         and state.currency_alpha in _ISO_4217_ALPHA.values()
-    ):
-        return None
-    return state
+    )
 
 
 def _store_tiered_estimate_state(
@@ -145,6 +150,65 @@ def _store_tiered_estimate_state(
         entry,
         data={**entry.data, CONF_TIER_COST_ESTIMATES: all_states},
     )
+
+
+async def async_seed_tiered_estimate(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    response: UsageResponse,
+    utility_display_name: str,
+    *,
+    active_period_start: datetime,
+    predicted_days: float,
+    currency_alpha: str,
+    tier_one_rate: float,
+    tier_two_rate: float,
+    tier_one_kwh_per_day: float,
+    residual_rate: float,
+    usage_point_id: str | None = None,
+) -> str:
+    """Persist a verified Tiered profile and immediately append its open-period costs.
+
+    Some ESPI servers deliver UsageSummary records only once. If the integration is first
+    installed after that delivery, or a statistics rebuild receives only the daily delta,
+    there is no summary in the live response from which to infer rates. This explicit service
+    seeds the same validated state normally learned from a completed bill; later summaries
+    remain authoritative and replace it automatically.
+    """
+    usage_points = response.usage_points
+    if usage_point_id is None:
+        if len(usage_points) != 1:
+            raise ValueError(
+                "usage_point_id is required when the response has more than one usage point"
+            )
+        up = usage_points[0]
+    else:
+        up = next(
+            (candidate for candidate in usage_points if candidate.usage_point_id == usage_point_id),
+            None,
+        )
+        if up is None:
+            raise ValueError(f"Unknown usage_point_id {usage_point_id!r}")
+
+    if active_period_start.tzinfo is None:
+        active_period_start = active_period_start.replace(tzinfo=UTC)
+    state = _TieredEstimateState(
+        profile=_TieredEstimateProfile(
+            tier_one_rate=tier_one_rate,
+            tier_two_rate=tier_two_rate,
+            tier_one_kwh_per_day=tier_one_kwh_per_day,
+            residual_rate=residual_rate,
+        ),
+        active_period_start=active_period_start,
+        predicted_days=predicted_days,
+        currency_alpha=currency_alpha.upper(),
+    )
+    if not _is_valid_tiered_estimate_state(state):
+        raise ValueError("Tiered estimate values are outside the supported ranges")
+
+    _store_tiered_estimate_state(hass, entry, up.usage_point_id, state)
+    await _import_cost_summaries(hass, entry, up, utility_display_name)
+    return up.usage_point_id
 
 
 def statistic_id_for_series(

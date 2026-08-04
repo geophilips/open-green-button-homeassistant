@@ -52,6 +52,48 @@
           "description": "Which Open Green Button account to rebuild. Leave empty to rebuild every configured account."
         }
       }
+    },
+    "set_tier_cost_estimate": {
+      "name": "Set Tiered cost estimate",
+      "description": "Seeds a verified Tiered rate profile when the utility's live feed no longer includes the completed bill that established those rates. Later billing summaries replace this estimate automatically.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Account",
+          "description": "The Open Green Button account to update."
+        },
+        "usage_point_id": {
+          "name": "Usage point",
+          "description": "Optional meter usage-point ID. Leave empty when the account has one usage point."
+        },
+        "active_period_start": {
+          "name": "Billing-period start",
+          "description": "Start of the currently open billing period."
+        },
+        "predicted_days": {
+          "name": "Predicted billing days",
+          "description": "Expected length of the open billing period."
+        },
+        "currency_alpha": {
+          "name": "Currency",
+          "description": "Three-letter ISO currency code, such as CAD."
+        },
+        "tier_one_rate": {
+          "name": "Tier 1 rate",
+          "description": "Tier 1 energy price per kWh."
+        },
+        "tier_two_rate": {
+          "name": "Tier 2 rate",
+          "description": "Tier 2 energy price per kWh."
+        },
+        "tier_one_kwh_per_day": {
+          "name": "Daily Tier 1 allowance",
+          "description": "Tier 1 kWh allowance per billing day."
+        },
+        "residual_rate": {
+          "name": "Residual rate",
+          "description": "Effective per-kWh estimate for delivery, regulatory charges, taxes, and rebates."
+        }
+      }
     }
   }
 }

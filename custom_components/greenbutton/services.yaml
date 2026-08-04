@@ -5,3 +5,64 @@ rebuild_statistics:
       selector:
         config_entry:
           integration: greenbutton
+
+set_tier_cost_estimate:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: greenbutton
+    usage_point_id:
+      required: false
+      selector:
+        text:
+    active_period_start:
+      required: true
+      selector:
+        datetime:
+    predicted_days:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 62
+          step: 1
+          mode: box
+    currency_alpha:
+      required: true
+      example: CAD
+      selector:
+        text:
+    tier_one_rate:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.001
+          mode: box
+    tier_two_rate:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.001
+          mode: box
+    tier_one_kwh_per_day:
+      required: true
+      selector:
+        number:
+          min: 0.1
+          max: 100
+          step: 0.1
+          mode: box
+    residual_rate:
+      required: true
+      selector:
+        number:
+          min: -1
+          max: 1
+          step: 0.001
+          mode: box
