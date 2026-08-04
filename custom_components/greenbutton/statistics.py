@@ -281,23 +281,23 @@ async def _import_series(
         (0.0, None) if fresh else await _resume_point(hass, statistic_id)
     )
 
+    by_hour, covered_seconds = _hourly_totals(series)
+    _drop_incomplete_trailing_hour(by_hour, covered_seconds, statistic_id)
+
     stats: list[StatisticData] = []
     running = resume_from_sum
-    for reading in series.readings:
+    for hour in sorted(by_hour):
         # Stale-window guard — HA's statistics machinery already deduplicates on
         # (statistic_id, start), but skipping locally avoids resetting `running` from
-        # readings already accounted for in the stored cumulative sum.
-        if resume_after_epoch is not None and reading.start.timestamp() <= resume_after_epoch:
+        # readings already accounted for in the stored cumulative sum. Compare the *aligned*
+        # hour, because that's the granularity the stored row (and hence `_resume_point`) is
+        # at: a raw sub-hourly reading start at :15 is > the hour's stored start, so a raw
+        # comparison would wave through readings whose hour is already in the sum and add
+        # them on top of it, inflating that hour and every hour after it.
+        if resume_after_epoch is not None and hour.timestamp() <= resume_after_epoch:
             continue
-        converted = _to_ha_units(reading.value, series.reading_type)
-        running += converted
-        stats.append(
-            StatisticData(
-                start=_align_to_hour(reading.start),
-                state=running,
-                sum=running,
-            )
-        )
+        running += by_hour[hour]
+        stats.append(StatisticData(start=hour, state=running, sum=running))
 
     if not stats:
         return
@@ -309,6 +309,64 @@ async def _import_series(
         resume_from_sum,
     )
     async_add_external_statistics(hass, metadata, stats)
+
+
+def _hourly_totals(series: MeterReadingSeries) -> tuple[dict[datetime, float], dict[datetime, int]]:
+    """Fold a series' readings into ``(kwh_by_hour, covered_seconds_by_hour)``.
+
+    Aggregating to the hour *before* accumulating is load-bearing for any utility whose feed
+    uses a sub-hourly ``intervalLength`` (15 or 30 minutes — none in scope today, but the ESPI
+    schema allows it and nothing upstream rejects it). One StatisticData row per reading would
+    emit four rows sharing the same hour-aligned ``start``; HA upserts on
+    (statistic_id, start), so three of the four are silently discarded and only the last
+    reading's cumulative total survives. That happens to land on the right number within a
+    single import, but it leaves the stored row's ``start`` at the hour boundary, which is what
+    [_resume_point] reads back — and the sub-hour readings inside that already-imported hour
+    then sail past a raw stale-window comparison on the next poll and get added a second time.
+
+    Summing per hour here makes each hour exactly one row, so the row we write and the cursor
+    we later resume from describe the same unit of time.
+    """
+    by_hour: dict[datetime, float] = {}
+    covered_seconds: dict[datetime, int] = {}
+    for reading in series.readings:
+        hour = _align_to_hour(reading.start)
+        by_hour[hour] = by_hour.get(hour, 0.0) + _to_ha_units(reading.value, series.reading_type)
+        covered_seconds[hour] = covered_seconds.get(hour, 0) + reading.duration_seconds
+    return by_hour, covered_seconds
+
+
+def _drop_incomplete_trailing_hour(
+    by_hour: dict[datetime, float],
+    covered_seconds: dict[datetime, int],
+    statistic_id: str,
+) -> None:
+    """Remove the newest hour from [by_hour] when the feed only covers part of it.
+
+    The cumulative-sum model can't revise an hour once written: the resume point is a single
+    (sum, start) pair, so re-stating an earlier hour would mean rewriting every later row. With
+    a sub-hourly feed a poll routinely lands mid-hour — writing that half-covered hour would
+    freeze it at half its real consumption, since the aligned stale-window guard correctly
+    refuses to add its remaining intervals on the next poll.
+
+    So hold the partial hour back instead and let a later poll import it whole. Only the
+    *trailing* hour is deferred; a mid-series hour short of 3600s is a genuine gap in the feed
+    and is imported as-is. An hour with no duration information at all (0s covered) is left
+    alone rather than deferred forever. Hourly feeds — every utility in scope today — cover a
+    full 3600s per hour and never trip this.
+    """
+    if not by_hour:
+        return
+    last_hour = max(by_hour)
+    covered = covered_seconds.get(last_hour, 0)
+    if 0 < covered < 3600:
+        _LOGGER.debug(
+            "Deferring partial hour %s for %s (%ds of 3600 covered) until the feed completes it",
+            last_hour.isoformat(),
+            statistic_id,
+            covered,
+        )
+        del by_hour[last_hour]
 
 
 def _stat_display_name(

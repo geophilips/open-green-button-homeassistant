@@ -10,8 +10,12 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticMeanType
-from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    statistics_during_period,
+)
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CoreState
 from pytest_homeassistant_custom_component.components.recorder.common import (
@@ -161,6 +165,146 @@ async def test_incremental_import_reads_resume_point(hass: HomeAssistant) -> Non
         )
 
     resume_mock.assert_awaited()  # incremental imports must still read the resume point
+
+
+def _sub_hourly_response(hours: range, interval_seconds: int = 900) -> UsageResponse:
+    """A FORWARD electricity response on a sub-hourly `intervalLength`.
+
+    Each hour in [hours] is split into `3600 // interval_seconds` readings of 250 Wh, so every
+    hour totals exactly 1 kWh no matter the interval length.
+    """
+    per_hour = 3600 // interval_seconds
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=interval_seconds,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="mr1",
+        reading_type=reading_type,
+        readings=[
+            UsageReading(
+                start=datetime(2026, 7, 5, h, tzinfo=UTC) + timedelta(seconds=i * interval_seconds),
+                duration_seconds=interval_seconds,
+                value=1000.0 / per_hour,
+            )
+            for h in hours
+            for i in range(per_hour)
+        ],
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def _recorded_sums(hass: HomeAssistant, stat_id: str) -> list[tuple[int, float]]:
+    """Read a usage statistic back out of the recorder as ``[(hour, cumulative_sum), ...]``."""
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        datetime(2026, 7, 5, tzinfo=UTC),
+        datetime(2026, 7, 6, tzinfo=UTC),
+        {stat_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    return [
+        (datetime.fromtimestamp(row["start"], tz=UTC).hour, round(row["sum"], 3))
+        for row in by_id.get(stat_id, [])
+    ]
+
+
+async def test_sub_hourly_series_is_not_double_counted_across_polls(hass: HomeAssistant) -> None:
+    """A 15-minute-interval feed imported twice must not inflate the cumulative sum.
+
+    Regression guard for a latent double-count: `_align_to_hour` floors all four readings in an
+    hour to the same `start`, so one row per reading collides on (statistic_id, start) and only
+    the last survives HA's upsert — which looks right on a single import, but leaves the stored
+    row's start at the hour boundary. `_resume_point` returns that boundary, so a stale-window
+    guard comparing the *raw* reading start would wave the :15/:30/:45 readings of an
+    already-imported hour straight through on the next poll and add them on top of the resumed
+    sum, inflating that hour and every hour after it.
+
+    Two polls over overlapping windows, against a real recorder, must leave 1 kWh per hour.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    stat_id = statistic_id_for_series(entry.entry_id, "up1", "FORWARD")
+
+    # Poll 1: hours 05 and 06 (1 kWh each, as four 250 Wh quarter-hour readings).
+    await import_usage_statistics(
+        hass, entry, _sub_hourly_response(range(5, 7)), utility_display_name="X"
+    )
+    await async_wait_recording_done(hass)
+    assert await _recorded_sums(hass, stat_id) == [(5, 1.0), (6, 2.0)]
+
+    # Poll 2: the same two hours again (the fetch window overlaps by design) plus hour 07.
+    await import_usage_statistics(
+        hass, entry, _sub_hourly_response(range(5, 8)), utility_display_name="X"
+    )
+    await async_wait_recording_done(hass)
+    assert await _recorded_sums(hass, stat_id) == [(5, 1.0), (6, 2.0), (7, 3.0)]
+
+
+async def test_sub_hourly_readings_are_summed_into_one_row_per_hour(hass: HomeAssistant) -> None:
+    """Four quarter-hour readings become a single StatisticData row carrying the whole hour."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass, entry, _sub_hourly_response(range(5, 7)), utility_display_name="X"
+        )
+
+    stats = add_mock.call_args.args[2]
+    assert [(s["start"].hour, round(s["sum"], 3)) for s in stats] == [(5, 1.0), (6, 2.0)]
+
+
+async def test_partial_trailing_hour_is_deferred_then_imported_whole(hass: HomeAssistant) -> None:
+    """A poll landing mid-hour holds that hour back rather than freezing it at half a total.
+
+    The resume point is a single (sum, start) pair, so an hour can't be revised once written —
+    importing a half-covered hour would permanently under-count it. Defer it instead; the next
+    poll carries the full hour and imports it whole.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    stat_id = statistic_id_for_series(entry.entry_id, "up1", "FORWARD")
+
+    # Poll 1 lands mid-hour: hour 05 complete, hour 06 only half published.
+    partial = _sub_hourly_response(range(5, 7))
+    series = partial.usage_points[0].series[0]
+    truncated = MeterReadingSeries(
+        meter_reading_id=series.meter_reading_id,
+        reading_type=series.reading_type,
+        readings=series.readings[:6],  # 4 readings for hour 05, 2 for hour 06
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[truncated])
+    await import_usage_statistics(
+        hass,
+        entry,
+        UsageResponse(updated=None, usage_points=[up], new_credentials=None),
+        utility_display_name="X",
+    )
+    await async_wait_recording_done(hass)
+    assert await _recorded_sums(hass, stat_id) == [(5, 1.0)]  # hour 06 held back, not halved
+
+    # Poll 2 carries hour 06 complete — it lands at its full 1 kWh.
+    await import_usage_statistics(
+        hass, entry, _sub_hourly_response(range(5, 8)), utility_display_name="X"
+    )
+    await async_wait_recording_done(hass)
+    assert await _recorded_sums(hass, stat_id) == [(5, 1.0), (6, 2.0), (7, 3.0)]
 
 
 def _per_interval_cost_response() -> UsageResponse:
