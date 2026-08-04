@@ -89,6 +89,11 @@ CONF_POLL_INTERVAL_SECONDS = "poll_interval_seconds"
 # so no separate cost cursor is needed.
 CONF_LAST_FETCHED_AT = "last_fetched_at"
 
+# Per-usage-point state for live Tiered cost estimates between completed UsageSummary bills.
+# The utility feed only republishes a summary when a bill closes, so the inferred rates and
+# current-period boundary must survive incremental polls and Home Assistant restarts.
+CONF_TIER_COST_ESTIMATES = "tier_cost_estimates"
+
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see
 # [coordinator.GreenButtonCoordinator._async_ensure_customer_label]). CONF_CUSTOMER_LABEL doubles

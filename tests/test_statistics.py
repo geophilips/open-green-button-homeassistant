@@ -18,16 +18,21 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 
 from custom_components.greenbutton.api import (
     BillingSummary,
+    CostDetail,
     MeterReadingSeries,
     NormalizedReadingType,
     UsagePoint,
     UsageReading,
     UsageResponse,
 )
-from custom_components.greenbutton.const import DOMAIN
+from custom_components.greenbutton.const import CONF_TIER_COST_ESTIMATES, DOMAIN
 from custom_components.greenbutton.statistics import (
+    _predicted_billing_days,
     _recorded_forward_hours,
     _select_billing_summaries,
+    _tiered_estimate_profile,
+    _tiered_estimated_costs,
+    _TieredEstimateProfile,
     import_usage_statistics,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
@@ -314,6 +319,57 @@ async def test_bulk_zero_cost_falls_back_to_billing_summary(hass: HomeAssistant)
     assert [round(s["sum"], 2) for s in stats] == [20.0, 50.0]
 
 
+async def test_incremental_poll_uses_saved_tier_state_without_summary(
+    hass: HomeAssistant,
+) -> None:
+    """Daily polls keep appending estimates even though UsageSummary is not republished."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    entry.data = {
+        CONF_TIER_COST_ESTIMATES: {
+            "up1": {
+                "active_period_start": "2026-07-01T04:00:00+00:00",
+                "predicted_days": 30,
+                "currency_alpha": "CAD",
+                "tier_one_rate": 0.12,
+                "tier_two_rate": 0.142,
+                "tier_one_kwh_per_day": 20,
+                "residual_rate": 0.06,
+            }
+        }
+    }
+    recorded = [
+        (datetime(2026, 7, 5, 5, tzinfo=UTC), 1.0),
+        (datetime(2026, 7, 5, 6, tzinfo=UTC), 1.5),
+    ]
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(100.0, datetime(2026, 7, 5, 5, tzinfo=UTC).timestamp())),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(return_value=recorded),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass,
+            entry,
+            _milton_mixed_series_response(),
+            utility_display_name="Milton Hydro",
+        )
+
+    cost_calls = [
+        call for call in add_mock.call_args_list if call.args[1]["statistic_id"].endswith("_cost")
+    ]
+    assert len(cost_calls) == 1
+    stats = cost_calls[0].args[2]
+    # The first saved hour is already imported; the second adds 1.5 kWh × (12¢ + 6¢).
+    assert len(stats) == 1
+    assert round(stats[0]["sum"], 2) == 100.27
+
+
 def _summary_only_response() -> UsageResponse:
     """A monthly UsageSummary with NO per-interval <cost> and NO readings in the response.
 
@@ -496,3 +552,72 @@ def test_select_summaries_prefers_real_bill_over_zero_placeholder() -> None:
     selected = _select_billing_summaries([placeholder, real])
     assert len(selected) == 1
     assert selected[0].total_cost == 130.08
+
+
+def _milton_detail(note: str, dollars: float) -> CostDetail:
+    return CostDetail(
+        amount_raw=round(dollars * 100_000),
+        note=note,
+        item_kind=10,
+        unit_cost_raw=None,
+    )
+
+
+def test_milton_tier_profile_replays_completed_bill() -> None:
+    """A synthetic 30-day bill recovers the exact 12.0/14.2-cent tier rates."""
+    summary = BillingSummary(
+        billing_period_start=datetime(2026, 6, 10, 4, tzinfo=UTC),
+        billing_period_duration_seconds=30 * _DAY,
+        bill_last_period_raw=12_500_000,
+        cost_additional_last_period_raw=12_500_000,
+        cost_details=[
+            _milton_detail("'Block 1 - Summer SMR'", 72.00),
+            _milton_detail("'Block 2 - Summer SMR'", 14.20),
+        ],
+        currency_numeric_code=124,
+    )
+    hours = [(datetime(2026, 6, 10, 4, tzinfo=UTC), 700.0)]
+
+    profile = _tiered_estimate_profile(summary, hours)
+
+    assert profile is not None
+    assert round(profile.tier_one_rate, 6) == 0.12
+    assert round(profile.tier_two_rate, 6) == 0.142
+    assert round(profile.residual_rate, 6) == round(38.80 / 700.0, 6)
+
+
+def test_open_period_prediction_uses_same_cycle_from_previous_year() -> None:
+    """An open period inherits the prior year's same-month read-cycle duration."""
+    previous_year = _summary(datetime(2025, 7, 10, 4, tzinfo=UTC), 30, 100.00)
+    latest = _summary(datetime(2026, 6, 10, 4, tzinfo=UTC), 30, 100.00)
+
+    predicted = _predicted_billing_days(
+        [previous_year, latest],
+        datetime(2026, 7, 10, 4, tzinfo=UTC),
+    )
+
+    assert predicted == 30
+
+
+def test_tiered_estimate_splits_threshold_hour_and_preserves_total() -> None:
+    """The hour crossing 600 kWh is split between tiers, including residual bill cost."""
+    profile = _TieredEstimateProfile(
+        tier_one_rate=0.12,
+        tier_two_rate=0.142,
+        tier_one_kwh_per_day=20.0,
+        residual_rate=38.80 / 700.0,
+    )
+    start = datetime(2026, 7, 10, 4, tzinfo=UTC)
+    hours = [
+        (start, 598.2912),
+        (start + timedelta(hours=1), 2.0148),
+        (start + timedelta(hours=2), 79.5864),
+    ]
+
+    costs = _tiered_estimated_costs(hours, profile, predicted_days=30)
+
+    crossing_expected = 1.7088 * 0.12 + 0.306 * 0.142 + 2.0148 * profile.residual_rate
+    assert round(costs[start + timedelta(hours=1)], 8) == round(crossing_expected, 8)
+    total_kwh = sum(kwh for _hour, kwh in hours)
+    expected = 600 * 0.12 + (total_kwh - 600) * 0.142 + total_kwh * profile.residual_rate
+    assert round(sum(costs.values()), 8) == round(expected, 8)
