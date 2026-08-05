@@ -25,7 +25,9 @@ import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from homeassistant.core import CoreState
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
@@ -42,6 +44,7 @@ from .const import (
     CONF_CUSTOMER_ADDRESS,
     CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_IMPORT_LOGIC_REVISION,
     CONF_INITIAL_HISTORY_SECONDS,
     CONF_LAST_FETCHED_AT,
     CONF_POLL_INTERVAL_SECONDS,
@@ -49,11 +52,18 @@ from .const import (
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    IMPORT_LOGIC_REVISION,
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
     PUBLISHED_MAX_LOOKAHEAD,
+    SERVICE_REBUILD_STATISTICS,
 )
-from .statistics import async_clear_statistics_for_entry, import_usage_statistics
+from .statistics import (
+    async_clear_statistics_for_entry,
+    async_entry_has_statistics,
+    import_usage_statistics,
+    response_has_cumulative_series,
+)
 from .storage import xml_cache_path
 
 if TYPE_CHECKING:
@@ -144,6 +154,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         # initial-history window instead of the incremental slice since `last_fetched_at`.
         # Consumed in [_published_min]; cleared after a successful import.
         self._force_full_history = False
+        # Guards [_schedule_deferred_import_migration] against arming the one-time statistics
+        # repair twice — two concurrent full-history rebuilds would fight over the same store.
+        self._import_migration_armed = False
 
     async def _async_update_data(self) -> UsageResponse:
         """Fetch, persist rotated credentials, then write statistics."""
@@ -156,6 +169,17 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self.entry.entry_id,
             published_min.isoformat(),
             published_max.isoformat(),
+        )
+
+        # Sampled BEFORE the import, while the store still reflects only the previous logic:
+        # afterwards we can't tell a first-ever import from one that appended to older rows,
+        # and that distinction decides whether a repair rebuild is warranted. Only read when a
+        # repair is actually outstanding, so the steady state costs no recorder round-trip.
+        import_migration_pending = (
+            self.entry.data.get(CONF_IMPORT_LOGIC_REVISION) != IMPORT_LOGIC_REVISION
+        )
+        had_prior_statistics = import_migration_pending and await async_entry_has_statistics(
+            self.hass, self.entry.entry_id
         )
 
         response = await self._fetch(published_min, published_max)
@@ -188,6 +212,21 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         self._advance_cursor(response)
         # A full-history rebuild has now landed; revert to incremental polling.
         self._force_full_history = False
+
+        if import_migration_pending:
+            if self.hass.state is CoreState.running:
+                # May purge and re-import everything we just wrote, and hands back the rebuilt
+                # response so this refresh publishes the repaired data, not the stale slice.
+                rebuilt = await self._async_migrate_import(response, had_prior_statistics)
+                if rebuilt is not None:
+                    return rebuilt
+            else:
+                # DEADLOCK GUARD — the rebuild awaits `Recorder.async_block_till_done()`, which
+                # cannot complete before HA has started (the recorder isn't draining its queue
+                # yet) while HA in turn won't start until config-entry setup returns — and the
+                # first refresh runs inside that setup. Same trap [statistics] documents for its
+                # cost pass; same escape. Defer to just after startup, where blocking is safe.
+                self._schedule_deferred_import_migration(response, had_prior_statistics)
         return response
 
     async def _fetch(self, published_min: datetime, published_max: datetime) -> UsageResponse:
@@ -379,7 +418,144 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             data={**self.entry.data, CONF_LAST_FETCHED_AT: cursor_iso},
         )
 
-    async def async_rebuild_statistics(self) -> None:
+    def _schedule_deferred_import_migration(
+        self,
+        response: UsageResponse,
+        had_prior_statistics: bool,
+    ) -> None:
+        """Run the one-time statistics repair as soon as HA finishes starting.
+
+        The first refresh happens inside config-entry setup, before HA is running, where the
+        rebuild's recorder block would deadlock (see the caller). Waiting for the next ordinary
+        poll instead would strand a user on visibly wrong data for a full poll interval — a day
+        on most utilities — after they installed the update that fixes it. `async_at_started`
+        fires on EVENT_HOMEASSISTANT_STARTED, moments later; its unsubscribe is tied to the entry
+        so an unload cancels a still-pending repair.
+
+        Armed at most once: a second arming would run two full-history rebuilds concurrently.
+        """
+        if self._import_migration_armed:
+            return
+        self._import_migration_armed = True
+
+        async def _deferred_migration(_hass: HomeAssistant) -> None:
+            _LOGGER.debug(
+                "Running deferred import-logic repair check for entry %s (HA has started)",
+                self.entry.entry_id,
+            )
+            # publish=True: we're outside the refresh cycle now, so a rebuild has to publish its
+            # own result — nothing else will.
+            await self._async_migrate_import(response, had_prior_statistics, publish=True)
+
+        _LOGGER.debug(
+            "HA is %s, not running — deferring the import-logic repair check for entry %s "
+            "until after startup",
+            self.hass.state,
+            self.entry.entry_id,
+        )
+        self.entry.async_on_unload(async_at_started(self.hass, _deferred_migration))
+
+    async def _async_migrate_import(
+        self,
+        response: UsageResponse,
+        had_prior_statistics: bool,
+        *,
+        publish: bool = False,
+    ) -> UsageResponse | None:
+        """Repair statistics this entry imported under superseded logic. Returns the rebuilt
+        response when a rebuild ran, else None.
+
+        Rows are written once, as they're fetched, so a fix to how usage or cost is *computed*
+        leaves everything already in the recorder wrong. `greenbutton.rebuild_statistics` has
+        always been the cure, but it only helps a user who notices the bad data and knows the
+        action exists — an inflated consumption spike mostly looks like "the Energy dashboard is
+        broken". So an entry carrying a stale `CONF_IMPORT_LOGIC_REVISION` repairs itself here.
+
+        A blanket rebuild would be the simple answer and the wrong one: it makes every user
+        re-pull their entire initial-history window from their utility to fix a bug most of them
+        never had. So we rebuild only entries whose feed shows the offending shape, and stamp the
+        rest as current on the spot. For revision 1 that shape is a cumulative meter register in
+        the response ([statistics.response_has_cumulative_series]) — exactly the series that used
+        to be summed into consumption (#6) and to hijack cost selection with its `cost=0` (#7).
+
+        Three ways this resolves, all at most once per entry:
+
+          - **No statistics predate this code** → nothing was written by the old logic, so stamp
+            and move on. Covers a newly-added entry, whose very first import is already correct.
+          - **The feed has no cumulative register** → this entry was never affected; stamp.
+            Held back on an empty response, where "no register" only means the utility published
+            nothing in this window — the decision waits for a poll that carries readings.
+          - **Affected** → rebuild, then stamp.
+
+        A failed rebuild leaves the stamp unset deliberately: the entry stays corrupt but marked
+        for repair, and the next poll tries again. It never fails the refresh — the poll itself
+        succeeded, and taking the entry down over a repair of *old* rows would also stop new ones
+        from arriving.
+        """
+        from homeassistant.exceptions import HomeAssistantError
+
+        if not had_prior_statistics:
+            self._store_import_logic_revision()
+            return None
+
+        if not any(s.readings for up in response.usage_points for s in up.series):
+            _LOGGER.debug(
+                "Entry %s awaits an import-logic repair check, but this poll carried no "
+                "readings to judge the feed by — re-checking on the next poll",
+                self.entry.entry_id,
+            )
+            return None
+
+        if not response_has_cumulative_series(response):
+            _LOGGER.debug(
+                "Entry %s is unaffected by the import-logic change (no cumulative meter "
+                "register in its feed); marking revision %d without a rebuild",
+                self.entry.entry_id,
+                IMPORT_LOGIC_REVISION,
+            )
+            self._store_import_logic_revision()
+            return None
+
+        _LOGGER.warning(
+            "Entry %s imported statistics under superseded logic: its feed publishes a "
+            "cumulative meter register, which older versions summed into the consumption "
+            "statistic as if it were interval usage. Rebuilding this entry's statistics from a "
+            "full history re-fetch — this runs once and may take several minutes",
+            self.entry.entry_id,
+        )
+        try:
+            rebuilt = await self.async_rebuild_statistics(publish=publish)
+        except HomeAssistantError as err:
+            # Non-fatal: THIS poll's data is imported and sound. Leave the revision unstamped so
+            # the next poll retries, and name the manual action for anyone who wants it sooner.
+            _LOGGER.warning(
+                "Automatic statistics rebuild failed for entry %s: %s. Existing statistics were "
+                "left untouched and the rebuild will be retried on the next poll; you can also "
+                "run the %s.%s action manually",
+                self.entry.entry_id,
+                err,
+                DOMAIN,
+                SERVICE_REBUILD_STATISTICS,
+            )
+            return None
+
+        # The revision stamp is written by [async_rebuild_statistics] itself, so a manual
+        # rebuild counts too — it produces rows under exactly the same current logic.
+        # INFO, not WARNING: this is the resolution of the warning above, and HA logs at INFO
+        # by default, so it lands in the same log the user is already reading.
+        _LOGGER.info(
+            "Statistics for entry %s have been rebuilt and are now correct", self.entry.entry_id
+        )
+        return rebuilt
+
+    def _store_import_logic_revision(self) -> None:
+        """Stamp the entry as holding statistics computed by the current import logic."""
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_IMPORT_LOGIC_REVISION: IMPORT_LOGIC_REVISION},
+        )
+
+    async def async_rebuild_statistics(self, *, publish: bool = True) -> UsageResponse:
         """Rebuild this entry's statistics from a full re-fetch — non-destructively.
 
         The supported recovery path when a calculation change (e.g. the cost fix) means the
@@ -401,6 +577,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         utility's resource server is intermittently flaky) wiped the user's history — and the
         incremental poll could not repopulate it, because its `published-min` window sits
         ahead of the utility's lagged data. Fetching first makes a failed rebuild a no-op.
+
+        Args:
+            publish: Publish the re-fetched response to the coordinator on success. True for
+                the `rebuild_statistics` action, which runs standalone and must leave `.data`
+                and the poll timer consistent with what it just imported. False when called
+                from inside [_async_update_data] (the one-time repair in
+                [_async_migrate_import]): that refresh publishes the returned response itself,
+                and calling `async_set_updated_data` mid-refresh would publish twice and re-arm
+                the timer underneath the running poll.
+
+        Returns:
+            The full-history response that was imported.
 
         Raises:
             HomeAssistantError: the rebuild fetch failed (network / upstream / reauth).
@@ -458,10 +646,16 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         )
         self._async_clear_background_load_issue()
         self._advance_cursor(response)
-        # Publish the fresh response into the coordinator (updates .data, marks the update
-        # successful, notifies listeners, and re-arms the poll) without a second fetch.
-        self.async_set_updated_data(response)
+        # Everything in the store was just computed by the current logic, so the entry is at the
+        # current revision by construction — whether we got here from the `rebuild_statistics`
+        # action or from the automatic repair in [_async_migrate_import].
+        self._store_import_logic_revision()
+        if publish:
+            # Publish the fresh response into the coordinator (updates .data, marks the update
+            # successful, notifies listeners, and re-arms the poll) without a second fetch.
+            self.async_set_updated_data(response)
         _LOGGER.info("Rebuild complete for entry %s", self.entry.entry_id)
+        return response
 
     @property
     def _background_load_issue_id(self) -> str:

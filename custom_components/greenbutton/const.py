@@ -48,14 +48,6 @@ PUBLISHED_MAX_LOOKAHEAD = timedelta(days=1)
 # on a multi-hour-to-multi-day lag, so a daily poll captures everything without over-polling.
 DEFAULT_SCAN_INTERVAL = timedelta(days=1)
 
-# Optional wall-clock scheduling for utilities whose server-supplied cadence is exactly daily.
-# Disabled by default so existing entries keep their interval-from-start behaviour until the
-# user explicitly chooses a local time in the options flow. Shorter or multi-day utility
-# cadences always remain authoritative and ignore this option.
-CONF_DAILY_POLL_TIME_ENABLED = "daily_poll_time_enabled"
-CONF_DAILY_POLL_TIME = "daily_poll_time"
-DEFAULT_DAILY_POLL_TIME = "06:00:00"
-
 # The hosted proxy server. May be overridden per-config-entry for self-hosters via the
 # server_base_url in entry.data.
 DEFAULT_SERVER_BASE_URL = "https://api.opengreenbutton.org"
@@ -106,10 +98,26 @@ CONF_POLL_INTERVAL_SECONDS = "poll_interval_seconds"
 # so no separate cost cursor is needed.
 CONF_LAST_FETCHED_AT = "last_fetched_at"
 
-# Per-usage-point state for live Tiered cost estimates between completed UsageSummary bills.
-# The utility feed only republishes a summary when a bill closes, so the inferred rates and
-# current-period boundary must survive incremental polls and Home Assistant restarts.
+# Per-usage-point state for Milton Hydro's provisional Ontario Tiered cost estimate. The state
+# includes the cumulative cost at the open period boundary, so replacing provisional rows with a
+# later exact bill never has to guess its baseline from a narrow recorder window.
 CONF_TIER_COST_ESTIMATES = "tier_cost_estimates"
+
+# Revision of the statistics *calculation* logic that produced this entry's stored rows.
+# Statistics are written once as they're fetched, so a fix that changes how usage or cost is
+# computed does NOT retroactively correct rows already in the recorder — historically that
+# needed the user to notice and run `greenbutton.rebuild_statistics` by hand. The coordinator
+# compares this stamp against IMPORT_LOGIC_REVISION and repairs affected entries itself; see
+# [coordinator.GreenButtonCoordinator._async_migrate_import].
+CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
+
+# Bump when a change means previously-imported rows are wrong and must be rebuilt, AND teach
+# the coordinator how to recognize an affected entry's feed (a blanket rebuild would make every
+# user re-pull their full history against their utility for a bug that may not affect them).
+#   1 — cumulative meter registers (ESPI BULK_QUANTITY et al) were summed into the consumption
+#       statistic, and their `cost=0` placeholder suppressed real UsageSummary billing.
+#       Affects feeds that publish a cumulative register: Milton Hydro. (issues #6, #7)
+IMPORT_LOGIC_REVISION = 1
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

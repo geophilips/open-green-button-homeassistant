@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -34,6 +36,7 @@ from custom_components.greenbutton.api import (
 from custom_components.greenbutton.const import (
     CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_IMPORT_LOGIC_REVISION,
     CONF_LAST_FETCHED_AT,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
@@ -41,6 +44,7 @@ from custom_components.greenbutton.const import (
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    IMPORT_LOGIC_REVISION,
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
 )
@@ -697,3 +701,224 @@ async def test_incremental_poll_uses_one_tight_window_at_usage_frontier(
     assert (
         api.fetch_usage.await_args.kwargs["published_min"] == usage_frontier - LAST_FETCHED_OVERLAP
     )
+
+
+# ---------------------------------------------------------------------------------------
+# One-time statistics repair after an import-logic change (issues #6 / #7).
+#
+# Rows are written once as they're fetched, so a fix to how usage or cost is *computed* never
+# reaches data already in the recorder. `rebuild_statistics` has always been the cure, but only
+# for a user who notices the bad data and knows the action exists — so an affected entry repairs
+# itself on the first poll after the update. These cover which entries qualify.
+# ---------------------------------------------------------------------------------------
+
+
+def _response_with_cumulative_register() -> UsageResponse:
+    """Milton's shape: hourly deltas beside a daily cumulative meter register, both FORWARD.
+
+    The register is the marker that this entry's stored statistics were corrupted by the old
+    logic — it's the series that used to be summed into consumption (#6) and whose `cost=0`
+    hijacked cost-source selection (#7).
+    """
+    delta = MeterReadingSeries(
+        meter_reading_id="hourly",
+        reading_type=_reading_type(),
+        readings=[UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0)],
+    )
+    bulk_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="BULK_QUANTITY",
+        interval_length_seconds=86400,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    register = MeterReadingSeries(
+        meter_reading_id="register",
+        reading_type=bulk_type,
+        readings=[UsageReading(datetime(2026, 7, 5, tzinfo=UTC), 86400, 9_876_543.0, cost=0.0)],
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[delta, register])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def _migration_patches(*, had_statistics: bool):
+    """Patch the recorder boundary for a migration test; the decision logic stays real."""
+    return (
+        patch(
+            "custom_components.greenbutton.coordinator.async_entry_has_statistics",
+            new=AsyncMock(return_value=had_statistics),
+        ),
+        patch(
+            "custom_components.greenbutton.coordinator.async_clear_statistics_for_entry",
+            new=AsyncMock(return_value=[f"{DOMAIN}:x_forward"]),
+        ),
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+    )
+
+
+async def test_import_migration_rebuilds_entry_with_cumulative_register(
+    hass: HomeAssistant,
+) -> None:
+    """An entry whose feed carries a cumulative register repairs itself on the next poll.
+
+    Its stored rows were computed by the old logic, which summed the register into consumption —
+    a spike no incremental poll can undo, because the cumulative sum carries it forward forever.
+    """
+    hass.set_state(CoreState.running)  # migration runs inline once HA is up
+    entry = _entry(hass)
+    api = _api_returning(_response_with_cumulative_register())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_skips_entry_without_cumulative_register(
+    hass: HomeAssistant,
+) -> None:
+    """An unaffected feed is stamped in place — no full-history re-pull from its utility.
+
+    The whole point of gating on the feed's shape: a blanket rebuild would make every Burlington
+    and Elexicon user re-download their entire history to fix a bug they never had.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    api = _api_returning(_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC)))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()  # no rebuild re-fetch
+    clear_mock.assert_not_awaited()
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_skips_entry_with_no_prior_statistics(
+    hass: HomeAssistant,
+) -> None:
+    """A newly-added entry is stamped without a rebuild — its first import is already correct.
+
+    Nothing in the store predates the current logic, so there is nothing to repair, even though
+    its feed does carry the cumulative register.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    api = _api_returning(_response_with_cumulative_register())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=False)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()
+    clear_mock.assert_not_awaited()
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_defers_decision_on_empty_response(hass: HomeAssistant) -> None:
+    """An empty poll can't clear an entry: "no register" may just mean "nothing published".
+
+    Utilities publish on a multi-day lag, so empty windows are routine. Stamping on one would
+    permanently write off an affected entry that simply had a quiet day.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    clear_mock.assert_not_awaited()
+    assert CONF_IMPORT_LOGIC_REVISION not in entry.data  # undecided → re-checked next poll
+
+
+async def test_import_migration_retries_after_a_failed_rebuild(hass: HomeAssistant) -> None:
+    """A failed repair must not fail the poll, and must not mark the entry as repaired.
+
+    The poll itself succeeded and its data is sound; taking the entry down over old rows would
+    stop new ones arriving too. Leaving the stamp off is what schedules the retry.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    # First call (the poll) succeeds; the rebuild's re-fetch fails.
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_response_with_cumulative_register(), OpenGbApiError("upstream 502")]
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is True  # the poll stands
+    assert coordinator.last_exception is None
+    clear_mock.assert_not_awaited()  # fetch failed first → nothing purged
+    assert CONF_IMPORT_LOGIC_REVISION not in entry.data  # still marked for repair
+
+
+async def test_import_migration_not_rechecked_once_stamped(hass: HomeAssistant) -> None:
+    """A stamped entry costs nothing on later polls — not even the recorder lookup."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_IMPORT_LOGIC_REVISION: IMPORT_LOGIC_REVISION}
+    )
+    api = _api_returning(_response_with_cumulative_register())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats as has_stats_mock, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    has_stats_mock.assert_not_awaited()  # steady state: no recorder round-trip
+    clear_mock.assert_not_awaited()
+    api.fetch_usage.assert_awaited_once()
+
+
+async def test_import_migration_deferred_until_hass_started(hass: HomeAssistant) -> None:
+    """Before HA has started, the repair waits for EVENT_HOMEASSISTANT_STARTED.
+
+    Same deadlock as the cost pass: the rebuild awaits `Recorder.async_block_till_done()`, which
+    can't complete before HA starts, while HA won't start until config-entry setup returns — and
+    the first refresh runs inside that setup. Waiting for the next scheduled poll instead would
+    strand the user on visibly wrong data for a full poll interval (a day on most utilities).
+    """
+    hass.set_state(CoreState.starting)
+    entry = _entry(hass)
+    api = _api_returning(_response_with_cumulative_register())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+        # Nothing recorder-blocking may run while HA is still starting.
+        clear_mock.assert_not_awaited()
+        api.fetch_usage.assert_awaited_once()
+        assert CONF_IMPORT_LOGIC_REVISION not in entry.data
+
+        # ...and the repair runs as soon as HA is up.
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+
+        clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+        assert api.fetch_usage.await_count == 2
+        assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
