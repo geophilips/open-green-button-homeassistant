@@ -6,10 +6,12 @@ where a recorder is wired up; these focus on the pure-function bits that don't n
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.components.recorder.statistics import (
@@ -325,6 +327,9 @@ def _per_interval_cost_response() -> UsageResponse:
         readings=[
             UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0, cost=0.087),
             UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0, cost=0.122),
+            # A genuinely free hour on a series that really does itemize cost. Must stay on the
+            # per-interval path — see test_per_interval_cost_keeps_legitimate_zero_cost_hours.
+            UsageReading(datetime(2026, 7, 5, 7, tzinfo=UTC), 3600, 500.0, cost=0.0),
         ],
     )
     up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
@@ -350,7 +355,304 @@ async def test_per_interval_cost_writes_cumulative_cost_stat(hass: HomeAssistant
     assert len(cost_calls) == 1
     metadata, stats = cost_calls[0].args[1], cost_calls[0].args[2]
     assert metadata["unit_of_measurement"] == "CAD"
-    assert [round(s["sum"], 3) for s in stats] == [0.087, 0.209]  # cumulative
+    assert [round(s["sum"], 3) for s in stats] == [0.087, 0.209, 0.209]  # cumulative
+
+
+async def test_per_interval_cost_keeps_legitimate_zero_cost_hours(hass: HomeAssistant) -> None:
+    """A $0 hour on a genuinely itemized series stays on the per-interval path.
+
+    The fix for #7 works by restricting *which series* are consulted for interval cost, not by
+    rejecting zero values: a "costs must be non-zero" test would push a trailing all-zero window
+    onto the summary path and mix summary-distributed rows into a per-interval cost statistic.
+    Here the third hour is free and the response also carries a summary — the summary must be
+    ignored, and the free hour must still produce a row (flat cumulative, not a gap).
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    response = _per_interval_cost_response()
+    up = response.usage_points[0]
+    with_summary = UsageResponse(
+        updated=None,
+        usage_points=[
+            UsagePoint(
+                usage_point_id=up.usage_point_id,
+                service_kind=up.service_kind,
+                series=up.series,
+                summaries=[_summary(datetime(2026, 7, 1, tzinfo=UTC), 31, total_dollars=99.0)],
+            )
+        ],
+        new_credentials=None,
+    )
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(return_value=[(datetime(2026, 7, 5, 5, tzinfo=UTC), 1.0)]),
+        ) as recorded_mock,
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(hass, entry, with_summary, utility_display_name="X")
+
+    recorded_mock.assert_not_awaited()  # the summary path was never taken
+    cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
+    stats = cost_calls[0].args[2]
+    assert [round(s["sum"], 3) for s in stats] == [0.087, 0.209, 0.209]
+
+
+async def test_all_zero_cost_window_stays_on_per_interval_path(hass: HomeAssistant) -> None:
+    """A poll where every itemized cost happens to be zero must NOT flip to the summary path.
+
+    This is why the fix for #7 restricts *which series* are consulted rather than rejecting zero
+    values. A "costs must be non-zero" test looks equivalent on Milton's feed but is not: the
+    cost source is re-decided on every poll, so a quiet window on a utility that genuinely
+    itemizes cost (savagedata/Elexicon, which also publish UsageSummary) would flip that one poll
+    onto the summary path and append summary-distributed rows into a statistic already holding
+    per-interval rows — double-counting every hour the bill covers past the per-interval frontier.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    response = _per_interval_cost_response()
+    series = response.usage_points[0].series[0]
+    all_zero = MeterReadingSeries(
+        meter_reading_id=series.meter_reading_id,
+        reading_type=series.reading_type,
+        readings=[
+            UsageReading(r.start, r.duration_seconds, r.value, cost=0.0) for r in series.readings
+        ],
+    )
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[all_zero],
+        summaries=[_summary(datetime(2026, 7, 1, tzinfo=UTC), 31, total_dollars=99.0)],
+    )
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(return_value=[(datetime(2026, 7, 5, 5, tzinfo=UTC), 1.0)]),
+        ) as recorded_mock,
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass,
+            entry,
+            UsageResponse(updated=None, usage_points=[up], new_credentials=None),
+            utility_display_name="X",
+        )
+
+    recorded_mock.assert_not_awaited()  # the summary was not distributed over recorded usage
+    cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
+    assert [round(s["sum"], 3) for s in cost_calls[0].args[2]] == [0.0, 0.0, 0.0]
+
+
+def _milton_mixed_series_response(*, with_summary: bool = False) -> UsageResponse:
+    """Milton Hydro's shape: hourly deltas beside a daily cumulative register snapshot.
+
+    Both series are FORWARD on one UsagePoint, so both map to the same statistic id. The register
+    reading is the meter's lifetime total (9,876.543 kWh) and carries the `cost=0` placeholder
+    that used to hijack cost-source selection. Synthetic — no customer data.
+    """
+    delta_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    bulk_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="BULK_QUANTITY",
+        interval_length_seconds=_DAY,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    delta_series = MeterReadingSeries(
+        meter_reading_id="hourly",
+        reading_type=delta_type,
+        readings=[
+            UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0),
+            UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0),
+        ],
+    )
+    bulk_series = MeterReadingSeries(
+        meter_reading_id="register",
+        reading_type=bulk_type,
+        readings=[UsageReading(datetime(2026, 7, 5, tzinfo=UTC), _DAY, 9_876_543.0, cost=0.0)],
+    )
+    summaries = (
+        [_summary(datetime(2026, 7, 1, tzinfo=UTC), 31, total_dollars=50.0)] if with_summary else []
+    )
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[delta_series, bulk_series],
+        summaries=summaries,
+    )
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def test_bulk_register_series_is_not_added_to_interval_usage(hass: HomeAssistant) -> None:
+    """Issue #6: the cumulative register must not inflate the hourly consumption statistic.
+
+    Both series are FORWARD on one UsagePoint, so both resolve to the same statistic id. Summing
+    the register's 9,876.543 kWh lifetime total into the running sum reported it as a single
+    interval's consumption — an enormous false spike on the Energy dashboard.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass, entry, _milton_mixed_series_response(), utility_display_name="Milton Hydro"
+        )
+
+    usage_calls = [
+        c for c in add_mock.call_args_list if not c.args[1]["statistic_id"].endswith("_cost")
+    ]
+    assert len(usage_calls) == 1  # the register series contributed no write at all
+    stats = usage_calls[0].args[2]
+    assert [round(s["sum"], 3) for s in stats] == [1.0, 2.5]  # hourly deltas only
+
+
+async def test_bulk_zero_cost_falls_back_to_billing_summary(hass: HomeAssistant) -> None:
+    """Issue #7: the register's `cost=0` placeholder must not suppress the real bill.
+
+    Milton's hourly deltas carry no cost at all; the only cost-bearing reading in the feed is the
+    register's zero. Consulting every FORWARD reading let that select the per-interval path and
+    write an all-zero cost statistic while the non-zero UsageSummary went unused.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    recorded = [
+        (datetime(2026, 7, 5, 5, tzinfo=UTC), 1.0),
+        (datetime(2026, 7, 5, 6, tzinfo=UTC), 1.5),
+    ]
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(return_value=recorded),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(
+            hass,
+            entry,
+            _milton_mixed_series_response(with_summary=True),
+            utility_display_name="Milton Hydro",
+        )
+
+    cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
+    assert len(cost_calls) == 1
+    # $50 distributed over 1.0 + 1.5 kWh → $20 then $30, cumulative — not the all-zero stat.
+    assert [round(s["sum"], 2) for s in cost_calls[0].args[2]] == [20.0, 50.0]
+
+
+def _accumulation_response(behaviour: str, flow_direction: str = "FORWARD") -> UsageResponse:
+    """One hourly FORWARD-by-default series carrying an arbitrary accumulation behaviour."""
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction=flow_direction,
+        accumulation_behaviour=behaviour,
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="mr1",
+        reading_type=reading_type,
+        readings=[
+            UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0),
+            UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0),
+        ],
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def _import_and_collect_usage(hass: HomeAssistant, response: UsageResponse) -> list:
+    """Import [response] with the recorder mocked out; return the usage (non-cost) stat rows."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(hass, entry, response, utility_display_name="X")
+    return [c for c in add_mock.call_args_list if not c.args[1]["statistic_id"].endswith("_cost")]
+
+
+async def test_unrecognized_accumulation_behaviour_still_imports(hass: HomeAssistant) -> None:
+    """Exclusion is a blacklist: an unknown behaviour keeps importing as it always has.
+
+    Regression guard against the whitelist ("import only DELTA_DATA") that was tried first. ESPI
+    codes we don't map — and any feed omitting `accumulationBehaviour` entirely — normalize to
+    "OTHER", and a whitelist drops every one of them: zero statistics written, an empty Energy
+    dashboard, and nothing above DEBUG to say why.
+    """
+    usage_calls = await _import_and_collect_usage(hass, _accumulation_response("OTHER"))
+    assert len(usage_calls) == 1
+    assert [round(s["sum"], 3) for s in usage_calls[0].args[2]] == [1.0, 2.5]
+
+
+async def test_reverse_non_delta_series_still_imports(hass: HomeAssistant) -> None:
+    """Solar export on a non-DELTA_DATA behaviour must survive too — same whitelist trap."""
+    usage_calls = await _import_and_collect_usage(
+        hass, _accumulation_response("SUMMATION", flow_direction="REVERSE")
+    )
+    assert len(usage_calls) == 1
+    assert usage_calls[0].args[1]["statistic_id"].endswith("_reverse")
+
+
+async def test_every_cumulative_behaviour_is_excluded(hass: HomeAssistant) -> None:
+    """BULK_QUANTITY isn't special — every cumulative-register behaviour is excluded.
+
+    CONTINUOUS_CUMULATIVE (ESPI 2) is the one that matters: it used to normalize to "OTHER" and
+    would have slipped straight past a name-based exclusion.
+    """
+    for behaviour in ("BULK_QUANTITY", "CUMULATIVE", "CONTINUOUS_CUMULATIVE"):
+        assert await _import_and_collect_usage(hass, _accumulation_response(behaviour)) == [], (
+            f"{behaviour} should not be summed into a consumption statistic"
+        )
+
+
+async def test_only_cumulative_series_logs_error(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A UsagePoint with nothing but registers writes nothing — and says so loudly.
+
+    Deriving deltas from a register isn't implemented, so such a feed yields no energy at all.
+    That's an empty Energy dashboard, which has to be diagnosable from the log alone.
+    """
+    with caplog.at_level(logging.ERROR, logger="custom_components.greenbutton.statistics"):
+        assert await _import_and_collect_usage(hass, _accumulation_response("BULK_QUANTITY")) == []
+    assert "no per-interval consumption series" in caplog.text
 
 
 def _summary_only_response() -> UsageResponse:

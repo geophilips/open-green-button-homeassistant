@@ -640,11 +640,23 @@ def _flow_direction(f: int | None) -> str:
 
 
 def _accumulation(a: int | None) -> str:
+    # Full NAESB ESPI AccumulationKind. Completeness matters here, unlike the other mappers:
+    # [statistics] decides whether a series is per-interval consumption or a cumulative meter
+    # register by *name*, so a cumulative code left falling through to "OTHER" would be summed
+    # into the consumption statistic as if it were a delta (see issue #6). NOTE: 11 is
+    # instantaneous and 12 is latchingQuantity — this map previously had 12 as INSTANTANEOUS.
     return {
+        0: "NONE",
         1: "BULK_QUANTITY",
+        2: "CONTINUOUS_CUMULATIVE",
         3: "CUMULATIVE",
         4: "DELTA_DATA",
-        12: "INSTANTANEOUS",
+        6: "INDICATING",
+        9: "SUMMATION",
+        10: "TIME_OF_USE",
+        11: "INSTANTANEOUS",
+        12: "LATCHING_QUANTITY",
+        13: "BOUNDED_QUANTITY",
     }.get(-1 if a is None else a, "OTHER")
 
 

@@ -102,23 +102,55 @@ async def async_clear_statistics_for_entry(hass: HomeAssistant, entry_id: str) -
     (purge-before-reimport), so the "which ids belong to this entry" rule lives in one place
     next to [statistic_id_for_series] / [statistic_id_prefix_for_entry].
 
-    ``async_list_statistic_ids`` is ``async`` (not a ``@callback``) and takes no source
-    filter, so we list everything the recorder knows and filter to our source + this entry's
-    prefix. The source check is the load-bearing one; the prefix keeps us from touching a
-    sibling entry's rows. ``Recorder.async_clear_statistics`` is a ``@callback`` that queues
-    the delete on the recorder's worker thread — call it from the event loop, never wrap it in
-    an executor job (that would bypass the recorder queue and run a callback off-loop).
+    ``Recorder.async_clear_statistics`` is a ``@callback`` that queues the delete on the
+    recorder's worker thread — call it from the event loop, never wrap it in an executor job
+    (that would bypass the recorder queue and run a callback off-loop).
+    """
+    owned = await _async_statistic_ids_for_entry(hass, entry_id)
+    if owned:
+        get_instance(hass).async_clear_statistics(owned)
+    return owned
+
+
+async def async_entry_has_statistics(hass: HomeAssistant, entry_id: str) -> bool:
+    """True when this entry already owns at least one long-term statistic.
+
+    Read-only counterpart to [async_clear_statistics_for_entry]. The coordinator uses it to
+    tell "this entry has imported before, under whatever logic shipped then" from "this entry
+    is importing for the first time" — which decides whether a one-time rebuild is warranted
+    after an import-logic change. See [coordinator.GreenButtonCoordinator._async_migrate_import].
+    """
+    return bool(await _async_statistic_ids_for_entry(hass, entry_id))
+
+
+async def _async_statistic_ids_for_entry(hass: HomeAssistant, entry_id: str) -> list[str]:
+    """Every statistic id owned by [entry_id], per the [statistic_id_for_series] format.
+
+    ``async_list_statistic_ids`` is ``async`` (not a ``@callback``) and takes no source filter,
+    so we list everything the recorder knows and filter to our source + this entry's prefix. The
+    source check is the load-bearing one; the prefix keeps us off a sibling entry's rows.
     """
     prefix = statistic_id_prefix_for_entry(entry_id)
     all_ids = await async_list_statistic_ids(hass)
-    owned = [
+    return [
         item["statistic_id"]
         for item in all_ids
         if item.get("source") == DOMAIN and item["statistic_id"].startswith(prefix)
     ]
-    if owned:
-        get_instance(hass).async_clear_statistics(owned)
-    return owned
+
+
+def response_has_cumulative_series(response: UsageResponse) -> bool:
+    """True when [response] carries a cumulative meter register we now exclude from statistics.
+
+    The signal that an entry's *stored* statistics may be corrupt: before the fix for issue #6,
+    a register series like this was summed into the consumption statistic (and its ``cost=0``
+    placeholder hijacked cost selection, issue #7). An entry whose feed contains one, and which
+    imported under the old logic, needs its statistics rebuilt — see
+    [coordinator.GreenButtonCoordinator._async_migrate_import].
+    """
+    return any(
+        not _is_interval_consumption_series(s) for up in response.usage_points for s in up.series
+    )
 
 
 def _slugify(component: str) -> str:
@@ -139,7 +171,9 @@ async def import_usage_statistics(
     *,
     fresh: bool = False,
 ) -> None:
-    """Push every series in [response] into HA long-term statistics.
+    """Push every interval-consumption series in [response] into HA long-term statistics.
+
+    Cumulative meter registers are excluded — see [_is_interval_consumption_series].
 
     Idempotent on (statistic_id, hour) — re-importing a previously-imported hour is a no-op,
     so the coordinator can pull overlapping windows on every poll without worrying about
@@ -153,8 +187,35 @@ async def import_usage_statistics(
     unnecessary and the source of the race — bypass it.
     """
     for up in response.usage_points:
+        imported_any = False
         for series in up.series:
+            if not _is_interval_consumption_series(series):
+                _warn_once(
+                    f"{entry.entry_id}:{up.usage_point_id}:{series.meter_reading_id}:cumulative",
+                    "Skipping meter reading %s on usage point %s: accumulation behaviour %s is a "
+                    "cumulative meter register, not per-interval consumption — adding its values "
+                    "to the usage statistic would report the whole meter total as one interval's "
+                    "consumption",
+                    series.meter_reading_id,
+                    up.usage_point_id,
+                    series.reading_type.accumulation_behaviour,
+                )
+                continue
+            imported_any = True
             await _import_series(hass, entry, up, series, utility_display_name, fresh=fresh)
+        if up.series and not imported_any:
+            # Every series was a cumulative register. Deriving deltas from a register is
+            # possible in principle but isn't implemented, so this usage point contributes no
+            # energy at all — loud, because the symptom is an empty Energy dashboard.
+            _LOGGER.error(
+                "Usage point %s has no per-interval consumption series — every one of its %d "
+                "series is a cumulative meter register (%s). No energy statistics will be "
+                "written for it; please report this feed at %s",
+                up.usage_point_id,
+                len(up.series),
+                ", ".join(sorted({s.reading_type.accumulation_behaviour for s in up.series})),
+                "https://github.com/rocketraman/open-green-button-homeassistant/issues",
+            )
 
     # Cost is written after usage, in a second pass. A monthly UsageSummary arrives long after its
     # billing period (Burlington publishes it ~2-3 weeks later), so the period's usage is NOT in
@@ -225,14 +286,87 @@ async def _import_costs(
             await _import_cost_summaries(hass, entry, up, utility_display_name, fresh=fresh)
 
 
-def _has_interval_cost(up: UsagePoint) -> bool:
-    """True when any FORWARD reading on this UsagePoint carries a per-interval cost."""
-    return any(
-        r.cost is not None
+# ESPI AccumulationKind values whose readings are a running meter register (a total since the
+# meter was installed / last reset), NOT the quantity consumed during the interval. Named per
+# [espi._accumulation], which maps the full NAESB enum so nothing cumulative hides in "OTHER".
+#
+# Deliberately a *blacklist*: an accumulation behaviour we don't recognize keeps importing as it
+# always has. The whitelist alternative ("import only DELTA_DATA") silently drops any series whose
+# behaviour is missing, unmapped, or merely unusual — an empty Energy dashboard with nothing above
+# DEBUG to explain it. `INDICATING` and `LATCHING_QUANTITY` are arguably register-like too, but no
+# feed in scope emits them and misclassifying them would drop real data; revisit with a real
+# sample.
+_CUMULATIVE_ACCUMULATION = frozenset(
+    {
+        "BULK_QUANTITY",  # ESPI 1 — the daily register snapshot Milton Hydro publishes
+        "CONTINUOUS_CUMULATIVE",  # ESPI 2
+        "CUMULATIVE",  # ESPI 3
+    }
+)
+
+# Keys already logged at WARNING by [_warn_once], so a permanent condition doesn't repeat the
+# warning on every poll. Module-level (not per-entry) and never pruned: it holds a handful of
+# short strings for the lifetime of the process, and a full HA restart re-arms every warning.
+_WARNED_ONCE: set[str] = set()
+
+
+def _warn_once(key: str, msg: str, *args: object) -> None:
+    """Log at WARNING the first time [key] is seen this run, at DEBUG every time after.
+
+    Skipping a series is a data-loss event and has to be visible — DEBUG-only was how the
+    unit-mapping skip stayed invisible. But the conditions we skip on are properties of the
+    utility's feed, so they recur on every poll; warning each time would be log spam for the
+    rest of the entry's life. First one loud, the rest quiet.
+    """
+    if key in _WARNED_ONCE:
+        _LOGGER.debug(msg, *args)
+        return
+    _WARNED_ONCE.add(key)
+    _LOGGER.warning(msg, *args)
+
+
+def _is_interval_consumption_series(series: MeterReadingSeries) -> bool:
+    """True when a series' readings are per-interval quantities we can sum into a statistic.
+
+    False for cumulative meter registers. Milton Hydro publishes an hourly ``DELTA_DATA``
+    consumption series *and* a daily ``BULK_QUANTITY`` register snapshot for the same meter,
+    both FORWARD — so both map to one [statistic_id_for_series] and the register's
+    meter-lifetime total was being added to the hourly running sum, reporting an enormous
+    false spike (issue #6).
+    """
+    return series.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION
+
+
+def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:
+    """The FORWARD per-interval consumption series on this UsagePoint — the basis for cost.
+
+    Cost is about what was consumed, so REVERSE (solar export) is out, and so are cumulative
+    registers: they aren't billed intervals, and Milton's carries a ``cost=0`` placeholder that
+    used to masquerade as real per-interval pricing (issue #7).
+    """
+    return [
+        s
         for s in up.series
-        if s.reading_type.flow_direction == "FORWARD"
-        for r in s.readings
-    )
+        if s.reading_type.flow_direction == "FORWARD" and _is_interval_consumption_series(s)
+    ]
+
+
+def _has_interval_cost(up: UsagePoint) -> bool:
+    """True when this UsagePoint's interval-consumption readings carry per-interval cost.
+
+    Scoped to [_forward_interval_series]. Milton Hydro attaches ``cost=0`` to its daily
+    ``BULK_QUANTITY`` register while billing through ``UsageSummary``; testing every FORWARD
+    reading let that placeholder select the per-interval path and write an all-zero cost
+    statistic, suppressing the real (non-zero) summary entirely (issue #7).
+
+    Deliberately still ``cost is not None`` rather than ``cost != 0``: a series that genuinely
+    itemizes cost may have legitimately zero hours, and because this decision is remade on every
+    poll, a "must be non-zero" test would flip a trailing all-zero window onto the summary path
+    and mix summary-distributed rows into a per-interval cost statistic. Restricting *which*
+    series are consulted fixes #7 on its own; see the issue for the series-level persistence
+    that would make the choice stable across polls.
+    """
+    return any(r.cost is not None for s in _forward_interval_series(up) for r in s.readings)
 
 
 async def _import_series(
@@ -254,8 +388,10 @@ async def _import_series(
     )
     unit = _ha_unit_for(series.reading_type)
     if unit is None:
-        _LOGGER.debug(
-            "Skipping series %s: no HA unit mapping for %s/%s",
+        _warn_once(
+            f"{statistic_id}:{series.reading_type.unit_of_measure}:no-unit",
+            "Skipping series %s: no HA unit mapping for %s/%s — its readings will not appear "
+            "in the Energy dashboard",
             statistic_id,
             series.reading_type.commodity,
             series.reading_type.unit_of_measure,
@@ -602,18 +738,19 @@ async def _import_cost_from_readings(
 ) -> None:
     """Write a cumulative-cost statistic from per-interval `<cost>` on the FORWARD readings.
 
-    Utilities like savagedata/Milton itemize the actual cost on every IntervalReading — more
-    accurate and finer-grained than distributing a monthly UsageSummary total (and it works when
-    the summary only carries an "Amount Due" subtotal, which our summary path deliberately drops).
-    Costs are summed per hour across the UsagePoint's FORWARD series (multiple meters roll up into
-    one bill), then accumulated into the same cost stat the Energy dashboard reads.
+    Utilities like savagedata itemize the actual cost on every IntervalReading — more accurate
+    and finer-grained than distributing a monthly UsageSummary total (and it works when the
+    summary only carries an "Amount Due" subtotal, which our summary path deliberately drops).
+    Costs are summed per hour across the UsagePoint's FORWARD interval-consumption series
+    (multiple meters roll up into one bill), then accumulated into the same cost stat the Energy
+    dashboard reads. Cumulative registers are excluded — see [_forward_interval_series].
     """
+    forward_series = _forward_interval_series(up)
     currency_code = next(
         (
             s.reading_type.currency_numeric_code
-            for s in up.series
-            if s.reading_type.flow_direction == "FORWARD"
-            and s.reading_type.currency_numeric_code is not None
+            for s in forward_series
+            if s.reading_type.currency_numeric_code is not None
         ),
         None,
     )
@@ -627,9 +764,7 @@ async def _import_cost_from_readings(
         return
 
     cost_by_hour: dict[datetime, float] = {}
-    for series in up.series:
-        if series.reading_type.flow_direction != "FORWARD":
-            continue
+    for series in forward_series:
         for reading in series.readings:
             if reading.cost is None:
                 continue

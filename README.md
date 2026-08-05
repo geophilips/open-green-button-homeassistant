@@ -35,7 +35,11 @@ The integration writes hourly consumption data into the HA Energy dashboard's lo
 
 ## Recomputing statistics after an update
 
-Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values. To rebuild them without removing the integration (and without redoing the Green Button authorization), run the **Rebuild statistics** action:
+Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values.
+
+When an update fixes a calculation bug, the integration repairs affected accounts by itself: on the first poll after the update it checks whether your utility's feed has the shape the bug applied to, and if it does, rebuilds that account's statistics automatically (once — you'll see it in the log). Accounts the bug never touched are left alone rather than made to re-download their whole history.
+
+You can also rebuild on demand — after changing something yourself, or if an automatic repair failed. Run the **Rebuild statistics** action:
 
 **Developer Tools → Actions → “Open Green Button: Rebuild statistics” → Perform action.**
 

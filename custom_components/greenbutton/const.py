@@ -89,6 +89,22 @@ CONF_POLL_INTERVAL_SECONDS = "poll_interval_seconds"
 # so no separate cost cursor is needed.
 CONF_LAST_FETCHED_AT = "last_fetched_at"
 
+# Revision of the statistics *calculation* logic that produced this entry's stored rows.
+# Statistics are written once as they're fetched, so a fix that changes how usage or cost is
+# computed does NOT retroactively correct rows already in the recorder — historically that
+# needed the user to notice and run `greenbutton.rebuild_statistics` by hand. The coordinator
+# compares this stamp against IMPORT_LOGIC_REVISION and repairs affected entries itself; see
+# [coordinator.GreenButtonCoordinator._async_migrate_import].
+CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
+
+# Bump when a change means previously-imported rows are wrong and must be rebuilt, AND teach
+# the coordinator how to recognize an affected entry's feed (a blanket rebuild would make every
+# user re-pull their full history against their utility for a bug that may not affect them).
+#   1 — cumulative meter registers (ESPI BULK_QUANTITY et al) were summed into the consumption
+#       statistic, and their `cost=0` placeholder suppressed real UsageSummary billing.
+#       Affects feeds that publish a cumulative register: Milton Hydro. (issues #6, #7)
+IMPORT_LOGIC_REVISION = 1
+
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see
 # [coordinator.GreenButtonCoordinator._async_ensure_customer_label]). CONF_CUSTOMER_LABEL doubles
