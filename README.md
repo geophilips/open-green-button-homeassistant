@@ -35,7 +35,11 @@ The integration writes hourly consumption data into the HA Energy dashboard's lo
 
 ## Recomputing statistics after an update
 
-Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values. To rebuild them without removing the integration (and without redoing the Green Button authorization), run the **Rebuild statistics** action:
+Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values.
+
+When an update fixes a calculation bug, the integration repairs affected accounts by itself: on the first poll after the update it checks whether your utility's feed has the shape the bug applied to, and if it does, rebuilds that account's statistics automatically (once — you'll see it in the log). Accounts the bug never touched are left alone rather than made to re-download their whole history.
+
+You can also rebuild on demand — after changing something yourself, or if an automatic repair failed. Run the **Rebuild statistics** action:
 
 **Developer Tools → Actions → “Open Green Button: Rebuild statistics” → Perform action.**
 
@@ -53,7 +57,11 @@ It deletes that account's imported energy and cost statistics, then re-downloads
 
 The proxy tells the integration how often each utility permits polling. When that cadence is exactly once per day, you can anchor it to a consistent local time under **Settings → Devices & services → Open Green Button → Configure**. Enable **Poll daily at a specific local time** and choose the time. The schedule uses Home Assistant's timezone and follows daylight-saving changes.
 
-This option only changes when a daily poll runs. It never increases or decreases a utility's supplied cadence: shorter and multi-day schedules continue to use their original intervals. Home Assistant still performs one initial fetch whenever the integration starts or reloads so its in-memory state is available.
+This option only changes when a daily poll runs. It never increases or decreases a utility's supplied cadence: shorter and multi-day schedules continue to use their original intervals. A first installation and a manual integration reload fetch immediately. A normal Home Assistant restart reuses the statistics already stored by Recorder and waits for the next scheduled poll, avoiding a redundant utility request during startup.
+
+### Milton Hydro current-period cost estimate
+
+Milton Hydro accounts on Ontario Tiered pricing can show provisional current-period costs between completed bills. The estimator is deliberately utility-scoped: it learns the Block/Tier rates and non-energy residual from Milton's latest exact `UsageSummary`, stores the cumulative cost at the new period boundary, and replaces provisional rows when the exact bill arrives. It stops at the predicted billing-period end if a new summary is late, so stale rates cannot keep accumulating indefinitely. Exact utility summaries remain authoritative.
 
 ## Supported utilities
 
@@ -89,7 +97,7 @@ The venv at `.venv/` is auto-activated when you `cd` into the repo.
 **Working today**
 
 - OAuth authorization against the proxy server, with refresh-token rotation handled automatically
-- Polls the proxy every 6 hours and writes hourly consumption into the Energy dashboard's long-term statistics via [`async_add_external_statistics`](https://developers.home-assistant.io/docs/core/entity/sensor#statistics-imported-from-external-sources)
+- Polls at the utility-supplied cadence and writes hourly consumption into the Energy dashboard's long-term statistics via [`async_add_external_statistics`](https://developers.home-assistant.io/docs/core/entity/sensor#statistics-imported-from-external-sources)
 - Reauth flow surfaces as an HA notification when the utility revokes our refresh token
 - Imports per-billing-period cost from ESPI `UsageSummary` blocks into the Energy dashboard's Cost column, with Ontario time-of-use distribution
 

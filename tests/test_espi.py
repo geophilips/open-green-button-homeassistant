@@ -1,6 +1,9 @@
 """Parser regression tests for custodian-specific ESPI feed shapes."""
 
+from datetime import UTC, datetime
+
 from custom_components.greenbutton.espi import (
+    _accumulation,
     _flow_direction,
     parse_customer_feed,
     parse_usage_feed,
@@ -16,6 +19,118 @@ def test_flow_direction_codes_match_espi_xsd() -> None:
     assert _flow_direction(4) == "NET"
     assert _flow_direction(19) == "REVERSE"
     assert _flow_direction(20) == "TOTAL"
+
+
+def test_accumulation_codes_match_espi_xsd() -> None:
+    """NAESB ESPI AccumulationKind, in full.
+
+    Completeness is load-bearing, not cosmetic: [statistics] decides by *name* whether a series
+    is per-interval consumption or a cumulative meter register, so a cumulative code falling
+    through to "OTHER" would be summed into the consumption statistic as if it were a delta
+    (issue #6). continuousCumulative (2) is the one that did. Note 11=instantaneous and
+    12=latchingQuantity — this map previously had 12 as INSTANTANEOUS.
+    """
+    assert _accumulation(0) == "NONE"
+    assert _accumulation(1) == "BULK_QUANTITY"
+    assert _accumulation(2) == "CONTINUOUS_CUMULATIVE"
+    assert _accumulation(3) == "CUMULATIVE"
+    assert _accumulation(4) == "DELTA_DATA"
+    assert _accumulation(6) == "INDICATING"
+    assert _accumulation(9) == "SUMMATION"
+    assert _accumulation(10) == "TIME_OF_USE"
+    assert _accumulation(11) == "INSTANTANEOUS"
+    assert _accumulation(12) == "LATCHING_QUANTITY"
+    assert _accumulation(13) == "BOUNDED_QUANTITY"
+    # Unknown / absent stays "OTHER" — the statistics importer treats that as importable.
+    assert _accumulation(None) == "OTHER"
+    assert _accumulation(99) == "OTHER"
+
+
+# Milton-shaped feed: ONE UsagePoint carrying two FORWARD MeterReadings — hourly deltas
+# (accumulationBehaviour=4) and a daily cumulative register snapshot (accumulationBehaviour=1,
+# with a <cost>0</cost> placeholder). Synthetic; no customer data. This is the shape issues #6
+# and #7 asked for a fixture of: both series normalize to the same statistic id downstream, so
+# the register's meter-lifetime total was being added to hourly consumption.
+#
+# 1751691600 = 2025-07-05T05:00:00Z, 1751695200 = 06:00:00Z, 1751673600 = 2025-07-05T00:00:00Z.
+_MIXED_ACCUMULATION_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>urn:uuid:f</id>
+  <updated>2026-07-06T00:00:00Z</updated>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://mh/UsagePoint/UP1"/>
+    <content><espi:UsagePoint><espi:ServiceCategory><espi:kind>0</espi:kind></espi:ServiceCategory></espi:UsagePoint></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://mh/UsagePoint/UP1/MeterReading/MR_HOURLY"/>
+    <link rel="related" type="espi-entry/ReadingType" href="https://mh/ReadingType/RT_DELTA"/>
+    <content><espi:MeterReading/></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="up" type="espi-feed/IntervalBlock" href="https://mh/UsagePoint/UP1/MeterReading/MR_HOURLY/IntervalBlock"/>
+    <link rel="self" href="https://mh/UsagePoint/UP1/MeterReading/MR_HOURLY/IntervalBlock/IB1"/>
+    <content>
+      <espi:IntervalBlock>
+        <espi:IntervalReading>
+          <espi:timePeriod><espi:duration>3600</espi:duration><espi:start>1751691600</espi:start></espi:timePeriod>
+          <espi:value>1000</espi:value>
+        </espi:IntervalReading>
+        <espi:IntervalReading>
+          <espi:timePeriod><espi:duration>3600</espi:duration><espi:start>1751695200</espi:start></espi:timePeriod>
+          <espi:value>1500</espi:value>
+        </espi:IntervalReading>
+      </espi:IntervalBlock>
+    </content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://mh/UsagePoint/UP1/MeterReading/MR_REGISTER"/>
+    <link rel="related" type="espi-entry/ReadingType" href="https://mh/ReadingType/RT_BULK"/>
+    <content><espi:MeterReading/></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="up" type="espi-feed/IntervalBlock" href="https://mh/UsagePoint/UP1/MeterReading/MR_REGISTER/IntervalBlock"/>
+    <link rel="self" href="https://mh/UsagePoint/UP1/MeterReading/MR_REGISTER/IntervalBlock/IB2"/>
+    <content>
+      <espi:IntervalBlock>
+        <espi:IntervalReading>
+          <espi:cost>0</espi:cost>
+          <espi:timePeriod><espi:duration>86400</espi:duration><espi:start>1751673600</espi:start></espi:timePeriod>
+          <espi:value>9876543</espi:value>
+        </espi:IntervalReading>
+      </espi:IntervalBlock>
+    </content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://mh/ReadingType/RT_DELTA"/>
+    <content><espi:ReadingType><espi:accumulationBehaviour>4</espi:accumulationBehaviour><espi:commodity>1</espi:commodity><espi:currency>124</espi:currency><espi:flowDirection>1</espi:flowDirection><espi:intervalLength>3600</espi:intervalLength><espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier><espi:uom>72</espi:uom></espi:ReadingType></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://mh/ReadingType/RT_BULK"/>
+    <content><espi:ReadingType><espi:accumulationBehaviour>1</espi:accumulationBehaviour><espi:commodity>1</espi:commodity><espi:currency>124</espi:currency><espi:flowDirection>1</espi:flowDirection><espi:intervalLength>86400</espi:intervalLength><espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier><espi:uom>72</espi:uom></espi:ReadingType></content>
+  </entry>
+</feed>"""
+
+
+def test_mixed_delta_and_bulk_series_parse_as_distinct_series() -> None:
+    """One UsagePoint, two FORWARD MeterReadings — the delta and register series stay separate.
+
+    The parser has to preserve each MeterReading's own accumulationBehaviour, because that's the
+    only thing distinguishing hourly consumption from a meter-lifetime register total once both
+    are FORWARD on the same UsagePoint (issues #6, #7).
+    """
+    _updated, usage_points = parse_usage_feed(_MIXED_ACCUMULATION_FEED)
+    assert len(usage_points) == 1
+    by_behaviour = {s.reading_type.accumulation_behaviour: s for s in usage_points[0].series}
+    assert set(by_behaviour) == {"DELTA_DATA", "BULK_QUANTITY"}
+
+    delta = by_behaviour["DELTA_DATA"]
+    assert [r.value for r in delta.readings] == [1000.0, 1500.0]
+    assert delta.readings[0].start == datetime(2025, 7, 5, 5, tzinfo=UTC)
+    assert [r.cost for r in delta.readings] == [None, None]  # Milton itemizes no hourly cost
+
+    register = by_behaviour["BULK_QUANTITY"]
+    assert [r.value for r in register.readings] == [9_876_543.0]  # meter-lifetime total
+    assert register.readings[0].cost == 0.0  # the placeholder that used to hijack cost selection
 
 
 # savagedata-style feed: resources are nested in the URL path

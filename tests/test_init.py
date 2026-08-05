@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.core import CoreState
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
@@ -36,6 +37,7 @@ from custom_components.greenbutton.const import (
     CONF_DAILY_POLL_TIME,
     CONF_DAILY_POLL_TIME_ENABLED,
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_LAST_FETCHED_AT,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_ID,
@@ -100,6 +102,65 @@ async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
         )
         await hass.async_block_till_done()
         assert fetch.await_count == 2, "periodic poll did not fire on the scan interval"
+
+
+async def test_normal_restart_with_history_skips_immediate_fetch(hass: HomeAssistant) -> None:
+    """Persisted utility data waits for its schedule instead of blocking every HA boot."""
+    hass.set_state(CoreState.starting)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_UTILITY_ID: "milton_hydro",
+            CONF_UTILITY_NAME: "Milton Hydro",
+            CONF_ENCRYPTED_REFRESH_BLOB: "blob",
+            CONF_PROXY_TOKEN: "token",
+            CONF_LAST_FETCHED_AT: "2026-08-04T04:00:00+00:00",
+        },
+        options={
+            CONF_DAILY_POLL_TIME_ENABLED: True,
+            CONF_DAILY_POLL_TIME: "06:00:00",
+        },
+    )
+    entry.add_to_hass(hass)
+    fetch = AsyncMock()
+    with (
+        patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
+        patch("custom_components.greenbutton.async_track_time_change", return_value=MagicMock()),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    fetch.assert_not_awaited()
+
+
+async def test_manual_reload_with_history_still_fetches(hass: HomeAssistant) -> None:
+    """When HA is running, Reload remains an explicit immediate refresh action."""
+    hass.set_state(CoreState.running)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_UTILITY_ID: "milton_hydro",
+            CONF_UTILITY_NAME: "Milton Hydro",
+            CONF_ENCRYPTED_REFRESH_BLOB: "blob",
+            CONF_PROXY_TOKEN: "token",
+            CONF_LAST_FETCHED_AT: "2026-08-04T04:00:00+00:00",
+        },
+    )
+    entry.add_to_hass(hass)
+    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
+    fetch = AsyncMock(return_value=empty)
+    with (
+        patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
+        patch(
+            "custom_components.greenbutton.OpenGbApi.fetch_customer",
+            new=AsyncMock(return_value=CustomerResponse(customer=None, new_credentials=None)),
+        ),
+        patch("custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    fetch.assert_awaited_once()
 
 
 async def test_setup_uses_server_interval_for_non_daily_utility(hass: HomeAssistant) -> None:

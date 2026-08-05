@@ -23,6 +23,7 @@ from datetime import datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
+from homeassistant.core import CoreState
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -41,6 +42,7 @@ from .const import (
     ATTR_USAGE_POINT_ID,
     CONF_DAILY_POLL_TIME,
     CONF_DAILY_POLL_TIME_ENABLED,
+    CONF_LAST_FETCHED_AT,
     CONF_SERVER_BASE_URL,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
@@ -122,9 +124,9 @@ def _configured_daily_poll_time(
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up an Open Green Button config entry.
 
-    Creates a coordinator, kicks off a first refresh (which will trigger reauth if the
-    persisted refresh token has been revoked while HA was down), and stashes the coordinator
-    in ``hass.data`` for diagnostics.
+    Creates a coordinator and stashes it in ``hass.data`` for diagnostics. A first install or
+    manual reload fetches immediately; a normal Home Assistant boot with an existing usage
+    frontier uses stored statistics and waits for the configured schedule.
     """
     api = OpenGbApi(
         session=async_get_clientsession(hass),
@@ -132,9 +134,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     coordinator = GreenButtonCoordinator(hass, api, entry)
 
-    # First refresh raises ConfigEntryAuthFailed → HA opens a reauth notification. Any other
-    # failure becomes ConfigEntryNotReady → HA retries with backoff.
-    await coordinator.async_config_entry_first_refresh()
+    # When a refresh runs, ConfigEntryAuthFailed opens HA's reauth flow; other failures become
+    # ConfigEntryNotReady and are retried with backoff.
+    restarting_with_history = (
+        hass.state is not CoreState.running and CONF_LAST_FETCHED_AT in entry.data
+    )
+    if restarting_with_history:
+        # Utility data is already persisted in recorder statistics. Re-fetching it on every HA
+        # restart is redundant and puts network/recorder work on the startup critical path.
+        coordinator.async_set_updated_data(None)
+        _LOGGER.info(
+            "Skipping startup fetch for entry %s; next refresh follows its polling schedule",
+            entry.entry_id,
+        )
+    else:
+        # First install and manual reload remain explicit refresh actions.
+        await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
