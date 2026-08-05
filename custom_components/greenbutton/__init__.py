@@ -19,14 +19,14 @@ the same utility (sandbox / test account beside a real account, or multi-meter h
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 
 from .api import OpenGbApi
 from .const import (
@@ -39,6 +39,8 @@ from .const import (
     ATTR_TIER_ONE_RATE,
     ATTR_TIER_TWO_RATE,
     ATTR_USAGE_POINT_ID,
+    CONF_DAILY_POLL_TIME,
+    CONF_DAILY_POLL_TIME_ENABLED,
     CONF_SERVER_BASE_URL,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
@@ -75,6 +77,48 @@ _SET_TIER_COST_ESTIMATE_SCHEMA = vol.Schema(
 _LOGGER = logging.getLogger(__name__)
 
 
+def _configured_daily_poll_time(
+    entry: ConfigEntry,
+    poll_interval: timedelta,
+) -> time | None:
+    """Return an enabled local poll time for an exactly-daily utility cadence.
+
+    The utility-provided cadence remains authoritative. A wall-clock time only changes the
+    phase of a one-day schedule; it must never make a six-hour or multi-day utility poll daily.
+    Invalid persisted values fall back safely to interval scheduling.
+    """
+    if poll_interval != DEFAULT_SCAN_INTERVAL or not entry.options.get(
+        CONF_DAILY_POLL_TIME_ENABLED, False
+    ):
+        return None
+
+    raw = entry.options.get(CONF_DAILY_POLL_TIME)
+    if not isinstance(raw, str):
+        _LOGGER.warning(
+            "Ignoring invalid daily poll time for entry %s: %r",
+            entry.entry_id,
+            raw,
+        )
+        return None
+    try:
+        configured = time.fromisoformat(raw)
+    except ValueError:
+        _LOGGER.warning(
+            "Ignoring invalid daily poll time for entry %s: %r",
+            entry.entry_id,
+            raw,
+        )
+        return None
+    if configured.tzinfo is not None:
+        _LOGGER.warning(
+            "Ignoring timezone-qualified daily poll time for entry %s: %r",
+            entry.entry_id,
+            raw,
+        )
+        return None
+    return configured
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up an Open Green Button config entry.
 
@@ -98,28 +142,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # DataUpdateCoordinator only arms its internal poll timer when it has ≥1 listener AND the
     # entry's `pref_disable_polling` is off (update_coordinator._schedule_refresh). Relying on
     # that gated scheduler is fragile for a poll-only integration — a stray "disable polling"
-    # system-option silently stops all data updates. So we drive the periodic refresh
-    # ourselves with an unconditional time interval that HA can't turn off. The first fetch
-    # already ran above via async_config_entry_first_refresh; this covers every fetch after.
+    # system-option silently stops all data updates. So we drive refreshes ourselves. Daily
+    # utilities may be anchored to a user-selected local wall-clock time; every other cadence
+    # follows the interval supplied by the Open Green Button server. The first fetch already ran
+    # above via async_config_entry_first_refresh; these listeners cover every fetch after.
     async def _async_poll(now) -> None:
         _LOGGER.debug("Periodic poll firing for entry %s (scheduled tick %s)", entry.entry_id, now)
         await coordinator.async_refresh()
 
-    entry.async_on_unload(async_track_time_interval(hass, _async_poll, DEFAULT_SCAN_INTERVAL))
+    poll_interval = coordinator.update_interval or DEFAULT_SCAN_INTERVAL
+    daily_poll_time = _configured_daily_poll_time(entry, poll_interval)
+    if daily_poll_time is not None:
+        entry.async_on_unload(
+            async_track_time_change(
+                hass,
+                _async_poll,
+                hour=daily_poll_time.hour,
+                minute=daily_poll_time.minute,
+                second=daily_poll_time.second,
+            )
+        )
+        schedule_description = f"daily at {daily_poll_time.isoformat()} local time"
+    else:
+        entry.async_on_unload(async_track_time_interval(hass, _async_poll, poll_interval))
+        schedule_description = f"every {poll_interval}"
     # Emitted once, immediately, on every successful setup. If you do NOT see this line in the
     # log right after an HA (full) restart, the running code is stale — the deployed files or the
     # loaded module predate the timer. A config-entry *reload* is not enough; Python caches the
     # module, so only a full HA restart re-imports this file.
-    _LOGGER.info(
-        "Armed periodic poll for entry %s: every %s", entry.entry_id, DEFAULT_SCAN_INTERVAL
-    )
+    _LOGGER.info("Armed periodic poll for entry %s: %s", entry.entry_id, schedule_description)
 
     # NOTE: deliberately NO `add_update_listener(...reload...)` here. The coordinator writes
     # bookkeeping (CONF_LAST_FETCHED_AT, rotated credentials) into entry.data on every poll;
     # a blanket reload-on-update listener would tear the entry down and re-set it up on each
     # of those writes. Reauth reloads itself via the config flow's
-    # `async_update_reload_and_abort`, and there is no options flow, so nothing else needs a
-    # reload on data change.
+    # `async_update_reload_and_abort`. Polling options use OptionsFlowWithReload, which reloads
+    # once when the user saves without installing a broad update listener here.
     _async_register_services(hass)
     _LOGGER.info(
         "Set up Open Green Button entry %s for utility %s",

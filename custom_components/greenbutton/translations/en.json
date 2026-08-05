@@ -36,6 +36,22 @@
       "reauth_successful": "Re-authorization complete."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Polling schedule",
+        "description": "For utilities that publish on a daily schedule, you can run the poll at a consistent Home Assistant local time. The utility's schedule remains authoritative; this setting does not change shorter or multi-day polling intervals.",
+        "data": {
+          "daily_poll_time_enabled": "Poll daily at a specific local time",
+          "daily_poll_time": "Daily polling time"
+        },
+        "data_description": {
+          "daily_poll_time_enabled": "Turn this off to poll every 24 hours from the last integration start instead.",
+          "daily_poll_time": "Uses Home Assistant's local timezone and follows daylight-saving changes."
+        }
+      }
+    }
+  },
   "issues": {
     "background_load_unsupported": {
       "title": "{utility} is sending a large background data load we can't import yet",
