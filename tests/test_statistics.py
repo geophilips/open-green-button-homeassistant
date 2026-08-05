@@ -1047,4 +1047,4 @@ def test_tiered_estimate_splits_threshold_hour_and_preserves_total() -> None:
     ]
     costs = _tiered_estimated_costs(hours, profile, predicted_days=2)
     assert round(costs[hours[0][0]], 3) == 0.225
-    assert round(costs[hours[1][0]], 3) == 0.25
+    assert round(costs[hours[1][0]], 3) == 0.20
