@@ -48,6 +48,13 @@ PUBLISHED_MAX_LOOKAHEAD = timedelta(days=1)
 # on a multi-hour-to-multi-day lag, so a daily poll captures everything without over-polling.
 DEFAULT_SCAN_INTERVAL = timedelta(days=1)
 
+# Disabled by default so existing entries keep their interval-from-start behaviour until the
+# user explicitly chooses a local time in the options flow. Shorter or multi-day utility
+# cadences always remain authoritative and ignore this option.
+CONF_DAILY_POLL_TIME_ENABLED = "daily_poll_time_enabled"
+CONF_DAILY_POLL_TIME = "daily_poll_time"
+DEFAULT_DAILY_POLL_TIME = "06:00:00"
+
 # The hosted proxy server. May be overridden per-config-entry for self-hosters via the
 # server_base_url in entry.data.
 DEFAULT_SERVER_BASE_URL = "https://api.opengreenbutton.org"
