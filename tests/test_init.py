@@ -19,7 +19,10 @@ from pytest_homeassistant_custom_component.common import (
     async_fire_time_changed,
 )
 
-from custom_components.greenbutton import _async_register_services
+from custom_components.greenbutton import (
+    _async_register_services,
+    _configured_daily_poll_time,
+)
 from custom_components.greenbutton.api import CustomerResponse, UsageResponse
 from custom_components.greenbutton.const import (
     ATTR_ACTIVE_PERIOD_START,
@@ -30,7 +33,10 @@ from custom_components.greenbutton.const import (
     ATTR_TIER_ONE_KWH_PER_DAY,
     ATTR_TIER_ONE_RATE,
     ATTR_TIER_TWO_RATE,
+    CONF_DAILY_POLL_TIME,
+    CONF_DAILY_POLL_TIME_ENABLED,
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_ID,
     CONF_UTILITY_NAME,
@@ -94,6 +100,98 @@ async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
         )
         await hass.async_block_till_done()
         assert fetch.await_count == 2, "periodic poll did not fire on the scan interval"
+
+
+async def test_setup_uses_server_interval_for_non_daily_utility(hass: HomeAssistant) -> None:
+    """A shorter server cadence is honored instead of the daily fallback."""
+    six_hours = timedelta(hours=6)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_UTILITY_ID: "example_utility",
+            CONF_UTILITY_NAME: "Example Utility",
+            CONF_ENCRYPTED_REFRESH_BLOB: "blob",
+            CONF_PROXY_TOKEN: "token",
+            CONF_POLL_INTERVAL_SECONDS: six_hours.total_seconds(),
+        },
+    )
+    entry.add_to_hass(hass)
+
+    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
+    fetch = AsyncMock(return_value=empty)
+    with (
+        patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
+        patch(
+            "custom_components.greenbutton.OpenGbApi.fetch_customer",
+            new=AsyncMock(return_value=CustomerResponse(customer=None, new_credentials=None)),
+        ),
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert fetch.await_count == 1
+
+        async_fire_time_changed(hass, dt_util.utcnow() + six_hours + timedelta(minutes=1))
+        await hass.async_block_till_done()
+        assert fetch.await_count == 2
+
+
+async def test_setup_anchors_enabled_daily_schedule_to_local_time(
+    hass: HomeAssistant,
+) -> None:
+    """An enabled daily option uses HA's DST-aware local wall-clock helper."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_UTILITY_ID: "example_utility",
+            CONF_UTILITY_NAME: "Example Utility",
+            CONF_ENCRYPTED_REFRESH_BLOB: "blob",
+            CONF_PROXY_TOKEN: "token",
+            CONF_POLL_INTERVAL_SECONDS: DEFAULT_SCAN_INTERVAL.total_seconds(),
+        },
+        options={
+            CONF_DAILY_POLL_TIME_ENABLED: True,
+            CONF_DAILY_POLL_TIME: "06:15:30",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
+    with (
+        patch(
+            "custom_components.greenbutton.OpenGbApi.fetch_usage", new=AsyncMock(return_value=empty)
+        ),
+        patch(
+            "custom_components.greenbutton.OpenGbApi.fetch_customer",
+            new=AsyncMock(return_value=CustomerResponse(customer=None, new_credentials=None)),
+        ),
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        patch("custom_components.greenbutton.async_track_time_change") as track_time_change,
+        patch("custom_components.greenbutton.async_track_time_interval") as track_time_interval,
+    ):
+        track_time_change.return_value = MagicMock()
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    track_time_change.assert_called_once()
+    assert track_time_change.call_args.kwargs == {"hour": 6, "minute": 15, "second": 30}
+    track_time_interval.assert_not_called()
+
+
+def test_daily_wall_clock_option_never_overrides_non_daily_cadence() -> None:
+    """A saved wall-clock option cannot increase a six-hour utility to daily."""
+    entry = MagicMock()
+    entry.options = {
+        CONF_DAILY_POLL_TIME_ENABLED: True,
+        CONF_DAILY_POLL_TIME: "06:00:00",
+    }
+    assert _configured_daily_poll_time(entry, timedelta(hours=6)) is None
 
 
 async def test_service_is_registered(hass: HomeAssistant) -> None:

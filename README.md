@@ -47,7 +47,13 @@ data:
   config_entry_id: <your entry>   # optional — omit to rebuild every configured account
 ```
 
-It deletes that account's imported energy and cost statistics, then re-downloads and recomputes the full history from scratch. Because it pulls the entire initial-history window, it puts the same load on your utility as a fresh setup — run it when you need it, not on a schedule. If the re-fetch fails partway (network/utility hiccup), the statistics simply repopulate on the next successful 6-hour poll or the next rebuild.
+It deletes that account's imported energy and cost statistics, then re-downloads and recomputes the full history from scratch. Because it pulls the entire initial-history window, it puts the same load on your utility as a fresh setup — run it when you need it, not on a schedule. If the re-fetch fails partway (network/utility hiccup), the statistics simply repopulate on the next successful utility-scheduled poll or the next rebuild.
+
+### Daily polling time
+
+The proxy tells the integration how often each utility permits polling. When that cadence is exactly once per day, you can anchor it to a consistent local time under **Settings → Devices & services → Open Green Button → Configure**. Enable **Poll daily at a specific local time** and choose the time. The schedule uses Home Assistant's timezone and follows daylight-saving changes.
+
+This option only changes when a daily poll runs. It never increases or decreases a utility's supplied cadence: shorter and multi-day schedules continue to use their original intervals. Home Assistant still performs one initial fetch whenever the integration starts or reloads so its in-memory state is available.
 
 ## Supported utilities
 
