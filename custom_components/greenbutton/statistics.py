@@ -60,6 +60,7 @@ except ImportError:  # pragma: no cover — older HA core, drop-through to has_m
 _LOGGER = logging.getLogger(__name__)
 
 _MILTON_UTILITY_ID = "milton_hydro"
+_TIERED_ESTIMATE_GRACE_DAYS = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,8 +85,13 @@ class _TieredEstimateState:
 
     @property
     def period_end(self) -> datetime:
-        """Predicted exclusive end; estimates never extend past this boundary."""
+        """Predicted exclusive end of the active billing period."""
         return self.active_period_start + timedelta(days=self.predicted_days)
+
+    @property
+    def grace_end(self) -> datetime:
+        """Exclusive safety cutoff while an exact UsageSummary is delayed."""
+        return self.period_end + timedelta(days=_TIERED_ESTIMATE_GRACE_DAYS)
 
 
 def _tiered_estimates_supported(entry: ConfigEntry) -> bool:
@@ -1043,7 +1049,8 @@ async def _import_cost_summaries_with_estimates(
 
     if estimate_state is not None:
         latest_forward_hour = _latest_forward_hour(up)
-        estimate_end = estimate_state.period_end
+        predicted_period_end = estimate_state.period_end
+        estimate_end = estimate_state.grace_end
         if (
             latest_forward_hour is not None
             and latest_forward_hour >= estimate_state.active_period_start
@@ -1056,10 +1063,11 @@ async def _import_cost_summaries_with_estimates(
                 estimate_state.active_period_start,
                 period_end,
             )
-            cost_at_hour = _tiered_estimated_costs(
+            cost_at_hour = _tiered_estimated_costs_with_provisional_rollover(
                 open_hours,
                 estimate_state.profile,
                 estimate_state.predicted_days,
+                predicted_period_end,
             )
             append_after_epoch = None if rewrite_exact or fresh else resume_after_epoch
             if not rewrite_exact and not fresh:
@@ -1069,12 +1077,23 @@ async def _import_cost_summaries_with_estimates(
                     continue
                 running += cost_at_hour[hour_start]
                 stats.append(StatisticData(start=hour_start, state=running, sum=running))
-            if latest_forward_hour + timedelta(hours=1) > estimate_end:
+            latest_forward_end = latest_forward_hour + timedelta(hours=1)
+            if latest_forward_end > estimate_end:
                 _warn_once(
                     f"{entry.entry_id}:{up.usage_point_id}:stale-tier-estimate",
-                    "Tiered cost estimate for usage point %s stopped at predicted billing-period "
-                    "end %s; waiting for the next exact UsageSummary",
+                    "Tiered cost estimate for usage point %s stopped after the %d-day "
+                    "UsageSummary grace period at %s",
                     up.usage_point_id,
+                    _TIERED_ESTIMATE_GRACE_DAYS,
+                    estimate_end.isoformat(),
+                )
+            elif latest_forward_end > predicted_period_end:
+                _warn_once(
+                    f"{entry.entry_id}:{up.usage_point_id}:delayed-tier-summary",
+                    "UsageSummary for usage point %s is delayed past predicted billing-period "
+                    "end %s; provisional next-period costs will continue through %s",
+                    up.usage_point_id,
+                    predicted_period_end.isoformat(),
                     estimate_end.isoformat(),
                 )
 
@@ -1229,6 +1248,28 @@ def _tiered_estimated_costs(
         )
         consumed += kwh
     return out
+
+
+def _tiered_estimated_costs_with_provisional_rollover(
+    hours: list[tuple[datetime, float]],
+    profile: _TieredEstimateProfile,
+    predicted_days: float,
+    predicted_period_end: datetime,
+) -> dict[datetime, float]:
+    """Price a delayed-summary grace window with one provisional tier reset.
+
+    Milton can publish interval usage for several days after the predicted billing boundary
+    before it publishes the exact UsageSummary. Treat those hours as a provisional next period
+    so the Energy dashboard does not go to zero and the Tier 1 allowance resets at the predicted
+    boundary. When the exact summary arrives, the normal contiguous rewrite replaces both the
+    completed period and these provisional next-period rows from the actual boundary.
+    """
+    active_period_hours = [item for item in hours if item[0] < predicted_period_end]
+    provisional_next_period_hours = [item for item in hours if item[0] >= predicted_period_end]
+    return {
+        **_tiered_estimated_costs(active_period_hours, profile, predicted_days),
+        **_tiered_estimated_costs(provisional_next_period_hours, profile, predicted_days),
+    }
 
 
 async def _import_cost_from_readings(

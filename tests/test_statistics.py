@@ -44,6 +44,7 @@ from custom_components.greenbutton.statistics import (
     _recorded_forward_hours,
     _select_billing_summaries,
     _tiered_estimated_costs,
+    _tiered_estimated_costs_with_provisional_rollover,
     _TieredEstimateProfile,
     import_usage_statistics,
     statistic_id_for_series,
@@ -1003,8 +1004,8 @@ async def test_two_closed_bills_replace_estimates_from_saved_baseline(
     ]
 
 
-async def test_tiered_estimate_stops_at_predicted_period_end(hass: HomeAssistant) -> None:
-    """A missing UsageSummary cannot make provisional tier-two charges grow forever."""
+async def test_tiered_estimate_stops_after_summary_grace_period(hass: HomeAssistant) -> None:
+    """A delayed UsageSummary gets a bounded grace period, not an indefinite estimate."""
     active = datetime(2026, 7, 1, tzinfo=UTC)
     entry = _entry_with_tier_state(
         _saved_tier_state(active_period_start=active, predicted_days=1, baseline_sum=10.0)
@@ -1020,6 +1021,10 @@ async def test_tiered_estimate_stops_at_predicted_period_end(hass: HomeAssistant
             "custom_components.greenbutton.statistics._recorded_forward_hours",
             new=recorded,
         ),
+        patch(
+            "custom_components.greenbutton.statistics._latest_forward_hour",
+            return_value=active + timedelta(days=20),
+        ),
         patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
     ):
         await _import_cost_summaries_with_estimates(
@@ -1029,8 +1034,34 @@ async def test_tiered_estimate_stops_at_predicted_period_end(hass: HomeAssistant
             utility_display_name="Milton Hydro",
         )
 
-    assert recorded.await_args.args[4] == active + timedelta(days=1)
+    assert recorded.await_args.args[4] == active + timedelta(days=15)
     assert round(add.call_args.args[2][0]["sum"], 2) == 10.18
+
+
+def test_tiered_estimate_resets_tier_one_at_provisional_boundary() -> None:
+    """Post-boundary grace hours start a provisional period instead of staying in Tier 2."""
+    active = datetime(2026, 7, 1, tzinfo=UTC)
+    predicted_end = active + timedelta(days=1)
+    profile = _TieredEstimateProfile(
+        tier_one_rate=0.10,
+        tier_two_rate=0.20,
+        tier_one_kwh_per_day=1.0,
+        residual_rate=0.05,
+    )
+    hours = [
+        (active, 1.5),
+        (predicted_end, 1.0),
+    ]
+
+    costs = _tiered_estimated_costs_with_provisional_rollover(
+        hours,
+        profile,
+        predicted_days=1,
+        predicted_period_end=predicted_end,
+    )
+
+    assert round(costs[active], 3) == 0.225
+    assert round(costs[predicted_end], 3) == 0.15
 
 
 def test_tiered_estimate_splits_threshold_hour_and_preserves_total() -> None:
