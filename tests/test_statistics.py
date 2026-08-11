@@ -1060,7 +1060,7 @@ def test_tiered_estimate_resets_tier_one_at_provisional_boundary() -> None:
         predicted_period_end=predicted_end,
     )
 
-    assert round(costs[active], 3) == 0.225
+    assert round(costs[active], 3) == 0.275
     assert round(costs[predicted_end], 3) == 0.15
 
 
