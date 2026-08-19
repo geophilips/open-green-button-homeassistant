@@ -818,6 +818,41 @@ async def _recorded_forward_hours(
     return hours
 
 
+async def _forward_hours_for_cost(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    up: UsagePoint,
+    period_start: datetime,
+    period_end: datetime,
+) -> list[tuple[datetime, float]]:
+    """Return recorded usage plus FORWARD hours delivered by the current response.
+
+    Cost estimation normally reads the cumulative usage statistic back from the recorder so it
+    can price the entire open billing period.  The newest readings, however, are queued for
+    recorder import earlier in the same coordinator update.  On a real recorder those rows can
+    still be absent from a concurrent read even after the queue synchronization point, leaving
+    cost one poll behind usage.  Six-hour polling hid that lag; daily polling leaves yesterday's
+    cost incomplete until the next morning.
+
+    Merge the normalized interval readings already in this response over the recorder result.
+    The recorder remains the source for older hours outside the rolling response window, while
+    response values make the current poll self-contained and override an overlapping stored row.
+    """
+    recorded = await _recorded_forward_hours(hass, entry, up, period_start, period_end)
+    response_by_hour: dict[datetime, float] = {}
+    stat_id = statistic_id_for_series(entry.entry_id, up.usage_point_id, "FORWARD")
+    for series in _forward_interval_series(up):
+        by_hour, covered_seconds = _hourly_totals(series)
+        _drop_incomplete_trailing_hour(by_hour, covered_seconds, stat_id)
+        for hour, kwh in by_hour.items():
+            if period_start <= hour < period_end:
+                response_by_hour[hour] = response_by_hour.get(hour, 0.0) + kwh
+
+    merged = dict(recorded)
+    merged.update(response_by_hour)
+    return sorted(merged.items())
+
+
 async def _import_cost_summaries(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -1056,7 +1091,7 @@ async def _import_cost_summaries_with_estimates(
             and latest_forward_hour >= estimate_state.active_period_start
         ):
             period_end = min(latest_forward_hour + timedelta(hours=1), estimate_end)
-            open_hours = await _recorded_forward_hours(
+            open_hours = await _forward_hours_for_cost(
                 hass,
                 entry,
                 up,

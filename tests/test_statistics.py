@@ -39,6 +39,7 @@ from custom_components.greenbutton.const import (
 )
 from custom_components.greenbutton.statistics import (
     _cost_sum_before,
+    _forward_hours_for_cost,
     _import_cost_summaries_with_estimates,
     _load_tiered_estimate_state,
     _recorded_forward_hours,
@@ -93,6 +94,32 @@ async def test_recorded_forward_hours_reconstructs_hourly_kwh(hass: HomeAssistan
         hass, entry, up, base + timedelta(hours=1), base + timedelta(hours=4)
     )
     assert [(h.hour, round(k, 1)) for h, k in hours] == [(5, 2.0), (6, 3.0), (7, 1.0)]
+
+
+async def test_forward_hours_for_cost_includes_current_response_before_recorder_catches_up(
+    hass: HomeAssistant,
+) -> None:
+    """Same-poll response hours fill the recorder lag exposed by once-daily polling."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    response = _one_reading_response()
+    up = response.usage_points[0]
+    response_hour = up.series[0].readings[0].start
+    prior_hour = response_hour - timedelta(hours=1)
+
+    with patch(
+        "custom_components.greenbutton.statistics._recorded_forward_hours",
+        new=AsyncMock(return_value=[(prior_hour, 0.5), (response_hour, 0.8)]),
+    ):
+        hours = await _forward_hours_for_cost(
+            hass,
+            entry,
+            up,
+            prior_hour,
+            response_hour + timedelta(hours=1),
+        )
+
+    assert hours == [(prior_hour, 0.5), (response_hour, 1.0)]
 
 
 def _summary(start: datetime, duration_days: int, total_dollars: float) -> BillingSummary:
