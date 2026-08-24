@@ -60,7 +60,6 @@ except ImportError:  # pragma: no cover — older HA core, drop-through to has_m
 _LOGGER = logging.getLogger(__name__)
 
 _MILTON_UTILITY_ID = "milton_hydro"
-_TIERED_ESTIMATE_GRACE_DAYS = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,9 +88,15 @@ class _TieredEstimateState:
         return self.active_period_start + timedelta(days=self.predicted_days)
 
     @property
-    def grace_end(self) -> datetime:
-        """Exclusive safety cutoff while an exact UsageSummary is delayed."""
-        return self.period_end + timedelta(days=_TIERED_ESTIMATE_GRACE_DAYS)
+    def estimate_end(self) -> datetime:
+        """Exclusive safety cutoff while an exact UsageSummary is delayed.
+
+        Milton can publish the next bill more than two weeks after the meter-read boundary.
+        Keep the estimate alive for one complete provisional billing period so a normal late
+        bill does not create zero-cost days, while still bounding stale estimates if summaries
+        stop arriving altogether.
+        """
+        return self.period_end + timedelta(days=self.predicted_days)
 
 
 def _tiered_estimates_supported(entry: ConfigEntry) -> bool:
@@ -1085,7 +1090,7 @@ async def _import_cost_summaries_with_estimates(
     if estimate_state is not None:
         latest_forward_hour = _latest_forward_hour(up)
         predicted_period_end = estimate_state.period_end
-        estimate_end = estimate_state.grace_end
+        estimate_end = estimate_state.estimate_end
         if (
             latest_forward_hour is not None
             and latest_forward_hour >= estimate_state.active_period_start
@@ -1116,10 +1121,9 @@ async def _import_cost_summaries_with_estimates(
             if latest_forward_end > estimate_end:
                 _warn_once(
                     f"{entry.entry_id}:{up.usage_point_id}:stale-tier-estimate",
-                    "Tiered cost estimate for usage point %s stopped after the %d-day "
-                    "UsageSummary grace period at %s",
+                    "Tiered cost estimate for usage point %s stopped after one complete "
+                    "provisional billing period at %s",
                     up.usage_point_id,
-                    _TIERED_ESTIMATE_GRACE_DAYS,
                     estimate_end.isoformat(),
                 )
             elif latest_forward_end > predicted_period_end:
