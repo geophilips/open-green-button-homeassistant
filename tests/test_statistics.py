@@ -1031,8 +1031,8 @@ async def test_two_closed_bills_replace_estimates_from_saved_baseline(
     ]
 
 
-async def test_tiered_estimate_stops_after_summary_grace_period(hass: HomeAssistant) -> None:
-    """A delayed UsageSummary gets a bounded grace period, not an indefinite estimate."""
+async def test_tiered_estimate_stops_after_one_provisional_period(hass: HomeAssistant) -> None:
+    """A delayed UsageSummary gets one full provisional period, not an indefinite estimate."""
     active = datetime(2026, 7, 1, tzinfo=UTC)
     entry = _entry_with_tier_state(
         _saved_tier_state(active_period_start=active, predicted_days=1, baseline_sum=10.0)
@@ -1061,8 +1061,45 @@ async def test_tiered_estimate_stops_after_summary_grace_period(hass: HomeAssist
             utility_display_name="Milton Hydro",
         )
 
-    assert recorded.await_args.args[4] == active + timedelta(days=15)
+    assert recorded.await_args.args[4] == active + timedelta(days=2)
     assert round(add.call_args.args[2][0]["sum"], 2) == 10.18
+
+
+async def test_monthly_tiered_estimate_survives_sixteen_day_summary_delay(
+    hass: HomeAssistant,
+) -> None:
+    """Milton's late bill must not create zero-cost days after the old 14-day cutoff."""
+    active = datetime(2026, 7, 9, 4, tzinfo=UTC)
+    entry = _entry_with_tier_state(
+        _saved_tier_state(active_period_start=active, predicted_days=30, baseline_sum=10.0)
+    )
+    up = _milton_mixed_series_response().usage_points[0]
+    delayed_hour = active + timedelta(days=46)
+    recorded = AsyncMock(return_value=[(delayed_hour, 1.0)])
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(10.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=recorded,
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._latest_forward_hour",
+            return_value=delayed_hour,
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
+    ):
+        await _import_cost_summaries_with_estimates(
+            hass,
+            entry,
+            up,
+            utility_display_name="Milton Hydro",
+        )
+
+    assert recorded.await_args.args[4] == delayed_hour + timedelta(hours=1)
+    assert len(add.call_args.args[2]) == 1
 
 
 def test_tiered_estimate_resets_tier_one_at_provisional_boundary() -> None:
