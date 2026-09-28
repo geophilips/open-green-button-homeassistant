@@ -24,6 +24,7 @@ import logging
 import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from homeassistant.core import CoreState
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -69,6 +70,7 @@ from .const import (
 from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
+    defer_recent_zero_placeholder_days,
     import_usage_statistics,
     response_needs_import_migration,
 )
@@ -221,6 +223,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         )
 
         response = await self._fetch(published_min, published_max)
+        response = self._defer_provisional_readings(response, now)
 
         total_readings = sum(len(s.readings) for up in response.usage_points for s in up.series)
         _LOGGER.info(
@@ -265,6 +268,22 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 # cost pass; same escape. Defer to just after startup, where blocking is safe.
                 self._schedule_deferred_import_migration(response, had_prior_statistics)
         return response
+
+    def _defer_provisional_readings(self, response: UsageResponse, now: datetime) -> UsageResponse:
+        """Keep recent custodian zero placeholders out of statistics and cursor state."""
+        filtered, deferred = defer_recent_zero_placeholder_days(
+            response,
+            now=now,
+            local_timezone=ZoneInfo(self.hass.config.time_zone),
+        )
+        if deferred:
+            _LOGGER.info(
+                "Deferred %d recent zero-placeholder reading(s) for entry %s; a later poll "
+                "will retry the affected local day(s)",
+                deferred,
+                self.entry.entry_id,
+            )
+        return filtered
 
     async def _fetch(self, published_min: datetime, published_max: datetime) -> UsageResponse:
         """Call /proxy/usage for a window and persist any rotated credentials.
@@ -1083,6 +1102,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         finally:
             self._force_full_history = False
 
+        response = self._defer_provisional_readings(response, now)
         total_readings = sum(len(s.readings) for up in response.usage_points for s in up.series)
         _LOGGER.info(
             "Rebuild for entry %s: fetched %d usage point(s) with %d total reading(s)",

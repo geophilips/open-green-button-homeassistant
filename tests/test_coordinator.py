@@ -1408,18 +1408,18 @@ async def test_import_migration_rebuilds_entry_wiped_by_revision_1(hass: HomeAss
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
 
-async def test_import_migration_does_not_rebuild_repaired_entry_twice(
+async def test_import_migration_rebuilds_milton_shape_for_zero_placeholder_fix(
     hass: HomeAssistant,
 ) -> None:
-    """An entry already at revision 1 with an hourly feed is stamped forward, not rebuilt again.
+    """A Milton-shaped entry at revision 3 rebuilds once for provisional zero damage.
 
-    Milton's register spans 24 hours, but it's excluded in favour of its hourly DELTA_DATA
-    sibling — so its stored rows never came from a multi-hour reading and revision 2 doesn't
-    apply. Re-pulling its whole history would be pure waste.
+    The bad zero placeholders may be gone from the current response by upgrade time. The stable
+    signal is Milton's hourly DELTA_DATA plus its same-flow cumulative register companion, so a
+    previously current entry still needs one full rebuild under revision 4.
     """
     hass.set_state(CoreState.running)
     entry = _entry(hass)
-    _stamp(hass, entry, 1)
+    _stamp(hass, entry, 3)
     api = _api_returning(_response_with_cumulative_register())
     coordinator = GreenButtonCoordinator(hass, api, entry)
 
@@ -1427,8 +1427,8 @@ async def test_import_migration_does_not_rebuild_repaired_entry_twice(
     with has_stats, clear as clear_mock, _import:
         await coordinator.async_refresh()
 
-    api.fetch_usage.assert_awaited_once()  # no rebuild re-fetch
-    clear_mock.assert_not_awaited()
+    assert api.fetch_usage.await_count == 2  # poll, then full-history repair
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
 

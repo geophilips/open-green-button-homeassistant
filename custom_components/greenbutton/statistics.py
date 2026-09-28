@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import TYPE_CHECKING
 
 from homeassistant.components.recorder.statistics import (
@@ -28,7 +29,8 @@ from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.start import async_at_started
 
-from .const import DOMAIN
+from .api import UsageReading
+from .const import DOMAIN, PROVISIONAL_ZERO_DAY_GRACE
 from .tou import cost_detail_tou_bucket, ontario_tou_bucket
 
 if TYPE_CHECKING:
@@ -224,6 +226,12 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     1: response_has_cumulative_series,
     2: response_has_multi_hour_readings,
     3: response_cost_may_be_missing_bills,
+    # The same-flow cumulative companion is the stable fingerprint of the Milton-shaped feed
+    # whose recent hourly series carries provisional zero placeholders. The bad zeros may have
+    # disappeared by the time this code first polls, so the repair cannot key off seeing a zero
+    # tail in this particular response; the feed shape is what tells us its stored rows are
+    # suspect and need one rebuild.
+    4: response_has_cumulative_series,
 }
 
 
@@ -480,6 +488,86 @@ def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:
         for s in up.series
         if s.reading_type.flow_direction == "FORWARD" and _is_interval_consumption_series(up, s)
     ]
+
+
+def defer_recent_zero_placeholder_days(
+    response: UsageResponse,
+    *,
+    now: datetime,
+    local_timezone: tzinfo,
+) -> tuple[UsageResponse, int]:
+    """Remove recent local days whose feed ends in provisional zero placeholders.
+
+    Milton Hydro exposes two same-flow series for one UsagePoint: hourly ``DELTA_DATA`` and a
+    cumulative ``BULK_QUANTITY`` register. Before a local day is finalized, its hourly series
+    still contains all 24 records, but the unpublished suffix is filled with zero values. A later
+    poll replaces those zeros with real usage. Importing the first version is irreversible in our
+    cumulative HA statistic: the resume guard correctly refuses to rewrite an old hour, so the day
+    remains permanently low.
+
+    The cumulative companion is the feed-shape fingerprint that scopes this workaround narrowly.
+    When a recent local date's last available interval is zero, quarantine that date and every
+    newer reading on the UsagePoint. Trimming every sibling series is deliberate: the per-meter
+    cursor must remain behind the deferred usage too. After ``PROVISIONAL_ZERO_DAY_GRACE`` the
+    zeros are accepted as genuine, bounding the delay for an outage or an empty property.
+
+    Returns the filtered immutable response plus the number of deferred readings.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    cutoff = now.astimezone(UTC) - PROVISIONAL_ZERO_DAY_GRACE
+    deferred = 0
+    usage_points: list[UsagePoint] = []
+
+    for up in response.usage_points:
+        forward = _forward_interval_series(up)
+        has_cumulative_companion = any(
+            series.reading_type.flow_direction == "FORWARD"
+            and not _is_interval_consumption_series(up, series)
+            for series in up.series
+        )
+        if not forward or not has_cumulative_companion:
+            usage_points.append(up)
+            continue
+
+        suspicious_dates: list[date] = []
+        for series in forward:
+            by_date: dict[date, list[UsageReading]] = {}
+            for reading in sorted(series.readings, key=lambda item: item.start):
+                local_date = reading.start.astimezone(local_timezone).date()
+                by_date.setdefault(local_date, []).append(reading)
+
+            for local_date, readings in by_date.items():
+                last = readings[-1]
+                day_end_local = datetime.combine(
+                    local_date + timedelta(days=1), time.min, tzinfo=local_timezone
+                )
+                if (
+                    last.value == 0
+                    and (last.cost is None or last.cost == 0)
+                    and day_end_local.astimezone(UTC) > cutoff
+                ):
+                    suspicious_dates.append(local_date)
+
+        if not suspicious_dates:
+            usage_points.append(up)
+            continue
+
+        first_provisional_date = min(suspicious_dates)
+        filtered_series: list[MeterReadingSeries] = []
+        for series in up.series:
+            kept = [
+                reading
+                for reading in series.readings
+                if reading.start.astimezone(local_timezone).date() < first_provisional_date
+            ]
+            deferred += len(series.readings) - len(kept)
+            filtered_series.append(replace(series, readings=kept))
+        usage_points.append(replace(up, series=filtered_series))
+
+    if deferred == 0:
+        return response, 0
+    return replace(response, usage_points=usage_points), deferred
 
 
 def _has_interval_cost(up: UsagePoint) -> bool:

@@ -43,6 +43,13 @@ INITIAL_FETCH_LOOKBACK = timedelta(days=2 * 365)
 # on a multi-hour-to-multi-day lag, so a daily poll captures everything without over-polling.
 DEFAULT_SCAN_INTERVAL = timedelta(days=1)
 
+# Some custodians publish a complete-looking local day before every interval is finalized,
+# filling the not-yet-ready suffix with zero-valued readings. Those zeros must remain
+# provisional long enough for a later poll to replace them with the real values. After this
+# grace period they are accepted as genuine (for example, a long power outage), so a truly
+# zero-consumption account cannot be deferred forever.
+PROVISIONAL_ZERO_DAY_GRACE = timedelta(hours=48)
+
 # A utility whose permitted cadence is exactly this may be anchored to a local wall-clock time
 # instead of drifting with whenever HA last started. Named separately from DEFAULT_SCAN_INTERVAL
 # because the two mean different things — this one is "a cadence a clock time can express".
@@ -238,7 +245,11 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       billed through UsageSummary; feeds that itemize per-interval <cost> never ran the
 #       selection and are stamped forward untouched. Usage rows are unaffected — the damage is
 #       cost, and it is damage by omission, which is why nobody reported it as wrong data.
-IMPORT_LOGIC_REVISION = 3
+#   4 — Milton Hydro publishes recent, incomplete local days with zero placeholders for the
+#       hours it has not finalized yet. Those hours were imported and then treated as immutable,
+#       permanently understating the day even after Milton corrected its feed. Affected feeds are
+#       identified by the hourly interval series plus same-flow cumulative-register companion.
+IMPORT_LOGIC_REVISION = 4
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

@@ -10,6 +10,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.recorder import get_instance
@@ -35,6 +36,7 @@ from custom_components.greenbutton.api import (
 from custom_components.greenbutton.const import DOMAIN
 from custom_components.greenbutton.statistics import (
     _recorded_forward_hours,
+    defer_recent_zero_placeholder_days,
     import_usage_statistics,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
@@ -598,6 +600,119 @@ def _series(
             else readings
         ),
     )
+
+
+def test_recent_zero_placeholder_day_is_deferred_with_all_newer_siblings() -> None:
+    """A Milton-shaped recent zero tail stays out of both statistics and cursor inputs."""
+    timezone = ZoneInfo("America/Toronto")
+    prior = datetime(2026, 9, 27, 3, tzinfo=UTC)  # Sep 26 23:00 local
+    day_start = datetime(2026, 9, 27, 4, tzinfo=UTC)  # Sep 27 00:00 local
+    hourly = [UsageReading(prior, 3600, 420.0)]
+    hourly.extend(
+        UsageReading(
+            day_start + timedelta(hours=hour),
+            3600,
+            400.0 if hour < 13 else 0.0,
+        )
+        for hour in range(24)
+    )
+    hourly.append(UsageReading(datetime(2026, 9, 28, 5, tzinfo=UTC), 3600, 0.0))
+    register = [
+        UsageReading(datetime(2026, 9, 26, 17, tzinfo=UTC), 86400, 140_000_000.0),
+        UsageReading(datetime(2026, 9, 27, 5, tzinfo=UTC), 86400, 141_000_000.0),
+    ]
+    response = UsageResponse(
+        updated=None,
+        usage_points=[
+            UsagePoint(
+                usage_point_id="up1",
+                service_kind="electricity",
+                series=[
+                    _series("DELTA_DATA", meter_reading_id="hourly", readings=hourly),
+                    _series("BULK_QUANTITY", meter_reading_id="register", readings=register),
+                ],
+            )
+        ],
+        new_credentials=None,
+    )
+
+    filtered, deferred = defer_recent_zero_placeholder_days(
+        response,
+        now=datetime(2026, 9, 28, 16, tzinfo=UTC),
+        local_timezone=timezone,
+    )
+
+    assert deferred == 26
+    assert filtered.usage_points[0].series[0].readings == [hourly[0]]
+    assert filtered.usage_points[0].series[1].readings == register[:1]
+
+
+def test_old_trailing_zero_day_is_eventually_accepted() -> None:
+    """A real outage cannot be deferred forever: old zeroes pass after the grace period."""
+    timezone = ZoneInfo("America/Toronto")
+    start = datetime(2026, 9, 27, 4, tzinfo=UTC)
+    hourly = [UsageReading(start + timedelta(hours=hour), 3600, 0.0) for hour in range(24)]
+    response = UsageResponse(
+        updated=None,
+        usage_points=[
+            UsagePoint(
+                usage_point_id="up1",
+                service_kind="electricity",
+                series=[
+                    _series("DELTA_DATA", meter_reading_id="hourly", readings=hourly),
+                    _series(
+                        "BULK_QUANTITY",
+                        meter_reading_id="register",
+                        readings=[UsageReading(start, 86400, 140_000_000.0)],
+                    ),
+                ],
+            )
+        ],
+        new_credentials=None,
+    )
+
+    filtered, deferred = defer_recent_zero_placeholder_days(
+        response,
+        now=datetime(2026, 10, 1, 12, tzinfo=UTC),
+        local_timezone=timezone,
+    )
+
+    assert deferred == 0
+    assert filtered is response
+
+
+def test_zero_without_cumulative_companion_is_not_deferred() -> None:
+    """Ordinary interval feeds retain legitimate recent zero-consumption hours."""
+    timezone = ZoneInfo("America/Toronto")
+    start = datetime(2026, 9, 27, 4, tzinfo=UTC)
+    response = UsageResponse(
+        updated=None,
+        usage_points=[
+            UsagePoint(
+                usage_point_id="up1",
+                service_kind="electricity",
+                series=[
+                    _series(
+                        "DELTA_DATA",
+                        readings=[
+                            UsageReading(start, 3600, 400.0),
+                            UsageReading(start + timedelta(hours=1), 3600, 0.0),
+                        ],
+                    )
+                ],
+            )
+        ],
+        new_credentials=None,
+    )
+
+    filtered, deferred = defer_recent_zero_placeholder_days(
+        response,
+        now=datetime(2026, 9, 28, 16, tzinfo=UTC),
+        local_timezone=timezone,
+    )
+
+    assert deferred == 0
+    assert filtered is response
 
 
 def _accumulation_response(
