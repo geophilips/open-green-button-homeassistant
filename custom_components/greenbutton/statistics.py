@@ -14,8 +14,9 @@ the id format — never construct one ad-hoc elsewhere.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from statistics import median
 from typing import TYPE_CHECKING
 
@@ -29,7 +30,13 @@ from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.start import async_at_started
 
-from .const import CONF_TIER_COST_ESTIMATES, CONF_UTILITY_ID, DOMAIN
+from .api import UsageReading
+from .const import (
+    CONF_TIER_COST_ESTIMATES,
+    CONF_UTILITY_ID,
+    DOMAIN,
+    PROVISIONAL_ZERO_DAY_GRACE,
+)
 from .tou import cost_detail_tou_bucket, ontario_tou_bucket
 
 if TYPE_CHECKING:
@@ -100,12 +107,7 @@ class _TieredEstimateState:
 
 
 def _tiered_estimates_supported(entry: ConfigEntry) -> bool:
-    """True only for the verified Milton Hydro feed shape.
-
-    Ontario thresholds and Milton's Block/Tier summary labels are utility-specific. Keeping the
-    gate here prevents a coincidentally similar line item from enabling estimates for Burlington,
-    Elexicon, or a future non-Ontario utility.
-    """
+    """True only for the verified Milton Hydro feed shape."""
     return entry.data.get(CONF_UTILITY_ID) == _MILTON_UTILITY_ID
 
 
@@ -164,12 +166,7 @@ def _store_tiered_estimate_state(
     usage_point_id: str,
     state: _TieredEstimateState,
 ) -> None:
-    """Persist estimate state without triggering a config-entry reload.
-
-    The integration intentionally has no broad update listener: the coordinator already writes
-    cursors and rotated credentials into entry.data on every poll. This state write relies on the
-    same invariant and is kept idempotent to avoid needless registry updates.
-    """
+    """Persist estimate state without triggering a config-entry reload."""
     raw_states = entry.data.get(CONF_TIER_COST_ESTIMATES)
     all_states = dict(raw_states) if isinstance(raw_states, dict) else {}
     payload = {
@@ -202,8 +199,10 @@ def _clear_tiered_estimate_state(
         return
     all_states = dict(raw_states)
     del all_states[usage_point_id]
-    data = {**entry.data, CONF_TIER_COST_ESTIMATES: all_states}
-    hass.config_entries.async_update_entry(entry, data=data)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_TIER_COST_ESTIMATES: all_states},
+    )
 
 
 async def async_seed_tiered_estimate(
@@ -355,8 +354,108 @@ def response_has_cumulative_series(response: UsageResponse) -> bool:
     [coordinator.GreenButtonCoordinator._async_migrate_import].
     """
     return any(
-        not _is_interval_consumption_series(s) for up in response.usage_points for s in up.series
+        not _is_interval_consumption_series(up, s)
+        for up in response.usage_points
+        for s in up.series
     )
+
+
+def response_has_multi_hour_readings(response: UsageResponse) -> bool:
+    """True when [response] carries an importable reading that spans more than one hour.
+
+    The revision-2 signal (see [const.IMPORT_LOGIC_REVISION]). Such a reading used to be
+    written entirely into the hour it started in — a whole billing period's consumption as one
+    midnight spike — where it is now spread across the hours it covers ([_hours_spanned]).
+
+    Scoped to series that actually import, which is what keeps Milton Hydro off this path: its
+    daily ``BULK_QUANTITY`` register spans 24 hours, but it's excluded in favour of the hourly
+    ``DELTA_DATA`` sibling, so its stored rows never came from a multi-hour reading and it needs
+    no second rebuild. Hourly feeds (Burlington, Elexicon) are stamped forward untouched.
+    """
+    return any(
+        len(_hours_spanned(r.start, r.duration_seconds)) > 1
+        for up in response.usage_points
+        for s in up.series
+        if _is_interval_consumption_series(up, s)
+        for r in s.readings
+    )
+
+
+def response_cost_may_be_missing_bills(response: UsageResponse) -> bool | None:
+    """Whether [response] shows this entry's *cost* rows were built from only some of its bills.
+
+    The revision-3 signal. A summary that overlapped one already costed used to be rejected
+    outright as a duplicate, on the belief that consecutive periods only touch at an instant. They
+    share a meter-read day, so roughly every other bill was discarded and the cost statistic was
+    built from about half the money — where a later bill now replaces the earlier one's hours
+    instead (see [_import_cost_summaries]).
+
+    Unlike revisions 1 and 2, this can't be recognized from the overlap itself. Those were
+    properties of the *series*, present in every poll that carries readings; bills appear only in
+    the poll that publishes them, and a monthly utility hands over one at a time — so a pair of
+    overlapping periods would essentially never be in one response, and an entry judged on that
+    would be stamped "unaffected" and never repaired. The signal has to be the thing that is
+    stably observable: does this account cost from ``UsageSummary`` at all?
+
+      - **True** — some usage point bills through summaries. Its stored cost is suspect, because
+        we can't see from here which bills the old rule dropped.
+      - **False** — every usage point itemizes per-interval ``<cost>`` (savagedata/Milton,
+        Elexicon). Summary selection never ran for it, so nothing is wrong.
+      - **None** — this poll showed neither, so it tells us nothing either way. The caller waits
+        rather than stamping the entry as unaffected on absent evidence. An account whose utility
+        publishes no cost of any kind stays undecided indefinitely and re-checks each poll —
+        cheap, and it has no cost rows to repair regardless.
+    """
+    verdicts: list[bool | None] = []
+    for up in response.usage_points:
+        if up.summaries and not _has_interval_cost(up):
+            return True
+        # Per-interval cost settles it without needing a summary in this particular poll, which
+        # matters: it's what lets a savagedata-family account be cleared on an ordinary poll
+        # instead of waiting for a billing month to turn over.
+        verdicts.append(False if _has_interval_cost(up) else None)
+    if verdicts and all(v is False for v in verdicts):
+        return False
+    return None
+
+
+# Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
+# at revision N is tested against every predicate for a revision > N — so a user who skipped a
+# release still gets each repair they're owed, in one rebuild rather than one per revision.
+#
+# A predicate may return None for "this poll can't tell" — see [response_cost_may_be_missing_bills].
+_IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
+    1: response_has_cumulative_series,
+    2: response_has_multi_hour_readings,
+    3: response_cost_may_be_missing_bills,
+    # The same-flow cumulative companion is the stable fingerprint of the Milton-shaped feed
+    # whose recent hourly series carries provisional zero placeholders. The bad zeros may have
+    # disappeared by the time this code first polls, so the repair cannot key off seeing a zero
+    # tail in this particular response; the feed shape is what tells us its stored rows are
+    # suspect and need one rebuild.
+    4: response_has_cumulative_series,
+}
+
+
+def response_needs_import_migration(response: UsageResponse, stamped_revision: int) -> bool | None:
+    """Whether [response]'s shape shows this entry's rows were produced by a since-fixed bug.
+
+    [stamped_revision] is the entry's ``CONF_IMPORT_LOGIC_REVISION`` (0 when never stamped).
+
+    Returns None when no predicate found an offending shape but at least one couldn't tell from
+    this response — "not yet", not "no". Stamping an entry as unaffected on that would close the
+    repair permanently, which is the one outcome none of this may produce.
+    """
+    verdicts = [
+        check(response)
+        for revision, check in _IMPORT_MIGRATION_CHECKS.items()
+        if revision > stamped_revision
+    ]
+    if any(v is True for v in verdicts):
+        return True
+    if any(v is None for v in verdicts):
+        return None
+    return False
 
 
 def _slugify(component: str) -> str:
@@ -395,7 +494,7 @@ async def import_usage_statistics(
     for up in response.usage_points:
         imported_any = False
         for series in up.series:
-            if not _is_interval_consumption_series(series):
+            if not _is_interval_consumption_series(up, series):
                 _warn_once(
                     f"{entry.entry_id}:{up.usage_point_id}:{series.meter_reading_id}:cumulative",
                     "Skipping meter reading %s on usage point %s: accumulation behaviour %s is a "
@@ -407,19 +506,25 @@ async def import_usage_statistics(
                     series.reading_type.accumulation_behaviour,
                 )
                 continue
-            imported_any = True
-            await _import_series(hass, entry, up, series, utility_display_name, fresh=fresh)
+            # Call first, then OR — `or` short-circuits, and every series must be imported.
+            imported = await _import_series(
+                hass, entry, up, series, utility_display_name, fresh=fresh
+            )
+            imported_any = imported or imported_any
         if up.series and not imported_any:
-            # Every series was a cumulative register. Deriving deltas from a register is
-            # possible in principle but isn't implemented, so this usage point contributes no
-            # energy at all — loud, because the symptom is an empty Energy dashboard.
+            # Nothing on this usage point could be represented. Since a register is now only
+            # excluded when a same-flow sibling supersedes it (see
+            # [_is_interval_consumption_series]), reaching here means every series carried a
+            # unit we have no HA mapping for. The usage point contributes no energy at all —
+            # loud, because the symptom is an empty Energy dashboard.
             _LOGGER.error(
-                "Usage point %s has no per-interval consumption series — every one of its %d "
-                "series is a cumulative meter register (%s). No energy statistics will be "
-                "written for it; please report this feed at %s",
+                "Usage point %s has no importable consumption series — all %d were skipped "
+                "(accumulation behaviours: %s; units: %s). No energy statistics will be written "
+                "for it; please report this feed at %s",
                 up.usage_point_id,
                 len(up.series),
                 ", ".join(sorted({s.reading_type.accumulation_behaviour for s in up.series})),
+                ", ".join(sorted({s.reading_type.unit_of_measure for s in up.series})),
                 "https://github.com/rocketraman/open-green-button-homeassistant/issues",
             )
 
@@ -429,9 +534,7 @@ async def import_usage_statistics(
     # distribute the bill, so the usage writes above must be committed first. Block once here; on a
     # fresh rebuild the period's usage was written moments ago and would otherwise not be visible.
     needs_recorder_flush = any(
-        not _has_interval_cost(up)
-        and (up.summaries or _load_tiered_estimate_state(entry, up.usage_point_id) is not None)
-        for up in response.usage_points
+        not _has_interval_cost(up) and up.summaries for up in response.usage_points
     )
 
     if needs_recorder_flush and hass.state is not CoreState.running:
@@ -516,6 +619,11 @@ _CUMULATIVE_ACCUMULATION = frozenset(
     }
 )
 
+# Seconds of hourly coverage we forgive before calling an hour partial. ESPI durations use an
+# inclusive end (a 29-day billing period is 2505599s), so the final hour of any spread reading is
+# one second short of full. See [_drop_incomplete_trailing_hour].
+_HOUR_COVERAGE_SLACK = 1
+
 # Keys already logged at WARNING by [_warn_once], so a permanent condition doesn't repeat the
 # warning on every poll. Module-level (not per-entry) and never pruned: it holds a handful of
 # short strings for the lifetime of the process, and a full HA restart re-arms every warning.
@@ -537,7 +645,7 @@ def _warn_once(key: str, msg: str, *args: object) -> None:
     _LOGGER.warning(msg, *args)
 
 
-def _is_interval_consumption_series(series: MeterReadingSeries) -> bool:
+def _is_interval_consumption_series(up: UsagePoint, series: MeterReadingSeries) -> bool:
     """True when a series' readings are per-interval quantities we can sum into a statistic.
 
     False for cumulative meter registers. Milton Hydro publishes an hourly ``DELTA_DATA``
@@ -545,8 +653,33 @@ def _is_interval_consumption_series(series: MeterReadingSeries) -> bool:
     both FORWARD — so both map to one [statistic_id_for_series] and the register's
     meter-lifetime total was being added to the hourly running sum, reporting an enormous
     false spike (issue #6).
+
+    The accumulation behaviour ALONE can't make that call, because utilities mislabel it.
+    Consumers Energy (via UtilityAPI) publishes one reading per billing period — genuine
+    per-period consumption, values that rise and fall month to month (446–1246 kWh) — tagged
+    ``BULK_QUANTITY``. Excluding on the name alone dropped 100% of that feed, left an empty
+    Energy dashboard, and (via [response_has_cumulative_series]) triggered a repair rebuild
+    that purged the account's existing rows and re-imported nothing.
+
+    So a cumulative-named series is only excluded when this UsagePoint also carries a
+    non-cumulative series of the *same flow direction* — which is precisely the statistic_id
+    collision that motivated #6, and a strictly better source to resolve it in favour of. With
+    no such sibling the series is everything the utility publishes, and importing it is the
+    only way the account gets any energy at all. Flow direction matters: a FORWARD register
+    alongside a REVERSE delta series is not a collision, and excluding it would drop the only
+    consumption data there is.
+
+    Testing the values for monotonicity instead does NOT work here: each Consumers Energy
+    MeterReading holds exactly one reading, and a one-element series is trivially
+    non-decreasing, so every one of them would still read as a register.
     """
-    return series.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION
+    if series.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION:
+        return True
+    return not any(
+        other.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION
+        and other.reading_type.flow_direction == series.reading_type.flow_direction
+        for other in up.series
+    )
 
 
 def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:
@@ -559,8 +692,88 @@ def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:
     return [
         s
         for s in up.series
-        if s.reading_type.flow_direction == "FORWARD" and _is_interval_consumption_series(s)
+        if s.reading_type.flow_direction == "FORWARD" and _is_interval_consumption_series(up, s)
     ]
+
+
+def defer_recent_zero_placeholder_days(
+    response: UsageResponse,
+    *,
+    now: datetime,
+    local_timezone: tzinfo,
+) -> tuple[UsageResponse, int]:
+    """Remove recent local days whose feed ends in provisional zero placeholders.
+
+    Milton Hydro exposes two same-flow series for one UsagePoint: hourly ``DELTA_DATA`` and a
+    cumulative ``BULK_QUANTITY`` register. Before a local day is finalized, its hourly series
+    still contains all 24 records, but the unpublished suffix is filled with zero values. A later
+    poll replaces those zeros with real usage. Importing the first version is irreversible in our
+    cumulative HA statistic: the resume guard correctly refuses to rewrite an old hour, so the day
+    remains permanently low.
+
+    The cumulative companion is the feed-shape fingerprint that scopes this workaround narrowly.
+    When a recent local date's last available interval is zero, quarantine that date and every
+    newer reading on the UsagePoint. Trimming every sibling series is deliberate: the per-meter
+    cursor must remain behind the deferred usage too. After ``PROVISIONAL_ZERO_DAY_GRACE`` the
+    zeros are accepted as genuine, bounding the delay for an outage or an empty property.
+
+    Returns the filtered immutable response plus the number of deferred readings.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    cutoff = now.astimezone(UTC) - PROVISIONAL_ZERO_DAY_GRACE
+    deferred = 0
+    usage_points: list[UsagePoint] = []
+
+    for up in response.usage_points:
+        forward = _forward_interval_series(up)
+        has_cumulative_companion = any(
+            series.reading_type.flow_direction == "FORWARD"
+            and not _is_interval_consumption_series(up, series)
+            for series in up.series
+        )
+        if not forward or not has_cumulative_companion:
+            usage_points.append(up)
+            continue
+
+        suspicious_dates: list[date] = []
+        for series in forward:
+            by_date: dict[date, list[UsageReading]] = {}
+            for reading in sorted(series.readings, key=lambda item: item.start):
+                local_date = reading.start.astimezone(local_timezone).date()
+                by_date.setdefault(local_date, []).append(reading)
+
+            for local_date, readings in by_date.items():
+                last = readings[-1]
+                day_end_local = datetime.combine(
+                    local_date + timedelta(days=1), time.min, tzinfo=local_timezone
+                )
+                if (
+                    last.value == 0
+                    and (last.cost is None or last.cost == 0)
+                    and day_end_local.astimezone(UTC) > cutoff
+                ):
+                    suspicious_dates.append(local_date)
+
+        if not suspicious_dates:
+            usage_points.append(up)
+            continue
+
+        first_provisional_date = min(suspicious_dates)
+        filtered_series: list[MeterReadingSeries] = []
+        for series in up.series:
+            kept = [
+                reading
+                for reading in series.readings
+                if reading.start.astimezone(local_timezone).date() < first_provisional_date
+            ]
+            deferred += len(series.readings) - len(kept)
+            filtered_series.append(replace(series, readings=kept))
+        usage_points.append(replace(up, series=filtered_series))
+
+    if deferred == 0:
+        return response, 0
+    return replace(response, usage_points=usage_points), deferred
 
 
 def _has_interval_cost(up: UsagePoint) -> bool:
@@ -589,9 +802,16 @@ async def _import_series(
     utility_display_name: str,
     *,
     fresh: bool = False,
-) -> None:
+) -> bool:
+    """Import one series. Returns False only when its unit has no HA mapping.
+
+    The return value feeds the "this usage point imported nothing" check in
+    [import_usage_statistics], so it reports *representability*, not whether rows were
+    actually written: an empty or fully stale-filtered series is a normal quiet poll, not a
+    misconfigured feed, and must not trip that error.
+    """
     if not series.readings:
-        return  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
+        return True  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
 
     statistic_id = statistic_id_for_series(
         entry.entry_id,
@@ -608,7 +828,7 @@ async def _import_series(
             series.reading_type.commodity,
             series.reading_type.unit_of_measure,
         )
-        return
+        return False
 
     metadata: StatisticMetaData = {
         "has_mean": False,
@@ -648,7 +868,7 @@ async def _import_series(
         stats.append(StatisticData(start=hour, state=running, sum=running))
 
     if not stats:
-        return
+        return True
 
     _LOGGER.info(
         "Importing %d statistic rows for %s (resume_from_sum=%.3f)",
@@ -657,6 +877,7 @@ async def _import_series(
         resume_from_sum,
     )
     async_add_external_statistics(hass, metadata, stats)
+    return True
 
 
 def _hourly_totals(series: MeterReadingSeries) -> tuple[dict[datetime, float], dict[datetime, int]]:
@@ -674,14 +895,55 @@ def _hourly_totals(series: MeterReadingSeries) -> tuple[dict[datetime, float], d
 
     Summing per hour here makes each hour exactly one row, so the row we write and the cursor
     we later resume from describe the same unit of time.
+
+    A reading LONGER than an hour is spread across the hours it spans — see [_hours_spanned].
     """
     by_hour: dict[datetime, float] = {}
     covered_seconds: dict[datetime, int] = {}
     for reading in series.readings:
-        hour = _align_to_hour(reading.start)
-        by_hour[hour] = by_hour.get(hour, 0.0) + _to_ha_units(reading.value, series.reading_type)
-        covered_seconds[hour] = covered_seconds.get(hour, 0) + reading.duration_seconds
+        value = _to_ha_units(reading.value, series.reading_type)
+        for hour, overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
+            by_hour[hour] = by_hour.get(hour, 0.0) + value * fraction
+            covered_seconds[hour] = covered_seconds.get(hour, 0) + overlap
     return by_hour, covered_seconds
+
+
+def _hours_spanned(start: datetime, duration_seconds: int) -> list[tuple[datetime, int, float]]:
+    """Split ``[start, start+duration)`` into ``(hour_start, seconds_in_hour, fraction)`` triples.
+
+    ``fraction`` is that hour's share of the reading and sums to 1.0 across the result, so
+    callers multiply rather than divide — a reading with a degenerate duration can't produce a
+    division by zero at a call site.
+
+    Sub-hourly and exactly-hourly readings yield a single pair, so the common path is
+    unchanged. The point is readings that span MANY hours: a billing-only utility publishes
+    one reading per billing period, and folding that to ``_align_to_hour(start)`` alone wrote
+    a whole month's consumption into the period's first hour — an ~900 kWh spike at midnight
+    on day one and nothing for the remaining ~700 hours. Consumers Energy (via UtilityAPI)
+    publishes exactly this: 23 months of history arrived as 23 statistic rows.
+
+    Distributing evenly across the period does not invent detail the feed doesn't have — the
+    hourly shape is unknowable from a monthly total — but it is the only representation HA's
+    hourly statistics can carry, it makes daily/monthly dashboard rollups correct, and it
+    matches what [_import_cost_summaries] already does with a monthly bill.
+
+    Degenerate durations (0 or negative — a malformed feed) fall back to the single aligned
+    hour so the reading is still imported rather than silently vanishing.
+    """
+    if duration_seconds <= 0:
+        return [(_align_to_hour(start), 0, 1.0)]
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    end = start + timedelta(seconds=duration_seconds)
+    spans: list[tuple[datetime, int, float]] = []
+    hour = _align_to_hour(start)
+    while hour < end:
+        hour_end = hour + timedelta(hours=1)
+        overlap = int((min(end, hour_end) - max(start, hour)).total_seconds())
+        if overlap > 0:
+            spans.append((hour, overlap, overlap / duration_seconds))
+        hour = hour_end
+    return spans
 
 
 def _drop_incomplete_trailing_hour(
@@ -702,12 +964,18 @@ def _drop_incomplete_trailing_hour(
     and is imported as-is. An hour with no duration information at all (0s covered) is left
     alone rather than deferred forever. Hourly feeds — every utility in scope today — cover a
     full 3600s per hour and never trip this.
+
+    [_HOUR_COVERAGE_SLACK] accounts for ESPI's inclusive-end durations: a 29-day billing period
+    is published as 2505599s, not 2505600, so the last hour of a spread reading lands exactly
+    one second short. Without the slack that hour is deferred on every closed billing period —
+    and never imported, because a closed period is never re-published — quietly losing ~0.14%
+    of each month and leaving the summed hours short of the bill the cost pass divides by.
     """
     if not by_hour:
         return
     last_hour = max(by_hour)
     covered = covered_seconds.get(last_hour, 0)
-    if 0 < covered < 3600:
+    if 0 < covered < 3600 - _HOUR_COVERAGE_SLACK:
         _LOGGER.debug(
             "Deferring partial hour %s for %s (%ds of 3600 covered) until the feed completes it",
             last_hour.isoformat(),
@@ -727,58 +995,6 @@ def _stat_display_name(
     short_id = up.usage_point_id[:8]
     flow = series.reading_type.flow_direction.title()
     return f"{utility_display_name} · {up.service_kind.title()} {flow} ({short_id})"
-
-
-def _select_billing_summaries(summaries: list[BillingSummary]) -> list[BillingSummary]:
-    """Pick a non-overlapping, deduplicated set of summaries, in billing-period order.
-
-    A single ESPI feed frequently carries more than one ``UsageSummary`` covering the same
-    hours — exact duplicates repeated across the paginated feed, and/or rollup summaries at a
-    coarser granularity (e.g. a 12-month total alongside the per-bill totals). The cost
-    importer distributes each summary's *full* period total across its hours and **adds** the
-    result into one cumulative statistic, so any overlap multiplies the cost the Energy
-    dashboard shows for those hours (a single duplicated bill doubles it; a handful of
-    overlapping rollups can inflate it several-fold) while leaving energy untouched.
-
-    We defend against that here by choosing a maximal non-overlapping subset:
-
-      - Shortest duration first, so the summary most specific to a single bill wins over a
-        rollup that spans it.
-      - Higher total cost breaks ties, so a real bill beats a $0 placeholder for the same
-        period (test-lab feeds emit those).
-      - A summary is dropped when its ``[start, end)`` window overlaps one already kept.
-
-    Consecutive real billing periods share only their boundary instant, which is half-open
-    here, so they never collide — only genuine duplicates and coarser rollups get dropped.
-    """
-    # Shortest-first, then earliest, then most-expensive — see docstring for the rationale.
-    ordered = sorted(
-        summaries,
-        key=lambda s: (
-            s.billing_period_duration_seconds,
-            s.billing_period_start,
-            -s.total_cost,
-        ),
-    )
-    accepted: list[BillingSummary] = []
-    accepted_intervals: list[tuple[datetime, datetime]] = []
-    for summary in ordered:
-        start = summary.billing_period_start
-        end = start + timedelta(seconds=summary.billing_period_duration_seconds)
-        if any(start < a_end and a_start < end for a_start, a_end in accepted_intervals):
-            _LOGGER.debug(
-                "Dropping overlapping billing summary %s (+%ds, total_cost=%.2f) — its hours "
-                "are already costed by a more specific summary",
-                start.isoformat(),
-                summary.billing_period_duration_seconds,
-                summary.total_cost,
-            )
-            continue
-        accepted.append(summary)
-        accepted_intervals.append((start, end))
-
-    accepted.sort(key=lambda s: s.billing_period_start)
-    return accepted
 
 
 async def _recorded_forward_hours(
@@ -832,16 +1048,9 @@ async def _forward_hours_for_cost(
 ) -> list[tuple[datetime, float]]:
     """Return recorded usage plus FORWARD hours delivered by the current response.
 
-    Cost estimation normally reads the cumulative usage statistic back from the recorder so it
-    can price the entire open billing period.  The newest readings, however, are queued for
-    recorder import earlier in the same coordinator update.  On a real recorder those rows can
-    still be absent from a concurrent read even after the queue synchronization point, leaving
-    cost one poll behind usage.  Six-hour polling hid that lag; daily polling leaves yesterday's
-    cost incomplete until the next morning.
-
-    Merge the normalized interval readings already in this response over the recorder result.
-    The recorder remains the source for older hours outside the rolling response window, while
-    response values make the current poll self-contained and override an overlapping stored row.
+    The newest usage writes can still be queued when the cost pass reads the recorder. Merge the
+    current response over the stored rows so a daily poll prices every hour it just imported,
+    rather than leaving cost one poll behind usage.
     """
     recorded = await _recorded_forward_hours(hass, entry, up, period_start, period_end)
     response_by_hour: dict[datetime, float] = {}
@@ -858,121 +1067,13 @@ async def _forward_hours_for_cost(
     return sorted(merged.items())
 
 
-async def _import_cost_summaries(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    up: UsagePoint,
-    utility_display_name: str,
-    *,
-    fresh: bool = False,
-) -> None:
-    """Write a cumulative-cost statistic from this UsagePoint's BillingSummary entries.
-
-    HA's Energy dashboard pairs an energy stat with a cost stat at config time, and reads
-    them at the *same* time-bucket granularity as the energy stat (hourly). A single-value
-    cost stat at billing_period_start would show non-zero for one hour and zero for every
-    other hour — which is exactly the "shows as zero" symptom users see.
-
-    Instead, we distribute each billing-period total across the hours within that period
-    in proportion to that hour's consumption:
-
-        cost_at_hour_h = period_total_cost × (kwh_h / total_kwh_in_period)
-
-    This gives a per-hour cost that the dashboard aggregates into daily/monthly views
-    correctly, and matches the way a utility actually bills (you pay for the energy you
-    used, and a higher-consumption hour incurs more of the period's total cost). Real-world
-    accuracy depends on whether the utility's pricing is flat or TOU; the test lab is
-    flat, while production TOU pricing would want richer cost-detail handling
-    (future work).
-
-    The period's usage comes from the **recorder**, not this response: a UsageSummary is
-    published weeks after its period closes, so an incremental poll that carries a freshly-
-    published summary does NOT carry that period's readings (they were imported long ago). We
-    read them back from the usage statistic ([_recorded_forward_hours]) to distribute over.
-    This is why a plain published-min poll is enough to keep cost current — no reach-back needed.
-
-    Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary
-    to accounts they bill; meter-only test profiles often won't), or when the currency code
-    isn't one we have an ISO 4217 alpha mapping for.
-    """
-    if not up.summaries:
-        return
-    currency_alpha = _iso_4217_alpha(up.summaries[0].currency_numeric_code)
-    if currency_alpha is None:
-        _LOGGER.debug(
-            "Skipping cost stat for usage point %s: currency code %s has no ISO 4217 mapping",
-            up.usage_point_id,
-            up.summaries[0].currency_numeric_code,
-        )
-        return
-
-    statistic_id = statistic_id_for_cost(entry.entry_id, up.usage_point_id)
-    metadata: StatisticMetaData = {
-        "has_mean": False,
-        "has_sum": True,
-        "name": (
-            f"{utility_display_name} · {up.service_kind.title()} Cost ({up.usage_point_id[:8]})"
-        ),
-        "source": DOMAIN,
-        "statistic_id": statistic_id,
-        "unit_of_measurement": currency_alpha,
-        # HA's recorder validates `unit_class` against the registered `BaseUnitConverter`
-        # families in `util.unit_conversion`. There's no MonetaryConverter (you can't
-        # convert CAD ↔ USD via a fixed-ratio table), so anything besides None throws
-        # `Unsupported unit_class: '<value>'` at metadata validation. None is the
-        # well-formed answer for currency stats — the 2026.11 deprecation warning still
-        # fires for it, but the warning isn't a hard error and HA hasn't introduced a
-        # monetary class to migrate to yet. Revisit when HA adds one.
-        "unit_class": None,
-    }
-    if _MEAN_TYPE_NONE is not None:
-        metadata["mean_type"] = _MEAN_TYPE_NONE
-
-    resume_from_sum, resume_after_epoch = (
-        (0.0, None) if fresh else await _resume_point(hass, statistic_id)
+def _summary_order(summary: BillingSummary) -> tuple[datetime, int, float]:
+    """Stable order shared by exact and provisional cost imports."""
+    return (
+        summary.billing_period_start,
+        -summary.billing_period_duration_seconds,
+        summary.total_cost,
     )
-
-    stats: list[StatisticData] = []
-    running = resume_from_sum
-    for summary in _select_billing_summaries(up.summaries):
-        period_cost = summary.total_cost
-        if period_cost == 0:
-            # Test-lab fixtures often have $0 placeholders — skip rather than emit a
-            # cumulative-flat row across an entire month.
-            continue
-        period_start = summary.billing_period_start
-        period_end = period_start + timedelta(seconds=summary.billing_period_duration_seconds)
-        # FORWARD consumption for the period, read back from the recorder (see the docstring).
-        # REVERSE flow (solar export) isn't part of consumption cost, so the usage stat we read
-        # here — the FORWARD series — is the right basis.
-        in_period = await _recorded_forward_hours(hass, entry, up, period_start, period_end)
-        total_period_kwh = sum(k for (_, k) in in_period)
-        if total_period_kwh <= 0:
-            # No recorded usage for this period yet (e.g. a bill whose period predates our usage
-            # backfill) — nothing to distribute the cost over; skip until/if the usage exists.
-            continue
-
-        # Per-hour cost = per-kWh TOU rate (zero if not a TOU bucket) + per-kWh non-TOU rate
-        # for everything else (Delivery, Global Adjustment, rebates, etc.). Sum of all hourly
-        # costs across the period equals the period's total bill — verified by construction.
-        cost_at_hour = _cost_distribution_for_period(summary, in_period, total_period_kwh)
-        for hour_start, _kwh in in_period:
-            if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
-                continue
-            running += cost_at_hour[hour_start]
-            stats.append(StatisticData(start=hour_start, state=running, sum=running))
-
-    if not stats:
-        return
-
-    _LOGGER.info(
-        "Importing %d cost rows for %s in %s (resume_from_sum=%.2f)",
-        len(stats),
-        statistic_id,
-        currency_alpha,
-        resume_from_sum,
-    )
-    async_add_external_statistics(hass, metadata, stats)
 
 
 async def _import_cost_summaries_with_estimates(
@@ -1013,7 +1114,7 @@ async def _import_cost_summaries_with_estimates(
     resume_from_sum, resume_after_epoch = (
         (0.0, None) if fresh else await _resume_point(hass, statistic_id)
     )
-    selected = _select_billing_summaries(up.summaries)
+    selected = sorted(up.summaries, key=_summary_order)
     stats: list[StatisticData] = []
     running = resume_from_sum
     rewrite_exact = False
@@ -1046,6 +1147,7 @@ async def _import_cost_summaries_with_estimates(
 
     last_written_summary: BillingSummary | None = None
     last_written_hours: list[tuple[datetime, float]] = []
+    cost_by_hour: dict[datetime, float] = {}
     for summary in summaries_to_write:
         if summary.total_cost == 0:
             continue
@@ -1055,18 +1157,21 @@ async def _import_cost_summaries_with_estimates(
         total_period_kwh = sum(kwh for _hour, kwh in in_period)
         if total_period_kwh <= 0:
             continue
-        cost_at_hour = _cost_distribution_for_period(summary, in_period, total_period_kwh)
-        for hour_start, _kwh in in_period:
-            if (
-                not rewrite_exact
-                and resume_after_epoch is not None
-                and hour_start.timestamp() <= resume_after_epoch
-            ):
-                continue
-            running += cost_at_hour[hour_start]
-            stats.append(StatisticData(start=hour_start, state=running, sum=running))
+        # Match the upstream exact-bill rule: later summaries replace overlapping hours instead
+        # of double-charging or squeezing a whole bill into its non-overlapping remainder.
+        cost_by_hour.update(_cost_distribution_for_period(summary, in_period, total_period_kwh))
         last_written_summary = summary
         last_written_hours = in_period
+
+    for hour_start in sorted(cost_by_hour):
+        if (
+            not rewrite_exact
+            and resume_after_epoch is not None
+            and hour_start.timestamp() <= resume_after_epoch
+        ):
+            continue
+        running += cost_by_hour[hour_start]
+        stats.append(StatisticData(start=hour_start, state=running, sum=running))
 
     estimate_state = saved_state
     if last_written_summary is not None and _tiered_estimates_supported(entry):
@@ -1295,20 +1400,205 @@ def _tiered_estimated_costs_with_provisional_rollover(
     predicted_days: float,
     predicted_period_end: datetime,
 ) -> dict[datetime, float]:
-    """Price a delayed-summary grace window with one provisional tier reset.
-
-    Milton can publish interval usage for several days after the predicted billing boundary
-    before it publishes the exact UsageSummary. Treat those hours as a provisional next period
-    so the Energy dashboard does not go to zero and the Tier 1 allowance resets at the predicted
-    boundary. When the exact summary arrives, the normal contiguous rewrite replaces both the
-    completed period and these provisional next-period rows from the actual boundary.
-    """
+    """Price a delayed-summary grace window with one provisional tier reset."""
     active_period_hours = [item for item in hours if item[0] < predicted_period_end]
     provisional_next_period_hours = [item for item in hours if item[0] >= predicted_period_end]
     return {
         **_tiered_estimated_costs(active_period_hours, profile, predicted_days),
         **_tiered_estimated_costs(provisional_next_period_hours, profile, predicted_days),
     }
+
+
+async def _import_cost_summaries(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    up: UsagePoint,
+    utility_display_name: str,
+    *,
+    fresh: bool = False,
+) -> None:
+    """Write a cumulative-cost statistic from this UsagePoint's BillingSummary entries.
+
+    HA's Energy dashboard pairs an energy stat with a cost stat at config time, and reads
+    them at the *same* time-bucket granularity as the energy stat (hourly). A single-value
+    cost stat at billing_period_start would show non-zero for one hour and zero for every
+    other hour — which is exactly the "shows as zero" symptom users see.
+
+    Instead, we distribute each billing-period total across the hours within that period
+    in proportion to that hour's consumption:
+
+        cost_at_hour_h = period_total_cost × (kwh_h / total_kwh_in_period)
+
+    This gives a per-hour cost that the dashboard aggregates into daily/monthly views
+    correctly, and matches the way a utility actually bills (you pay for the energy you
+    used, and a higher-consumption hour incurs more of the period's total cost). Real-world
+    accuracy depends on whether the utility's pricing is flat or TOU; the test lab is
+    flat, while production TOU pricing would want richer cost-detail handling
+    (future work).
+
+    The period's usage comes from the **recorder**, not this response: a UsageSummary is
+    published weeks after its period closes, so an incremental poll that carries a freshly-
+    published summary does NOT carry that period's readings (they were imported long ago). We
+    read them back from the usage statistic ([_recorded_forward_hours]) to distribute over.
+    This is why a plain published-min poll is enough to keep cost current — no reach-back needed.
+
+    **Overlapping periods: the later bill replaces the earlier one's hours, in full.** Feeds
+    routinely carry summaries covering hours another summary already covers. Consecutive bills
+    overlap by a meter-read day, because the period is inclusive of both reads — El Paso
+    Electric's twelve monthly bills each lap one day over the previous. Feeds also repeat exact
+    duplicates across pagination, and some publish a coarse rollup beside the per-bill totals.
+    Costing every one of them in full would charge the shared hours twice over.
+
+    So each summary prices every hour of its *own* period, and a summary applied later simply
+    overwrites what an earlier one wrote on any hour they share. Ordering is by period start, then
+    longest-first, then cheapest-first, so the most recent and most specific statement of an hour's
+    cost is the one that survives. Rollups lose every hour a real bill also covers and keep only
+    the gaps; exact duplicates rewrite identical values and change nothing.
+
+    The alternative — clipping a later summary's window to the hours nobody has claimed and
+    spreading its full total across what's left — was tried and is worse. A bill's ``total_cost``
+    is one number with no per-day breakdown, so there is no honest way to subtract the overlap
+    day's share from it: the clipped remainder gets charged the whole bill, and every hour in it
+    is overpriced by the ratio of what was trimmed. Replacing needs no such guess. It also matches
+    what a later bill *means*: when two statements cover the same hour, the more recent one is the
+    utility's correction, not a duplicate to be reconciled against the older one.
+
+    Note the replacement applies within an import, not retroactively across polls. An hour costed
+    by a poll weeks ago sits behind this statistic's resume point and is skipped rather than
+    revised — a cumulative-sum statistic can't have its middle rewritten without restating every
+    row after it. A full rebuild (`greenbutton.rebuild_statistics`, or the automatic repair in
+    [coordinator.GreenButtonCoordinator._async_migrate_import]) re-imports from a clean slate and
+    applies this to the whole history, which is how a feed imported under the old rule gets fixed.
+
+    Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary
+    to accounts they bill; meter-only test profiles often won't), or when the currency code
+    isn't one we have an ISO 4217 alpha mapping for.
+    """
+    if not up.summaries:
+        return
+    currency_alpha = _iso_4217_alpha(up.summaries[0].currency_numeric_code)
+    if currency_alpha is None:
+        _LOGGER.debug(
+            "Skipping cost stat for usage point %s: currency code %s has no ISO 4217 mapping",
+            up.usage_point_id,
+            up.summaries[0].currency_numeric_code,
+        )
+        return
+
+    statistic_id = statistic_id_for_cost(entry.entry_id, up.usage_point_id)
+    metadata: StatisticMetaData = {
+        "has_mean": False,
+        "has_sum": True,
+        "name": (
+            f"{utility_display_name} · {up.service_kind.title()} Cost ({up.usage_point_id[:8]})"
+        ),
+        "source": DOMAIN,
+        "statistic_id": statistic_id,
+        "unit_of_measurement": currency_alpha,
+        # HA's recorder validates `unit_class` against the registered `BaseUnitConverter`
+        # families in `util.unit_conversion`. There's no MonetaryConverter (you can't
+        # convert CAD ↔ USD via a fixed-ratio table), so anything besides None throws
+        # `Unsupported unit_class: '<value>'` at metadata validation. None is the
+        # well-formed answer for currency stats — the 2026.11 deprecation warning still
+        # fires for it, but the warning isn't a hard error and HA hasn't introduced a
+        # monetary class to migrate to yet. Revisit when HA adds one.
+        "unit_class": None,
+    }
+    if _MEAN_TYPE_NONE is not None:
+        metadata["mean_type"] = _MEAN_TYPE_NONE
+
+    resume_from_sum, resume_after_epoch = (
+        (0.0, None) if fresh else await _resume_point(hass, statistic_id)
+    )
+
+    # Periods we couldn't cost for want of usage to spread them over. Collected rather than logged
+    # per-period so the summary below can say how many, over what span — "why is there no cost
+    # statistic?" is otherwise unanswerable from the log at any level.
+    uncostable: list[datetime] = []
+    # Each summary prices every hour of its own period, and a later one simply replaces whatever
+    # an earlier one put on an hour they share — see the docstring on why replacing beats trimming.
+    cost_by_hour: dict[datetime, float] = {}
+    for summary in sorted(
+        up.summaries,
+        key=lambda s: (
+            s.billing_period_start,
+            -s.billing_period_duration_seconds,
+            s.total_cost,
+        ),
+    ):
+        period_cost = summary.total_cost
+        if period_cost == 0:
+            # Test-lab fixtures often have $0 placeholders — skip rather than emit a
+            # cumulative-flat row across an entire month, or blank out a real bill's hours.
+            continue
+        period_start = summary.billing_period_start
+        period_end = period_start + timedelta(seconds=summary.billing_period_duration_seconds)
+        # FORWARD consumption for the period, read back from the recorder (see the docstring).
+        # REVERSE flow (solar export) isn't part of consumption cost, so the usage stat we read
+        # here — the FORWARD series — is the right basis.
+        in_period = await _recorded_forward_hours(hass, entry, up, period_start, period_end)
+        total_period_kwh = sum(k for (_, k) in in_period)
+        if total_period_kwh <= 0:
+            # No recorded usage for this period yet (e.g. a bill whose period predates our usage
+            # backfill) — nothing to distribute the cost over; skip until/if the usage exists.
+            uncostable.append(period_start)
+            _LOGGER.debug(
+                "No recorded usage in %s → %s for usage point %s, so its %.2f bill can't be "
+                "distributed — skipping this period",
+                period_start.isoformat(),
+                period_end.isoformat(),
+                up.usage_point_id,
+                period_cost,
+            )
+            continue
+
+        # Per-hour cost = per-kWh TOU rate (zero if not a TOU bucket) + per-kWh non-TOU rate
+        # for everything else (Delivery, Global Adjustment, rebates, etc.). Sum of all hourly
+        # costs across the period equals the period's total bill — verified by construction.
+        cost_by_hour.update(_cost_distribution_for_period(summary, in_period, total_period_kwh))
+
+    # One pass, in time order, so the cumulative sum is monotonic no matter what order the feed
+    # listed its summaries in.
+    stats: list[StatisticData] = []
+    running = resume_from_sum
+    for hour_start in sorted(cost_by_hour):
+        if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
+            continue
+        running += cost_by_hour[hour_start]
+        stats.append(StatisticData(start=hour_start, state=running, sum=running))
+
+    if not stats:
+        # No cost statistic gets registered at all in this case, so it's simply absent from the
+        # Energy dashboard's picker with nothing anywhere to say why. Name the reason: on a fresh
+        # account it's normally that the utility publishes bills going back further than the usage
+        # it will give us, which resolves itself as usage accumulates.
+        if uncostable:
+            _LOGGER.info(
+                "No cost statistic for usage point %s: %d billing period(s) between %s and %s "
+                "were published, but this entry has imported no usage inside any of them, so "
+                "there is nothing to distribute the bills across. Cost will appear once usage "
+                "exists for a billed period",
+                up.usage_point_id,
+                len(uncostable),
+                min(uncostable).date().isoformat(),
+                max(uncostable).date().isoformat(),
+            )
+        else:
+            _LOGGER.debug(
+                "No cost rows to write for usage point %s (every billing period was either a "
+                "zero-cost placeholder or already imported)",
+                up.usage_point_id,
+            )
+        return
+
+    _LOGGER.info(
+        "Importing %d cost rows for %s in %s (resume_from_sum=%.2f)",
+        len(stats),
+        statistic_id,
+        currency_alpha,
+        resume_from_sum,
+    )
+    async_add_external_statistics(hass, metadata, stats)
 
 
 async def _import_cost_from_readings(
@@ -1351,8 +1641,12 @@ async def _import_cost_from_readings(
         for reading in series.readings:
             if reading.cost is None:
                 continue
-            hour = _align_to_hour(reading.start)
-            cost_by_hour[hour] = cost_by_hour.get(hour, 0.0) + reading.cost
+            # Spread across the reading's span for the same reason usage is — see
+            # [_hours_spanned]. A billing-only feed carries the whole period's cost on one
+            # reading, and pinning it to the first hour puts a month's bill in a single hour
+            # of the cost statistic while the usage it pairs with is spread across the period.
+            for hour, _overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
+                cost_by_hour[hour] = cost_by_hour.get(hour, 0.0) + reading.cost * fraction
     if not cost_by_hour:
         return
 
@@ -1494,8 +1788,12 @@ def _ha_unit_class_for(reading_type: NormalizedReadingType) -> str | None:
 
 
 def _to_ha_units(value: float, reading_type: NormalizedReadingType) -> float:
-    """Apply the unit conversion implied by [_ha_unit_for]. The server already applied the
-    ESPI ``powerOfTenMultiplier`` on its end, so ``value`` is in the base unit."""
+    """Apply the unit conversion implied by [_ha_unit_for].
+
+    ``value`` already arrives in the ReadingType's base unit (Wh, m³) — [espi._assemble] scales
+    each reading by the ESPI ``powerOfTenMultiplier`` as it builds the UsageReading, so this
+    must not apply it a second time.
+    """
     if reading_type.unit_of_measure == "WATT_HOURS":
         return value / 1000.0
     return value

@@ -38,6 +38,21 @@ _LOGGER = logging.getLogger(__name__)
 # so a tight cap hides the actual upstream reason (e.g. why a Data Custodian 400s a data request).
 _MAX_ERROR_CHARS = 1200
 
+# How long to let a usage fetch run before giving up on it.
+#
+# aiohttp's default is `total=300`, and that is NOT enough: a first, full-history pull answers
+# with a plain 200 — after four to seven minutes. Measured against Toronto Hydro (savagedata),
+# whose first 2-year pull returned 200 at 268 s, 269 s, 306 s and 409 s on four separate
+# attempts. The proxy's own cap on the utility call is 300 s (UTILITY_REQUEST_TIMEOUT_MS), but
+# the whole request is that plus the token refresh, so the client's bound has to sit above it
+# rather than at it. Nothing waits on this — it runs as a background task off the config-entry
+# setup path — so a generous bound costs a held connection, not a blocked integration.
+#
+# `sock_read` deliberately isn't set: the proxy sends NOTHING until the custodian answers (it
+# streams the feed straight through, so the response headers wait on upstream), and a read
+# timeout shorter than the total would fire during exactly the silence this is meant to allow.
+USAGE_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=900, sock_connect=30)
+
 
 @dataclass(frozen=True, slots=True)
 class UtilitySummary:
@@ -340,11 +355,15 @@ class OpenGbAuthExpiredError(OpenGbApiError):
 class OpenGbDataPendingError(OpenGbApiError):
     """The utility is preparing the data asynchronously (ESPI async batch — HTTP 202).
 
-    The proxy surfaces this as ``utility_data_pending`` (HTTP 202) when the utility answers
-    the batch request with "data is being collected, available later" — which only happens
-    for very large datasets. We don't implement the Notification/BatchList retrieval flow
-    yet, so the coordinator maps this to a repair issue (with a link to the tracking GitHub
-    issue) instead of treating it as a transient ``UpdateFailed``.
+    The proxy surfaces this as ``utility_data_pending`` (HTTP 202) when the utility answers the
+    batch request with "data is being collected, available later". NOT a size threshold, despite
+    what this docstring used to claim: Alectra (Savage Data) answers this way for a two-month
+    window as readily as a two-year one — for some custodians it is simply how the endpoint works.
+
+    Recoverable, and usually within minutes. The coordinator freezes the request window so each
+    re-attempt can collect the batch the utility prepared (see ``CONF_PENDING_PUBLISHED_MIN``),
+    re-attempts on a short timer, and surfaces a repair issue that only escalates to an error if
+    the data never arrives.
     """
 
 
@@ -416,6 +435,7 @@ class OpenGbApi:
         published_min: datetime | None = None,
         published_max: datetime | None = None,
         raw_xml_sink: RawXmlSink | None = None,
+        resource_path: str | None = None,
     ) -> UsageResponse:
         """Pull a window of usage data from the proxy.
 
@@ -430,6 +450,13 @@ class OpenGbApi:
                 Serialized to ISO 8601 with `Z` suffix on the wire (the format
                 the Green Button test-lab harness requires).
             published_max: optional ESPI `published-max` filter — same constraints.
+            resource_path: optional RELATIVE ESPI resource suffix to fetch instead of the
+                subscription itself — e.g. ``UsagePoint`` or ``UsagePoint/{id}``. The proxy
+                joins it beneath the subscription URI held in our blob; it rejects anything
+                that isn't a plain relative suffix, since it attaches the utility access
+                token to whatever it fetches. Used to collect an asynchronous batch, which a
+                custodian prepares under a per-UsagePoint URL and never serves from the
+                subscription-level one.
             raw_xml_sink: optional async callback invoked with the raw response body
                 bytes between the read and the parse. Used by the coordinator to persist
                 the body to disk for diagnostics — passed in (instead of returned on
@@ -452,9 +479,13 @@ class OpenGbApi:
             body["publishedMin"] = _to_iso_z(published_min)
         if published_max is not None:
             body["publishedMax"] = _to_iso_z(published_max)
+        if resource_path is not None:
+            body["resourcePath"] = resource_path
 
         headers = {**self.headers, "Authorization": f"Bearer {proxy_token}"}
-        async with self._session.post(url, headers=headers, json=body) as resp:
+        async with self._session.post(
+            url, headers=headers, json=body, timeout=USAGE_FETCH_TIMEOUT
+        ) as resp:
             # Rotated credentials can accompany ANY response, not just 200. The proxy refreshes
             # the access token (and the utility may redeem a one-time refresh token) BEFORE the
             # resource fetch, so a subsequent upstream failure still carries a new blob we must
@@ -480,15 +511,24 @@ class OpenGbApi:
                 )
             if resp.status == 202:
                 # The proxy passes the utility's 202 Accepted through as `utility_data_pending`:
-                # the dataset is large enough that the utility is assembling it out-of-band
-                # (ESPI async batch). We don't implement the Notification/BatchList retrieval
-                # flow yet, so raise a distinct error the coordinator turns into a repair issue.
+                # the utility is assembling the dataset out-of-band (ESPI async batch). Retries
+                # replay the same window rather than recomputing it — see
+                # CONF_PENDING_PUBLISHED_MIN — because a re-asked question is the only thing the
+                # custodian can answer with the batch it prepared.
                 text = await resp.text()
                 error_code = _safe_json_field(text, "error")
+                # Carry the proxy's `message` through verbatim, exactly as the 401 branch above
+                # does. It holds the custodian's own 202 response — status, headers (Location /
+                # Content-Location name where the prepared batch will live, Retry-After says
+                # when), and body. This is not reproducible on demand: it needs a live
+                # authorization at a custodian that defers, so the affected user's HA log is the
+                # only place it can be collected from. Dropping it leaves us guessing.
+                detail = _safe_json_field(text, "message")
+                reason = f" ({detail})" if detail else ""
                 raise OpenGbDataPendingError(
                     "Utility is preparing data asynchronously (HTTP 202, "
                     f"{error_code or 'utility_data_pending'}); background data loads are not "
-                    "yet supported",
+                    f"yet supported{reason}",
                     new_credentials=new_credentials,
                 )
             if resp.status != 200:

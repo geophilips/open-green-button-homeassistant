@@ -33,6 +33,14 @@ Copy `custom_components/greenbutton/` into your Home Assistant config directory 
 
 The integration writes hourly consumption data into the HA Energy dashboard's long-term statistics.
 
+### If there's nothing to pick in the Energy dashboard yet
+
+Right after setup, **Settings → Dashboards → Energy** may say *no statistics available* when you try to add the account. That usually means your utility hasn't sent any data yet — plenty of them only start assembling your history once you authorize, which can take from a minute to a few hours. Until the first reading arrives there is nothing to put in the dashboard, so there is nothing to pick.
+
+Home Assistant will tell you when this is what's happening: look for a notice under **Settings → Repairs**. The integration re-checks on its own, first after a few minutes and then progressively less often, and the notice clears itself as soon as data lands. **You don't need to delete and re-add the integration** — that only appears to help because setting the account up again happens to trigger another fetch.
+
+If it's still empty a day later the notice changes to say so, and we'd like to hear about it — the link in the notice goes to the tracking issue.
+
 ## Recomputing statistics after an update
 
 Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values.
@@ -51,17 +59,19 @@ data:
   config_entry_id: <your entry>   # optional — omit to rebuild every configured account
 ```
 
-It deletes that account's imported energy and cost statistics, then re-downloads and recomputes the full history from scratch. Because it pulls the entire initial-history window, it puts the same load on your utility as a fresh setup — run it when you need it, not on a schedule. If the re-fetch fails partway (network/utility hiccup), the statistics simply repopulate on the next successful utility-scheduled poll or the next rebuild.
+It deletes that account's imported energy and cost statistics, then re-downloads and recomputes the full history from scratch. Because it pulls the entire initial-history window, it puts the same load on your utility as a fresh setup — run it when you need it, not on a schedule. If the re-fetch fails partway (network/utility hiccup), the statistics simply repopulate on the next successful poll or the next rebuild.
 
-### Daily polling time
+### Polling schedule
 
-The proxy tells the integration how often each utility permits polling. When that cadence is exactly once per day, you can anchor it to a consistent local time under **Settings → Devices & services → Open Green Button → Configure**. Enable **Poll daily at a specific local time** and choose the time. The schedule uses Home Assistant's timezone and follows daylight-saving changes.
+How often each utility may be polled is decided by that utility and passed to the integration by the proxy server — you can't make it poll more often. Most utilities publish once a day.
 
-This option only changes when a daily poll runs. It never increases or decreases a utility's supplied cadence: shorter and multi-day schedules continue to use their original intervals. A first installation and a manual integration reload fetch immediately. A normal Home Assistant restart reuses the statistics already stored by Recorder and waits for the next scheduled poll, avoiding a redundant utility request during startup.
+When the cadence works out to exactly once a day, you can choose *when* that poll runs, under **Settings → Devices & services → Open Green Button → Configure**. Enable **Poll daily at a specific local time** and pick a time. It uses Home Assistant's timezone and follows daylight-saving changes. Utilities on a shorter or multi-day cadence ignore the setting and keep their own interval.
+
+If Home Assistant is down when a poll was due — either the interval elapsed or the daily time went by — the poll runs when it next starts. Restarting inside a window that has already been polled doesn't re-fetch: that data is already in the recorder, so the restart just waits for the next scheduled poll.
 
 ### Milton Hydro current-period cost estimate
 
-Milton Hydro accounts on Ontario Tiered pricing can show provisional current-period costs between completed bills. The estimator is deliberately utility-scoped: it learns the Block/Tier rates and non-energy residual from Milton's latest exact `UsageSummary`, stores the cumulative cost at the new period boundary, and replaces provisional rows when the exact bill arrives. It stops at the predicted billing-period end if a new summary is late, so stale rates cannot keep accumulating indefinitely. Exact utility summaries remain authoritative.
+Milton Hydro accounts on Ontario Tiered pricing can show provisional current-period costs between completed bills. The estimator is deliberately utility-scoped: it learns the Block/Tier rates and non-energy residual from Milton's latest exact `UsageSummary`, stores the cumulative cost at the new period boundary, and replaces provisional rows when the exact bill arrives. If a bill is delayed, the estimate continues through at most one additional provisional billing period, then stops so stale rates cannot accumulate indefinitely. Exact utility summaries remain authoritative.
 
 ## Supported utilities
 
@@ -97,7 +107,7 @@ The venv at `.venv/` is auto-activated when you `cd` into the repo.
 **Working today**
 
 - OAuth authorization against the proxy server, with refresh-token rotation handled automatically
-- Polls at the utility-supplied cadence and writes hourly consumption into the Energy dashboard's long-term statistics via [`async_add_external_statistics`](https://developers.home-assistant.io/docs/core/entity/sensor#statistics-imported-from-external-sources)
+- Polls the proxy at the utility's permitted cadence, optionally anchored to a local time of day, and writes hourly consumption into the Energy dashboard's long-term statistics via [`async_add_external_statistics`](https://developers.home-assistant.io/docs/core/entity/sensor#statistics-imported-from-external-sources)
 - Reauth flow surfaces as an HA notification when the utility revokes our refresh token
 - Imports per-billing-period cost from ESPI `UsageSummary` blocks into the Energy dashboard's Cost column, with Ontario time-of-use distribution
 
@@ -151,8 +161,12 @@ If this integration is useful to you and you want to help keep it maintained and
 
 Suggested $5/month — covers proxy hosting plus time spent adding utilities and keeping up with Home Assistant changes.
 
-## License
+## Legal
 
-[MIT](LICENSE).
+Open Green Button is an open community project. It is not a legal entity, and it is not affiliated with or endorsed by any utility. This integration is free to use and is provided under the [MIT license](LICENSE), without warranty of any kind and with no liability to the authors or copyright holders.
+
+The hosted proxy at `https://api.opengreenbutton.org` is run by volunteers on a best-effort basis, with no uptime or support commitment, under those same terms. If you would rather not depend on it, the [server](https://github.com/rocketraman/open-green-button) is open source and can be [deployed by anyone](https://github.com/rocketraman/open-green-button/blob/master/docs/deployment.md).
+
+Registering as a third party with a utility is a separate matter, covered under [Legal](https://github.com/rocketraman/open-green-button#legal) in the main project README.
 
 "Green Button" is a trademark of the Green Button Alliance; this project uses the name in reference to the open data standard.

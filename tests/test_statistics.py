@@ -10,6 +10,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.recorder import get_instance
@@ -39,14 +40,13 @@ from custom_components.greenbutton.const import (
 )
 from custom_components.greenbutton.statistics import (
     _cost_sum_before,
-    _forward_hours_for_cost,
     _import_cost_summaries_with_estimates,
     _load_tiered_estimate_state,
     _recorded_forward_hours,
-    _select_billing_summaries,
     _tiered_estimated_costs,
     _tiered_estimated_costs_with_provisional_rollover,
     _TieredEstimateProfile,
+    defer_recent_zero_placeholder_days,
     import_usage_statistics,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
@@ -94,32 +94,6 @@ async def test_recorded_forward_hours_reconstructs_hourly_kwh(hass: HomeAssistan
         hass, entry, up, base + timedelta(hours=1), base + timedelta(hours=4)
     )
     assert [(h.hour, round(k, 1)) for h, k in hours] == [(5, 2.0), (6, 3.0), (7, 1.0)]
-
-
-async def test_forward_hours_for_cost_includes_current_response_before_recorder_catches_up(
-    hass: HomeAssistant,
-) -> None:
-    """Same-poll response hours fill the recorder lag exposed by once-daily polling."""
-    entry = MagicMock()
-    entry.entry_id = "01TESTENTRY"
-    response = _one_reading_response()
-    up = response.usage_points[0]
-    response_hour = up.series[0].readings[0].start
-    prior_hour = response_hour - timedelta(hours=1)
-
-    with patch(
-        "custom_components.greenbutton.statistics._recorded_forward_hours",
-        new=AsyncMock(return_value=[(prior_hour, 0.5), (response_hour, 0.8)]),
-    ):
-        hours = await _forward_hours_for_cost(
-            hass,
-            entry,
-            up,
-            prior_hour,
-            response_hour + timedelta(hours=1),
-        )
-
-    assert hours == [(prior_hour, 0.5), (response_hour, 1.0)]
 
 
 def _summary(start: datetime, duration_days: int, total_dollars: float) -> BillingSummary:
@@ -606,27 +580,363 @@ async def test_bulk_zero_cost_falls_back_to_billing_summary(hass: HomeAssistant)
     assert [round(s["sum"], 2) for s in cost_calls[0].args[2]] == [20.0, 50.0]
 
 
-def _accumulation_response(behaviour: str, flow_direction: str = "FORWARD") -> UsageResponse:
+def _series(
+    behaviour: str,
+    flow_direction: str = "FORWARD",
+    *,
+    meter_reading_id: str = "mr1",
+    unit: str = "WATT_HOURS",
+    readings: list[UsageReading] | None = None,
+) -> MeterReadingSeries:
     """One hourly FORWARD-by-default series carrying an arbitrary accumulation behaviour."""
-    reading_type = NormalizedReadingType(
-        commodity="ELECTRICITY_SECONDARY_METERED",
-        flow_direction=flow_direction,
-        accumulation_behaviour=behaviour,
-        interval_length_seconds=3600,
-        unit_of_measure="WATT_HOURS",
-        unit_of_measure_symbol="Wh",
-        power_of_ten_multiplier=0,
-        currency_numeric_code=124,
+    return MeterReadingSeries(
+        meter_reading_id=meter_reading_id,
+        reading_type=NormalizedReadingType(
+            commodity="ELECTRICITY_SECONDARY_METERED",
+            flow_direction=flow_direction,
+            accumulation_behaviour=behaviour,
+            interval_length_seconds=3600,
+            unit_of_measure=unit,
+            unit_of_measure_symbol="Wh",
+            power_of_ten_multiplier=0,
+            currency_numeric_code=124,
+        ),
+        readings=(
+            [
+                UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0),
+                UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0),
+            ]
+            if readings is None
+            else readings
+        ),
     )
-    series = MeterReadingSeries(
-        meter_reading_id="mr1",
-        reading_type=reading_type,
-        readings=[
-            UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0),
-            UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0),
+
+
+def test_recent_zero_placeholder_day_is_deferred_with_all_newer_siblings() -> None:
+    """A Milton-shaped recent zero tail stays out of both statistics and cursor inputs."""
+    timezone = ZoneInfo("America/Toronto")
+    prior = datetime(2026, 9, 27, 3, tzinfo=UTC)  # Sep 26 23:00 local
+    day_start = datetime(2026, 9, 27, 4, tzinfo=UTC)  # Sep 27 00:00 local
+    hourly = [UsageReading(prior, 3600, 420.0)]
+    hourly.extend(
+        UsageReading(
+            day_start + timedelta(hours=hour),
+            3600,
+            400.0 if hour < 13 else 0.0,
+        )
+        for hour in range(24)
+    )
+    hourly.append(UsageReading(datetime(2026, 9, 28, 5, tzinfo=UTC), 3600, 0.0))
+    register = [
+        UsageReading(datetime(2026, 9, 26, 17, tzinfo=UTC), 86400, 140_000_000.0),
+        UsageReading(datetime(2026, 9, 27, 5, tzinfo=UTC), 86400, 141_000_000.0),
+    ]
+    response = UsageResponse(
+        updated=None,
+        usage_points=[
+            UsagePoint(
+                usage_point_id="up1",
+                service_kind="electricity",
+                series=[
+                    _series("DELTA_DATA", meter_reading_id="hourly", readings=hourly),
+                    _series("BULK_QUANTITY", meter_reading_id="register", readings=register),
+                ],
+            )
         ],
+        new_credentials=None,
     )
-    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+
+    filtered, deferred = defer_recent_zero_placeholder_days(
+        response,
+        now=datetime(2026, 9, 28, 16, tzinfo=UTC),
+        local_timezone=timezone,
+    )
+
+    assert deferred == 26
+    assert filtered.usage_points[0].series[0].readings == [hourly[0]]
+    assert filtered.usage_points[0].series[1].readings == register[:1]
+
+
+def test_old_trailing_zero_day_is_eventually_accepted() -> None:
+    """A real outage cannot be deferred forever: old zeroes pass after the grace period."""
+    timezone = ZoneInfo("America/Toronto")
+    start = datetime(2026, 9, 27, 4, tzinfo=UTC)
+    hourly = [UsageReading(start + timedelta(hours=hour), 3600, 0.0) for hour in range(24)]
+    response = UsageResponse(
+        updated=None,
+        usage_points=[
+            UsagePoint(
+                usage_point_id="up1",
+                service_kind="electricity",
+                series=[
+                    _series("DELTA_DATA", meter_reading_id="hourly", readings=hourly),
+                    _series(
+                        "BULK_QUANTITY",
+                        meter_reading_id="register",
+                        readings=[UsageReading(start, 86400, 140_000_000.0)],
+                    ),
+                ],
+            )
+        ],
+        new_credentials=None,
+    )
+
+    filtered, deferred = defer_recent_zero_placeholder_days(
+        response,
+        now=datetime(2026, 10, 1, 12, tzinfo=UTC),
+        local_timezone=timezone,
+    )
+
+    assert deferred == 0
+    assert filtered is response
+
+
+def test_zero_without_cumulative_companion_is_not_deferred() -> None:
+    """Ordinary interval feeds retain legitimate recent zero-consumption hours."""
+    timezone = ZoneInfo("America/Toronto")
+    start = datetime(2026, 9, 27, 4, tzinfo=UTC)
+    response = UsageResponse(
+        updated=None,
+        usage_points=[
+            UsagePoint(
+                usage_point_id="up1",
+                service_kind="electricity",
+                series=[
+                    _series(
+                        "DELTA_DATA",
+                        readings=[
+                            UsageReading(start, 3600, 400.0),
+                            UsageReading(start + timedelta(hours=1), 3600, 0.0),
+                        ],
+                    )
+                ],
+            )
+        ],
+        new_credentials=None,
+    )
+
+    filtered, deferred = defer_recent_zero_placeholder_days(
+        response,
+        now=datetime(2026, 9, 28, 16, tzinfo=UTC),
+        local_timezone=timezone,
+    )
+
+    assert deferred == 0
+    assert filtered is response
+
+
+def _saved_tier_state(
+    *,
+    active_period_start: datetime,
+    predicted_days: float = 30,
+    baseline_sum: float | None = 100.0,
+) -> dict:
+    return {
+        "active_period_start": active_period_start.isoformat(),
+        "predicted_days": predicted_days,
+        "currency_alpha": "CAD",
+        "tier_one_rate": 0.12,
+        "tier_two_rate": 0.142,
+        "tier_one_kwh_per_day": 20.0,
+        "residual_rate": 0.06,
+        "baseline_sum": baseline_sum,
+    }
+
+
+def _entry_with_tier_state(state: dict, *, utility_id: str = "milton_hydro") -> MagicMock:
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    entry.data = {
+        CONF_UTILITY_ID: utility_id,
+        CONF_TIER_COST_ESTIMATES: {"up1": state},
+    }
+    return entry
+
+
+def test_tiered_state_is_ignored_for_non_milton_entry() -> None:
+    entry = _entry_with_tier_state(
+        _saved_tier_state(active_period_start=_APR2),
+        utility_id="burlington_hydro",
+    )
+    assert _load_tiered_estimate_state(entry, "up1") is None
+
+
+async def test_cost_baseline_widens_past_missing_boundary_hours(hass: HomeAssistant) -> None:
+    manager = MagicMock()
+    manager.async_add_executor_job = AsyncMock(
+        side_effect=[
+            {},
+            {},
+            {"greenbutton:test_cost": [{"start": _APR2 - timedelta(days=60), "sum": 88.0}]},
+        ]
+    )
+    with patch("custom_components.greenbutton.statistics.get_instance", return_value=manager):
+        baseline = await _cost_sum_before(hass, "greenbutton:test_cost", _APR2)
+    assert baseline == 88.0
+    assert manager.async_add_executor_job.await_count == 3
+
+
+async def test_two_closed_bills_replace_estimates_from_saved_baseline(
+    hass: HomeAssistant,
+) -> None:
+    entry = _entry_with_tier_state(_saved_tier_state(active_period_start=_APR2))
+    first = _summary(_APR2, 1, 20.0)
+    second_start = _APR2 + timedelta(days=1)
+    second = _summary(second_start, 1, 30.0)
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[],
+        summaries=[first, second],
+    )
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(999.0, (_APR2 + timedelta(days=3)).timestamp())),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(side_effect=[[(_APR2, 1.0)], [(second_start, 1.0)]]),
+        ),
+        patch("custom_components.greenbutton.statistics._clear_tiered_estimate_state"),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
+    ):
+        await _import_cost_summaries_with_estimates(
+            hass,
+            entry,
+            up,
+            utility_display_name="Milton Hydro",
+        )
+
+    rows = add.call_args.args[2]
+    assert [(row["start"], row["sum"]) for row in rows] == [
+        (_APR2, 120.0),
+        (second_start, 150.0),
+    ]
+
+
+async def test_tiered_estimate_stops_after_one_provisional_period(
+    hass: HomeAssistant,
+) -> None:
+    active = datetime(2026, 7, 1, tzinfo=UTC)
+    entry = _entry_with_tier_state(
+        _saved_tier_state(active_period_start=active, predicted_days=1, baseline_sum=10.0)
+    )
+    up = _milton_mixed_series_response().usage_points[0]
+    recorded = AsyncMock(return_value=[(active + timedelta(hours=5), 1.0)])
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(10.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=recorded,
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._latest_forward_hour",
+            return_value=active + timedelta(days=20),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
+    ):
+        await _import_cost_summaries_with_estimates(
+            hass,
+            entry,
+            up,
+            utility_display_name="Milton Hydro",
+        )
+
+    assert recorded.await_args.args[4] == active + timedelta(days=2)
+    assert round(add.call_args.args[2][0]["sum"], 2) == 10.18
+
+
+async def test_monthly_tiered_estimate_survives_sixteen_day_summary_delay(
+    hass: HomeAssistant,
+) -> None:
+    active = datetime(2026, 7, 9, 4, tzinfo=UTC)
+    entry = _entry_with_tier_state(
+        _saved_tier_state(active_period_start=active, predicted_days=30, baseline_sum=10.0)
+    )
+    up = _milton_mixed_series_response().usage_points[0]
+    delayed_hour = active + timedelta(days=46)
+    recorded = AsyncMock(return_value=[(delayed_hour, 1.0)])
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(10.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=recorded,
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._latest_forward_hour",
+            return_value=delayed_hour,
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
+    ):
+        await _import_cost_summaries_with_estimates(
+            hass,
+            entry,
+            up,
+            utility_display_name="Milton Hydro",
+        )
+
+    assert recorded.await_args.args[4] == delayed_hour + timedelta(hours=1)
+    assert len(add.call_args.args[2]) == 1
+
+
+def test_tiered_estimate_resets_tier_one_at_provisional_boundary() -> None:
+    active = datetime(2026, 7, 1, tzinfo=UTC)
+    predicted_end = active + timedelta(days=1)
+    profile = _TieredEstimateProfile(
+        tier_one_rate=0.10,
+        tier_two_rate=0.20,
+        tier_one_kwh_per_day=1.0,
+        residual_rate=0.05,
+    )
+    hours = [(active, 1.5), (predicted_end, 1.0)]
+
+    costs = _tiered_estimated_costs_with_provisional_rollover(
+        hours,
+        profile,
+        predicted_days=1,
+        predicted_period_end=predicted_end,
+    )
+
+    assert round(costs[active], 3) == 0.275
+    assert round(costs[predicted_end], 3) == 0.15
+
+
+def test_tiered_estimate_splits_threshold_hour_and_preserves_total() -> None:
+    profile = _TieredEstimateProfile(
+        tier_one_rate=0.10,
+        tier_two_rate=0.20,
+        tier_one_kwh_per_day=1.0,
+        residual_rate=0.05,
+    )
+    hours = [(_APR2, 1.5), (_APR2 + timedelta(hours=1), 1.0)]
+    costs = _tiered_estimated_costs(hours, profile, predicted_days=2)
+    assert round(costs[hours[0][0]], 3) == 0.225
+    assert round(costs[hours[1][0]], 3) == 0.20
+
+
+def _accumulation_response(
+    behaviour: str,
+    flow_direction: str = "FORWARD",
+    *,
+    sibling: MeterReadingSeries | None = None,
+) -> UsageResponse:
+    """A UsagePoint carrying [behaviour], optionally alongside a second series.
+
+    The sibling is what makes a cumulative register *excludable* — see
+    [statistics._is_interval_consumption_series]. Without one, a register is all the utility
+    publishes and is imported.
+    """
+    series = [_series(behaviour, flow_direction)]
+    if sibling is not None:
+        series.append(sibling)
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=series)
     return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
 
 
@@ -667,29 +977,106 @@ async def test_reverse_non_delta_series_still_imports(hass: HomeAssistant) -> No
     assert usage_calls[0].args[1]["statistic_id"].endswith("_reverse")
 
 
-async def test_every_cumulative_behaviour_is_excluded(hass: HomeAssistant) -> None:
-    """BULK_QUANTITY isn't special — every cumulative-register behaviour is excluded.
+async def test_every_cumulative_behaviour_is_excluded_when_superseded(
+    hass: HomeAssistant,
+) -> None:
+    """BULK_QUANTITY isn't special — every register behaviour loses to a same-flow sibling.
 
+    This is Milton Hydro's shape (issue #6): an hourly DELTA_DATA consumption series and a
+    register snapshot on one UsagePoint, both FORWARD, both mapping to one statistic_id.
     CONTINUOUS_CUMULATIVE (ESPI 2) is the one that matters: it used to normalize to "OTHER" and
     would have slipped straight past a name-based exclusion.
+
+    Only the sibling's readings may land — 1.0 then 2.5 kWh cumulative. If the register were
+    summed in too, the sums would be doubled.
     """
     for behaviour in ("BULK_QUANTITY", "CUMULATIVE", "CONTINUOUS_CUMULATIVE"):
-        assert await _import_and_collect_usage(hass, _accumulation_response(behaviour)) == [], (
-            f"{behaviour} should not be summed into a consumption statistic"
+        calls = await _import_and_collect_usage(
+            hass,
+            _accumulation_response(
+                behaviour, sibling=_series("DELTA_DATA", meter_reading_id="mr2")
+            ),
         )
+        assert len(calls) == 1, f"{behaviour} should not be summed into a consumption statistic"
+        assert [round(s["sum"], 3) for s in calls[0].args[2]] == [1.0, 2.5], behaviour
 
 
-async def test_only_cumulative_series_logs_error(
+async def test_lone_cumulative_series_still_imports(hass: HomeAssistant) -> None:
+    """A register with no sibling is all the utility publishes — import it.
+
+    Consumers Energy (via UtilityAPI) publishes one reading per billing period, genuine
+    per-period consumption, mislabelled BULK_QUANTITY. Excluding on the name alone dropped
+    100% of that feed and left an empty Energy dashboard.
+    """
+    for behaviour in ("BULK_QUANTITY", "CUMULATIVE", "CONTINUOUS_CUMULATIVE"):
+        calls = await _import_and_collect_usage(hass, _accumulation_response(behaviour))
+        assert len(calls) == 1, f"{behaviour} with no sibling must still import"
+        assert [round(s["sum"], 3) for s in calls[0].args[2]] == [1.0, 2.5], behaviour
+
+
+async def test_register_survives_a_sibling_of_the_other_flow_direction(
+    hass: HomeAssistant,
+) -> None:
+    """A REVERSE delta series doesn't supersede a FORWARD register — no statistic_id collision.
+
+    Excluding on "any non-cumulative sibling" would drop the only consumption data there is
+    and leave the account showing solar export but no usage.
+    """
+    calls = await _import_and_collect_usage(
+        hass,
+        _accumulation_response(
+            "BULK_QUANTITY",
+            sibling=_series("DELTA_DATA", flow_direction="REVERSE", meter_reading_id="mr2"),
+        ),
+    )
+    assert {c.args[1]["statistic_id"].rsplit("_", 1)[-1] for c in calls} == {"forward", "reverse"}
+
+
+async def test_billing_period_reading_spreads_across_its_hours(hass: HomeAssistant) -> None:
+    """A month-long reading becomes one row per hour, not a single spike at the period start.
+
+    Consumers Energy's shape: one reading per billing period. ESPI publishes an inclusive end,
+    so a 3-hour period is 10799s, and the total must survive the split exactly.
+    """
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[
+            _series(
+                "BULK_QUANTITY",
+                readings=[UsageReading(datetime(2026, 6, 2, tzinfo=UTC), 10799, 3000.0)],
+            )
+        ],
+    )
+    calls = await _import_and_collect_usage(
+        hass, UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+    )
+    assert len(calls) == 1
+    rows = calls[0].args[2]
+    assert [r["start"] for r in rows] == [datetime(2026, 6, 2, h, tzinfo=UTC) for h in (0, 1, 2)]
+    # 3 kWh spread evenly, accumulated: the trailing hour is 1s short (inclusive end) and must
+    # NOT be deferred — a closed billing period is never re-published.
+    assert [round(r["sum"], 3) for r in rows] == [1.0, 2.0, 3.0]
+
+
+async def test_unmappable_unit_on_every_series_logs_error(
     hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A UsagePoint with nothing but registers writes nothing — and says so loudly.
+    """A UsagePoint whose every series is unrepresentable writes nothing — and says so loudly.
 
-    Deriving deltas from a register isn't implemented, so such a feed yields no energy at all.
-    That's an empty Energy dashboard, which has to be diagnosable from the log alone.
+    That's an empty Energy dashboard, which has to be diagnosable from the log alone. Since a
+    register is now only excluded when a sibling supersedes it, the remaining way to import
+    nothing is a unit we have no HA mapping for.
     """
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[_series("DELTA_DATA", unit="OTHER")],
+    )
+    response = UsageResponse(updated=None, usage_points=[up], new_credentials=None)
     with caplog.at_level(logging.ERROR, logger="custom_components.greenbutton.statistics"):
-        assert await _import_and_collect_usage(hass, _accumulation_response("BULK_QUANTITY")) == []
-    assert "no per-interval consumption series" in caplog.text
+        assert await _import_and_collect_usage(hass, response) == []
+    assert "no importable consumption series" in caplog.text
 
 
 def _summary_only_response() -> UsageResponse:
@@ -741,11 +1128,20 @@ async def test_summary_cost_distributes_over_recorded_usage(hass: HomeAssistant)
     assert [round(s["sum"], 2) for s in stats] == [10.0, 40.0]
 
 
-async def test_summary_cost_skipped_when_no_recorded_usage(hass: HomeAssistant) -> None:
-    """A bill whose period has no recorded usage yet (e.g. predates the backfill) writes nothing."""
+async def test_summary_cost_skipped_when_no_recorded_usage(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bill whose period has no recorded usage yet (e.g. predates the backfill) writes nothing.
+
+    And says so. No cost statistic is registered at all in this case, so it's simply missing from
+    the Energy dashboard's picker — a user who asks why has nothing in the log to go on unless the
+    skip explains itself. This is the El Paso sandbox shape: a year of bills, one day of usage.
+    """
     entry = MagicMock()
     entry.entry_id = "01TESTENTRY"
     with (
+        caplog.at_level(logging.INFO, logger="custom_components.greenbutton.statistics"),
         patch(
             "custom_components.greenbutton.statistics._resume_point",
             new=AsyncMock(return_value=(0.0, None)),
@@ -762,6 +1158,8 @@ async def test_summary_cost_skipped_when_no_recorded_usage(hass: HomeAssistant) 
 
     cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
     assert not cost_calls
+    assert "No cost statistic for usage point" in caplog.text
+    assert "nothing to distribute the bills across" in caplog.text
 
 
 async def test_summary_cost_deferred_until_hass_started(hass: HomeAssistant) -> None:
@@ -882,264 +1280,90 @@ def test_statistic_id_slugifies_real_world_ulid_and_uuid_inputs() -> None:
     assert sid.startswith(statistic_id_prefix_for_entry("01KT5B7TVYNVZY86P0PH0EPTAB"))
 
 
-def test_select_summaries_drops_exact_duplicate_period() -> None:
-    """A billing period repeated across the paginated feed must be costed once, not twice.
+async def _cost_sums(hass, summaries: list[BillingSummary]) -> list[float]:
+    """Import [summaries] against a synthetic 1 kWh/hour usage history; return the cost rows' sums.
 
-    Two identical summaries → keeping both would double that period's cost in the Energy
-    dashboard (the regression this guards against).
+    `_recorded_forward_hours` is stubbed to answer for whatever window it's asked about, so each
+    summary spreads its total evenly over its own hours and the arithmetic below is exact.
     """
-    a = _summary(_APR2, 32, 130.08)
-    b = _summary(_APR2, 32, 130.08)
-    selected = _select_billing_summaries([a, b])
-    assert len(selected) == 1
-    assert selected[0].total_cost == 130.08
-
-
-def test_select_summaries_drops_overlapping_rollup() -> None:
-    """A coarse rollup that spans a per-bill period is dropped in favor of the specific one.
-
-    This is the multi-fold inflation case: a 12-month rollup laid over the current bill's
-    hours would add its whole total on top of the per-bill total.
-    """
-    per_bill = _summary(_APR2, 32, 130.08)
-    rollup = _summary(datetime(2025, 6, 1, tzinfo=UTC), 365, 1500.0)
-    selected = _select_billing_summaries([rollup, per_bill])
-    assert selected == [per_bill]
-
-
-def test_select_summaries_keeps_consecutive_periods() -> None:
-    """Back-to-back real billing periods share only their boundary instant → both kept.
-
-    The interval check is half-open, so May 4 belongs to the second period only and the two
-    never register as overlapping.
-    """
-    first = _summary(_APR2, 32, 130.08)  # Apr 2 → May 4
-    second = _summary(_MAY4, 30, 118.0)  # May 4 → Jun 3
-    selected = _select_billing_summaries([second, first])
-    assert selected == [first, second]  # returned in billing-period order
-
-
-def test_select_summaries_prefers_real_bill_over_zero_placeholder() -> None:
-    """When a $0 placeholder duplicates a real bill's period, keep the real one.
-
-    Same period + same (shortest) duration → the tie is broken by higher total_cost so the
-    real bill wins and its cost isn't silently dropped.
-    """
-    placeholder = _summary(_APR2, 32, 0.0)
-    real = _summary(_APR2, 32, 130.08)
-    selected = _select_billing_summaries([placeholder, real])
-    assert len(selected) == 1
-    assert selected[0].total_cost == 130.08
-
-
-def _saved_tier_state(
-    *,
-    active_period_start: datetime,
-    predicted_days: float = 30,
-    baseline_sum: float | None = 100.0,
-) -> dict:
-    """Serialized Milton estimate state used by the regression tests below."""
-    return {
-        "active_period_start": active_period_start.isoformat(),
-        "predicted_days": predicted_days,
-        "currency_alpha": "CAD",
-        "tier_one_rate": 0.12,
-        "tier_two_rate": 0.142,
-        "tier_one_kwh_per_day": 20.0,
-        "residual_rate": 0.06,
-        "baseline_sum": baseline_sum,
-    }
-
-
-def _entry_with_tier_state(state: dict, *, utility_id: str = "milton_hydro") -> MagicMock:
     entry = MagicMock()
     entry.entry_id = "01TESTENTRY"
-    entry.data = {
-        CONF_UTILITY_ID: utility_id,
-        CONF_TIER_COST_ESTIMATES: {"up1": state},
-    }
-    return entry
-
-
-def test_tiered_state_is_ignored_for_non_milton_entry() -> None:
-    """Ontario/Milton assumptions cannot activate for another utility by label coincidence."""
-    entry = _entry_with_tier_state(
-        _saved_tier_state(active_period_start=_APR2),
-        utility_id="burlington_hydro",
-    )
-    assert _load_tiered_estimate_state(entry, "up1") is None
-
-
-async def test_cost_baseline_widens_past_missing_boundary_hours(hass: HomeAssistant) -> None:
-    """A gap near bill start must not collapse the prior cumulative total to zero."""
-    manager = MagicMock()
-    manager.async_add_executor_job = AsyncMock(
-        side_effect=[
-            {},
-            {},
-            {"greenbutton:test_cost": [{"start": _APR2 - timedelta(days=60), "sum": 88.0}]},
-        ]
-    )
-    with patch("custom_components.greenbutton.statistics.get_instance", return_value=manager):
-        baseline = await _cost_sum_before(hass, "greenbutton:test_cost", _APR2)
-    assert baseline == 88.0
-    assert manager.async_add_executor_job.await_count == 3
-
-
-async def test_two_closed_bills_replace_estimates_from_saved_baseline(
-    hass: HomeAssistant,
-) -> None:
-    """Two bills delivered between polls are both exact and never reset cumulative cost."""
-    entry = _entry_with_tier_state(_saved_tier_state(active_period_start=_APR2))
-    first = _summary(_APR2, 1, 20.0)
-    second_start = _APR2 + timedelta(days=1)
-    second = _summary(second_start, 1, 30.0)
     up = UsagePoint(
-        usage_point_id="up1",
-        service_kind="electricity",
-        series=[],
-        summaries=[first, second],
+        usage_point_id="up1", service_kind="electricity", series=[], summaries=summaries
     )
+    response = UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+    async def _hours(_hass, _entry, _up, period_start, period_end):
+        hours, hour = [], period_start
+        while hour < period_end:
+            hours.append((hour, 1.0))
+            hour += timedelta(hours=1)
+        return hours
+
     with (
         patch(
             "custom_components.greenbutton.statistics._resume_point",
-            new=AsyncMock(return_value=(999.0, (_APR2 + timedelta(days=3)).timestamp())),
+            new=AsyncMock(return_value=(0.0, None)),
         ),
-        patch(
-            "custom_components.greenbutton.statistics._recorded_forward_hours",
-            new=AsyncMock(
-                side_effect=[
-                    [(_APR2, 1.0)],
-                    [(second_start, 1.0)],
-                ]
-            ),
-        ),
-        patch("custom_components.greenbutton.statistics._clear_tiered_estimate_state"),
-        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
+        patch("custom_components.greenbutton.statistics._recorded_forward_hours", new=_hours),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
     ):
-        await _import_cost_summaries_with_estimates(
-            hass,
-            entry,
-            up,
-            utility_display_name="Milton Hydro",
-        )
+        await import_usage_statistics(hass, entry, response, utility_display_name="X")
 
-    rows = add.call_args.args[2]
-    assert [(row["start"], row["sum"]) for row in rows] == [
-        (_APR2, 120.0),
-        (second_start, 150.0),
-    ]
+    cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
+    return [] if not cost_calls else [s["sum"] for s in cost_calls[0].args[2]]
 
 
-async def test_tiered_estimate_stops_after_one_provisional_period(hass: HomeAssistant) -> None:
-    """A delayed UsageSummary gets one full provisional period, not an indefinite estimate."""
-    active = datetime(2026, 7, 1, tzinfo=UTC)
-    entry = _entry_with_tier_state(
-        _saved_tier_state(active_period_start=active, predicted_days=1, baseline_sum=10.0)
-    )
-    up = _milton_mixed_series_response().usage_points[0]
-    recorded = AsyncMock(return_value=[(active + timedelta(hours=5), 1.0)])
-    with (
-        patch(
-            "custom_components.greenbutton.statistics._resume_point",
-            new=AsyncMock(return_value=(10.0, None)),
-        ),
-        patch(
-            "custom_components.greenbutton.statistics._recorded_forward_hours",
-            new=recorded,
-        ),
-        patch(
-            "custom_components.greenbutton.statistics._latest_forward_hour",
-            return_value=active + timedelta(days=20),
-        ),
-        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
-    ):
-        await _import_cost_summaries_with_estimates(
-            hass,
-            entry,
-            up,
-            utility_display_name="Milton Hydro",
-        )
-
-    assert recorded.await_args.args[4] == active + timedelta(days=2)
-    assert round(add.call_args.args[2][0]["sum"], 2) == 10.18
-
-
-async def test_monthly_tiered_estimate_survives_sixteen_day_summary_delay(
+async def test_a_later_bill_replaces_an_earlier_ones_overlapping_hours(
     hass: HomeAssistant,
 ) -> None:
-    """Milton's late bill must not create zero-cost days after the old 14-day cutoff."""
-    active = datetime(2026, 7, 9, 4, tzinfo=UTC)
-    entry = _entry_with_tier_state(
-        _saved_tier_state(active_period_start=active, predicted_days=30, baseline_sum=10.0)
-    )
-    up = _milton_mixed_series_response().usage_points[0]
-    delayed_hour = active + timedelta(days=46)
-    recorded = AsyncMock(return_value=[(delayed_hour, 1.0)])
-    with (
-        patch(
-            "custom_components.greenbutton.statistics._resume_point",
-            new=AsyncMock(return_value=(10.0, None)),
-        ),
-        patch(
-            "custom_components.greenbutton.statistics._recorded_forward_hours",
-            new=recorded,
-        ),
-        patch(
-            "custom_components.greenbutton.statistics._latest_forward_hour",
-            return_value=delayed_hour,
-        ),
-        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
-    ):
-        await _import_cost_summaries_with_estimates(
-            hass,
-            entry,
-            up,
-            utility_display_name="Milton Hydro",
-        )
+    """Where two bills cover the same hour, the later one's price is what stands.
 
-    assert recorded.await_args.args[4] == delayed_hour + timedelta(hours=1)
-    assert len(add.call_args.args[2]) == 1
+    Consecutive bills overlap by a meter-read day, because a billing period is inclusive of both
+    reads — every one of El Paso Electric's twelve monthly bills laps a day over the previous, and
+    Burlington and Elexicon are the same. Each bill prices all of its own hours, and the later
+    statement simply overwrites the shared ones. Nothing is dropped and nothing is guessed at.
+
+    Apr 1-3 at $48 over 48 h = $1/h. Apr 2-4 at $96 over 48 h = $2/h. The 24 hours of Apr 1 keep
+    $1; the 48 hours from Apr 2 on are restated at $2 → $24 + $96 = $120 across 72 hours.
+    """
+    first = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 48.0)
+    later = _summary(datetime(2026, 4, 2, tzinfo=UTC), 2, 96.0)
+    sums = await _cost_sums(hass, [later, first])  # feed order must not matter
+
+    assert len(sums) == 72
+    assert round(sums[-1], 2) == 120.0
+    assert round(sums[23], 2) == 24.0  # Apr 1 costed at the first bill's rate throughout
 
 
-def test_tiered_estimate_resets_tier_one_at_provisional_boundary() -> None:
-    """Post-boundary grace hours start a provisional period instead of staying in Tier 2."""
-    active = datetime(2026, 7, 1, tzinfo=UTC)
-    predicted_end = active + timedelta(days=1)
-    profile = _TieredEstimateProfile(
-        tier_one_rate=0.10,
-        tier_two_rate=0.20,
-        tier_one_kwh_per_day=1.0,
-        residual_rate=0.05,
-    )
-    hours = [
-        (active, 1.5),
-        (predicted_end, 1.0),
-    ]
+async def test_an_exact_duplicate_bill_costs_the_period_once(hass: HomeAssistant) -> None:
+    """A period repeated across a paginated feed rewrites identical values, changing nothing.
 
-    costs = _tiered_estimated_costs_with_provisional_rollover(
-        hours,
-        profile,
-        predicted_days=1,
-        predicted_period_end=predicted_end,
-    )
-
-    assert round(costs[active], 3) == 0.275
-    assert round(costs[predicted_end], 3) == 0.15
+    Under the old any-overlap-is-a-duplicate rule this needed detecting; replacing makes it a
+    no-op for free. Costing both would double the period in the Energy dashboard.
+    """
+    bill = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 48.0)
+    assert round((await _cost_sums(hass, [bill, bill]))[-1], 2) == 48.0
 
 
-def test_tiered_estimate_splits_threshold_hour_and_preserves_total() -> None:
-    """The hour crossing the lower-tier allowance is split rather than all-or-nothing."""
-    profile = _TieredEstimateProfile(
-        tier_one_rate=0.10,
-        tier_two_rate=0.20,
-        tier_one_kwh_per_day=1.0,
-        residual_rate=0.05,
-    )
-    hours = [
-        (_APR2, 1.5),
-        (_APR2 + timedelta(hours=1), 1.0),
-    ]
-    costs = _tiered_estimated_costs(hours, profile, predicted_days=2)
-    assert round(costs[hours[0][0]], 3) == 0.225
-    assert round(costs[hours[1][0]], 3) == 0.20
+async def test_a_rollup_only_prices_hours_no_bill_covers(hass: HomeAssistant) -> None:
+    """A coarse rollup published beside the per-bill totals loses every hour a bill also states.
+
+    It keeps the gaps, priced at its own average rate — no bill covers those hours, so its figure
+    is the only evidence there is for them. Apr 1-5 at $96 over 96 h = $1/h; the two days Apr 2-4
+    are restated by the $96/48 h = $2/h bill. So 24 h at $1 + 48 h at $2 + 24 h at $1 = $144.
+    """
+    rollup = _summary(datetime(2026, 4, 1, tzinfo=UTC), 4, 96.0)
+    bill = _summary(datetime(2026, 4, 2, tzinfo=UTC), 2, 96.0)
+    sums = await _cost_sums(hass, [rollup, bill])
+
+    assert len(sums) == 96
+    assert round(sums[23], 2) == 24.0  # Apr 1 — rollup's rate, no bill covers it
+    assert round(sums[-1], 2) == 144.0
+
+
+async def test_a_zero_cost_placeholder_never_blanks_out_a_real_bill(hass: HomeAssistant) -> None:
+    """Test-lab feeds emit $0 summaries beside real ones; they must not overwrite anything."""
+    placeholder = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 0.0)
+    real = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 48.0)
+    assert round((await _cost_sums(hass, [real, placeholder]))[-1], 2) == 48.0

@@ -82,7 +82,7 @@ class GreenButtonConfigFlow(ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> GreenButtonOptionsFlow:
-        """Return the options flow for polling preferences."""
+        """Expose the polling-schedule options flow (Configure on the entry card)."""
         return GreenButtonOptionsFlow()
 
     def __init__(self) -> None:
@@ -272,34 +272,30 @@ class GreenButtonConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class GreenButtonOptionsFlow(OptionsFlowWithReload):
-    """Configure optional wall-clock polling for daily utility schedules."""
+    """Polling-schedule preferences for one entry.
+
+    Subclasses OptionsFlowWithReload so saving reloads the entry — that's what re-arms the
+    poll timer with the new schedule. It reloads on *save* only, which is why the integration
+    can still avoid the blanket update listener described in [__init__.async_setup_entry].
+    """
 
     async def async_step_init(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Show and save polling options, reloading the entry after a change."""
+        """Show and save the polling options."""
         if user_input is not None:
             return self.async_create_entry(data=user_input)
 
         schema = vol.Schema(
             {
-                vol.Required(
-                    CONF_DAILY_POLL_TIME_ENABLED,
-                    default=False,
-                ): BooleanSelector(),
-                vol.Required(
-                    CONF_DAILY_POLL_TIME,
-                    default=DEFAULT_DAILY_POLL_TIME,
-                ): TimeSelector(),
+                vol.Required(CONF_DAILY_POLL_TIME_ENABLED, default=False): BooleanSelector(),
+                vol.Required(CONF_DAILY_POLL_TIME, default=DEFAULT_DAILY_POLL_TIME): TimeSelector(),
             }
         )
         return self.async_show_form(
             step_id="init",
-            data_schema=self.add_suggested_values_to_schema(
-                schema,
-                self.config_entry.options,
-            ),
+            data_schema=self.add_suggested_values_to_schema(schema, self.config_entry.options),
         )
 
 

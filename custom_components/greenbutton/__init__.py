@@ -18,16 +18,23 @@ the same utility (sandbox / test account beside a real account, or multi-meter h
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
 from homeassistant.core import CoreState
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    ServiceValidationError,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
+from homeassistant.loader import async_get_integration
+from homeassistant.util import dt as dt_util
 
 from .api import OpenGbApi
 from .const import (
@@ -44,10 +51,11 @@ from .const import (
     CONF_DAILY_POLL_TIME_ENABLED,
     CONF_LAST_FETCHED_AT,
     CONF_SERVER_BASE_URL,
-    CONF_UTILITY_NAME,
+    DAILY_CADENCE,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SERVER_BASE_URL,
     DOMAIN,
+    FIRST_REFRESH_GRACE,
     SERVICE_REBUILD_STATISTICS,
     SERVICE_SET_TIER_COST_ESTIMATE,
 )
@@ -56,6 +64,8 @@ from .diagnostics import async_remove_xml_cache
 from .statistics import async_clear_statistics_for_entry, async_seed_tiered_estimate
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant, ServiceCall
 
@@ -79,54 +89,116 @@ _SET_TIER_COST_ESTIMATE_SCHEMA = vol.Schema(
 _LOGGER = logging.getLogger(__name__)
 
 
-def _configured_daily_poll_time(
-    entry: ConfigEntry,
-    poll_interval: timedelta,
-) -> time | None:
-    """Return an enabled local poll time for an exactly-daily utility cadence.
+def _configured_daily_poll_time(entry: ConfigEntry, poll_interval: timedelta) -> time | None:
+    """The user's local poll time, if one applies to this entry's cadence.
 
-    The utility-provided cadence remains authoritative. A wall-clock time only changes the
-    phase of a one-day schedule; it must never make a six-hour or multi-day utility poll daily.
-    Invalid persisted values fall back safely to interval scheduling.
+    The server-supplied cadence stays authoritative: a wall-clock time can only change the
+    *phase* of an already-daily schedule, never turn a six-hour or multi-day cadence into a
+    daily one. Anything unparseable falls back to interval scheduling with a warning rather
+    than failing setup.
     """
-    if poll_interval != DEFAULT_SCAN_INTERVAL or not entry.options.get(
-        CONF_DAILY_POLL_TIME_ENABLED, False
-    ):
+    if poll_interval != DAILY_CADENCE or not entry.options.get(CONF_DAILY_POLL_TIME_ENABLED):
         return None
 
     raw = entry.options.get(CONF_DAILY_POLL_TIME)
-    if not isinstance(raw, str):
+    parsed = dt_util.parse_time(raw) if isinstance(raw, str) else None
+    if parsed is None:
         _LOGGER.warning(
-            "Ignoring invalid daily poll time for entry %s: %r",
+            "Ignoring invalid daily poll time for entry %s (%r); falling back to every %s",
             entry.entry_id,
             raw,
+            poll_interval,
         )
-        return None
-    try:
-        configured = time.fromisoformat(raw)
-    except ValueError:
+    return parsed
+
+
+def _previous_daily_occurrence(now: datetime, at: time) -> datetime:
+    """The most recent moment the local wall-clock time ``at`` went past, as UTC.
+
+    Built from a naive local datetime so it follows HA's timezone through DST rather than
+    doing arithmetic on a fixed offset.
+    """
+    local_today = dt_util.as_local(now).date()
+    todays = dt_util.as_utc(datetime.combine(local_today, at))
+    if todays <= now:
+        return todays
+    return dt_util.as_utc(datetime.combine(local_today - timedelta(days=1), at))
+
+
+def _poll_is_due(entry: ConfigEntry, poll_interval: timedelta, daily_at: time | None) -> bool:
+    """Whether the schedule says a fetch should already have happened.
+
+    Only consulted while HA is starting, to decide whether the setup-time fetch is doing real
+    work. An entry that has never polled, one whose interval has elapsed, and one that was
+    down at its wall-clock time are all due; an entry that polled within its own cadence is
+    not, and its data is already in the recorder.
+    """
+    raw = entry.data.get(CONF_LAST_FETCHED_AT)
+    last_fetched = dt_util.parse_datetime(raw) if isinstance(raw, str) else None
+    if last_fetched is None:
+        return True
+
+    now = dt_util.utcnow()
+    if daily_at is None:
+        return now - last_fetched >= poll_interval
+    return last_fetched < _previous_daily_occurrence(now, daily_at)
+
+
+def _make_late_first_refresh_handler(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> Callable[[asyncio.Task[None]], None]:
+    """Build the done-callback for a first refresh that outlived config-entry setup.
+
+    Setup has already returned True by the time this runs, so its outcome can no longer be
+    expressed as ConfigEntryNotReady / ConfigEntryAuthFailed — nothing is left to raise them to,
+    and an unretrieved task exception would surface as a bare "Task exception was never
+    retrieved" traceback. Translate instead:
+
+    * auth failure → start the reauth flow ourselves. `async_config_entry_first_refresh` re-raises
+      ConfigEntryAuthFailed *instead of* calling `async_start_reauth` (it expects setup to do it),
+      so nothing else would.
+    * anything else → log it. The entry stays loaded with `last_update_success` False, exactly as
+      a failed periodic poll leaves it, and the coordinator's own timers carry the retry: the
+      short pending-retry timer for a deferred (202) fetch, the poll timer otherwise.
+    """
+
+    def _handle(task: asyncio.Task[None]) -> None:
+        if task.cancelled():  # entry unloaded mid-fetch; nothing to report
+            return
+        err = task.exception()
+        if err is None:
+            _LOGGER.info("Entry %s: background first fetch completed", entry.entry_id)
+            return
+        if isinstance(err, ConfigEntryAuthFailed):
+            _LOGGER.warning(
+                "Entry %s: background first fetch needs re-authorization: %s",
+                entry.entry_id,
+                err,
+            )
+            entry.async_start_reauth(hass)
+            return
         _LOGGER.warning(
-            "Ignoring invalid daily poll time for entry %s: %r",
+            "Entry %s: background first fetch failed (%s); retrying on the coordinator's own "
+            "schedule",
             entry.entry_id,
-            raw,
+            err,
         )
-        return None
-    if configured.tzinfo is not None:
-        _LOGGER.warning(
-            "Ignoring timezone-qualified daily poll time for entry %s: %r",
-            entry.entry_id,
-            raw,
-        )
-        return None
-    return configured
+
+    return _handle
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up an Open Green Button config entry.
 
-    Creates a coordinator and stashes it in ``hass.data`` for diagnostics. A first install or
-    manual reload fetches immediately; a normal Home Assistant boot with an existing usage
-    frontier uses stored statistics and waits for the configured schedule.
+    Creates a coordinator, fetches when the schedule says a fetch is owed (which will trigger
+    reauth if the persisted refresh token has been revoked while HA was down), and stashes the
+    coordinator in ``hass.data`` for diagnostics.
+
+    That fetch is started as a task the entry owns and only waited on for FIRST_REFRESH_GRACE:
+    it can legitimately run for minutes on a first, full-history pull, which is longer than
+    anything driving setup is willing to wait. Failures that arrive inside the grace period are
+    raised from here as they always were; later ones are handled by
+    [_make_late_first_refresh_handler].
     """
     api = OpenGbApi(
         session=async_get_clientsession(hass),
@@ -134,39 +206,90 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     coordinator = GreenButtonCoordinator(hass, api, entry)
 
-    # When a refresh runs, ConfigEntryAuthFailed opens HA's reauth flow; other failures become
-    # ConfigEntryNotReady and are retried with backoff.
-    restarting_with_history = (
-        hass.state is not CoreState.running and CONF_LAST_FETCHED_AT in entry.data
-    )
-    if restarting_with_history:
-        # Utility data is already persisted in recorder statistics. Re-fetching it on every HA
-        # restart is redundant and puts network/recorder work on the startup critical path.
-        coordinator.async_set_updated_data(None)
-        _LOGGER.info(
-            "Skipping startup fetch for entry %s; next refresh follows its polling schedule",
-            entry.entry_id,
+    # The server's per-utility cadence, not a fixed daily tick — see the poll timer below.
+    poll_interval = coordinator.update_interval or DEFAULT_SCAN_INTERVAL
+    daily_poll_time = _configured_daily_poll_time(entry, poll_interval)
+
+    # First refresh raises ConfigEntryAuthFailed → HA opens a reauth notification. Any other
+    # failure becomes ConfigEntryNotReady → HA retries with backoff.
+    #
+    # Skipped only on an HA *restart* that lands inside the current polling window: the usage
+    # for that window is already in the recorder, so the fetch would ask the utility to resend
+    # what we just read, on the startup critical path. A first install and a manual reload run
+    # with `hass` already running and always fetch; so does a restart after a poll was missed —
+    # including one missed because HA was down at the daily wall-clock time. That keeps this
+    # the place a token revoked while HA was down still surfaces, and keeps the coordinator's
+    # import-logic repair (CONF_IMPORT_LOGIC_REVISION) running at startup.
+    if hass.state is CoreState.running or _poll_is_due(entry, poll_interval, daily_poll_time):
+        # Run it as a task the ENTRY owns, not inline. A first, full-history pull can take
+        # minutes against a slow custodian, and setup is usually driven by a browser request
+        # (finishing the config flow, or Reload) that a reverse proxy in front of HA will
+        # abandon long before that — cancelling the setup task, and with it an inline await.
+        # A background task survives that, because nothing awaits it here. See FIRST_REFRESH_GRACE.
+        first_refresh = entry.async_create_background_task(
+            hass,
+            coordinator.async_config_entry_first_refresh(),
+            name=f"{DOMAIN} first refresh {entry.entry_id}",
         )
+        # `asyncio.wait` never cancels what it waits on, on timeout or on being cancelled itself,
+        # so the fetch keeps running either way.
+        await asyncio.wait({first_refresh}, timeout=FIRST_REFRESH_GRACE.total_seconds())
+
+        if not first_refresh.done():
+            _LOGGER.info(
+                "Entry %s: first fetch is still running after %s — completing setup and letting "
+                "it finish in the background",
+                entry.entry_id,
+                FIRST_REFRESH_GRACE,
+            )
+            first_refresh.add_done_callback(_make_late_first_refresh_handler(hass, entry))
+        else:
+            try:
+                first_refresh.result()
+            except ConfigEntryNotReady:
+                # A utility preparing a deferred batch (HTTP 202) is NOT a failed setup. The entry
+                # is authorized, its credentials work, and the data is coming — it just isn't here
+                # yet, which for some custodians is the normal first-connection path. Refusing to
+                # finish setup for that would leave the entry showing as broken and, worse, would
+                # leave the poll timer below unarmed and the user's polling options inert, since HA
+                # never gets past this line. The coordinator raises a repair issue and re-attempts
+                # on its own short timer instead. Every other failure still means "can't start" —
+                # re-raise so HA retries with its own backoff.
+                if not coordinator.data_pending:
+                    raise
+                _LOGGER.info(
+                    "Entry %s: utility is still preparing the data (HTTP 202). Completing setup "
+                    "anyway — the coordinator will keep re-attempting until it lands",
+                    entry.entry_id,
+                )
     else:
-        # First install and manual reload remain explicit refresh actions.
-        await coordinator.async_config_entry_first_refresh()
+        _LOGGER.info(
+            "Entry %s polled at %s, within its %s cadence — skipping the startup fetch and "
+            "waiting for the next scheduled poll",
+            entry.entry_id,
+            entry.data.get(CONF_LAST_FETCHED_AT),
+            f"daily {daily_poll_time.isoformat()} local" if daily_poll_time else poll_interval,
+        )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+    # The coordinator arms its own short timer while a utility is preparing a deferred batch
+    # (see GreenButtonCoordinator._schedule_pending_retry). It re-arms itself across attempts, so
+    # the unsubscribe isn't a fixed handle we can hand to async_on_unload directly — tear it down
+    # through the coordinator instead, or a reload leaves a callback firing at a dead entry.
+    entry.async_on_unload(coordinator.cancel_pending_retry)
 
     # This integration owns no entities, so nothing subscribes to the coordinator. HA's
     # DataUpdateCoordinator only arms its internal poll timer when it has ≥1 listener AND the
     # entry's `pref_disable_polling` is off (update_coordinator._schedule_refresh). Relying on
     # that gated scheduler is fragile for a poll-only integration — a stray "disable polling"
-    # system-option silently stops all data updates. So we drive refreshes ourselves. Daily
-    # utilities may be anchored to a user-selected local wall-clock time; every other cadence
-    # follows the interval supplied by the Open Green Button server. The first fetch already ran
-    # above via async_config_entry_first_refresh; these listeners cover every fetch after.
+    # system-option silently stops all data updates. So we drive the periodic refresh
+    # ourselves with a schedule HA can't turn off. Any fetch owed at setup already ran above;
+    # this covers every fetch after.
     async def _async_poll(now) -> None:
         _LOGGER.debug("Periodic poll firing for entry %s (scheduled tick %s)", entry.entry_id, now)
         await coordinator.async_refresh()
 
-    poll_interval = coordinator.update_interval or DEFAULT_SCAN_INTERVAL
-    daily_poll_time = _configured_daily_poll_time(entry, poll_interval)
     if daily_poll_time is not None:
         entry.async_on_unload(
             async_track_time_change(
@@ -177,25 +300,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 second=daily_poll_time.second,
             )
         )
-        schedule_description = f"daily at {daily_poll_time.isoformat()} local time"
+        schedule = f"daily at {daily_poll_time.isoformat()} local time"
     else:
         entry.async_on_unload(async_track_time_interval(hass, _async_poll, poll_interval))
-        schedule_description = f"every {poll_interval}"
+        schedule = f"every {poll_interval}"
     # Emitted once, immediately, on every successful setup. If you do NOT see this line in the
     # log right after an HA (full) restart, the running code is stale — the deployed files or the
     # loaded module predate the timer. A config-entry *reload* is not enough; Python caches the
     # module, so only a full HA restart re-imports this file.
-    _LOGGER.info("Armed periodic poll for entry %s: %s", entry.entry_id, schedule_description)
+    _LOGGER.info("Armed periodic poll for entry %s: %s", entry.entry_id, schedule)
 
     # NOTE: deliberately NO `add_update_listener(...reload...)` here. The coordinator writes
     # bookkeeping (CONF_LAST_FETCHED_AT, rotated credentials) into entry.data on every poll;
     # a blanket reload-on-update listener would tear the entry down and re-set it up on each
     # of those writes. Reauth reloads itself via the config flow's
-    # `async_update_reload_and_abort`. Polling options use OptionsFlowWithReload, which reloads
-    # once when the user saves without installing a broad update listener here.
+    # `async_update_reload_and_abort`, and the polling options flow subclasses
+    # OptionsFlowWithReload, which reloads only when the user saves the form — so nothing
+    # here needs a reload on data change.
     _async_register_services(hass)
+    # Stamp the integration version into the log. A pasted log excerpt is the commonest thing a
+    # bug report carries, and without this it doesn't say which build produced it — issues/10 ran
+    # for two weeks partly because the affected version had to be inferred from poll cadence in
+    # server-side logs. HA reads this from manifest.json and refuses to load a custom integration
+    # without a valid one, so it is always present; the lookup is cached.
+    integration = await async_get_integration(hass, DOMAIN)
     _LOGGER.info(
-        "Set up Open Green Button entry %s for utility %s",
+        "Set up Open Green Button %s entry %s for utility %s",
+        integration.version,
         entry.entry_id,
         entry.data.get("utility_id"),
     )
@@ -235,14 +366,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 f"No loaded Open Green Button account with config entry id {entry_id!r}"
             )
         if coordinator.data is None:
-            raise ServiceValidationError("The account has no usage response to price yet")
+            raise ServiceValidationError("The account has not fetched usage data yet")
         try:
             active_period_start = datetime.fromisoformat(call.data[ATTR_ACTIVE_PERIOD_START])
             await async_seed_tiered_estimate(
                 hass,
                 coordinator.entry,
                 coordinator.data,
-                coordinator.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
+                coordinator.entry.data.get("utility_name", "Open Green Button"),
                 active_period_start=active_period_start,
                 predicted_days=call.data[ATTR_PREDICTED_DAYS],
                 currency_alpha=call.data[ATTR_CURRENCY_ALPHA],

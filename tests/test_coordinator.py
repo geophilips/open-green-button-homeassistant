@@ -8,6 +8,7 @@ mode, when to persist rotated credentials, etc.).
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
@@ -38,8 +39,11 @@ from custom_components.greenbutton.const import (
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_IMPORT_LOGIC_REVISION,
     CONF_LAST_FETCHED_AT,
+    CONF_PENDING_PUBLISHED_MAX,
+    CONF_PENDING_PUBLISHED_MIN,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
+    CONF_USAGE_POINT_CURSORS,
     CONF_UTILITY_ID,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
@@ -90,14 +94,38 @@ def _reading_type() -> NormalizedReadingType:
     )
 
 
-def _response_with_readings(*starts: datetime) -> UsageResponse:
+def _response_with_readings(*starts: datetime, cost: float | None = None) -> UsageResponse:
     """A UsageResponse carrying one FORWARD series with a reading at each given start."""
-    readings = [UsageReading(start=s, duration_seconds=3600, value=1000.0) for s in starts]
+    readings = [
+        UsageReading(start=s, duration_seconds=3600, value=1000.0, cost=cost) for s in starts
+    ]
     series = MeterReadingSeries(
         meter_reading_id="mr1", reading_type=_reading_type(), readings=readings
     )
     up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
     return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def _response_with_meters(meters: dict[str, list[datetime]]) -> UsageResponse:
+    """A UsageResponse carrying one FORWARD series per named UsagePoint (one meter each)."""
+    usage_points = [
+        UsagePoint(
+            usage_point_id=up_id,
+            service_kind="electricity",
+            series=[
+                MeterReadingSeries(
+                    meter_reading_id=f"mr-{up_id}",
+                    reading_type=_reading_type(),
+                    readings=[
+                        UsageReading(start=s, duration_seconds=3600, value=1000.0, cost=None)
+                        for s in starts
+                    ],
+                )
+            ],
+        )
+        for up_id, starts in meters.items()
+    ]
+    return UsageResponse(updated=None, usage_points=usage_points, new_credentials=None)
 
 
 async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) -> None:
@@ -123,14 +151,13 @@ async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) ->
     assert call.kwargs["encrypted_refresh_blob"] == "original_blob"
     assert call.kwargs["proxy_token"] == "original_token"  # noqa: S105
 
-    from custom_components.greenbutton.const import (
-        INITIAL_FETCH_LOOKBACK,
-        PUBLISHED_MAX_LOOKAHEAD,
-    )
+    from custom_components.greenbutton.const import INITIAL_FETCH_LOOKBACK
 
     now = datetime.now(UTC)
     expected_min = now - INITIAL_FETCH_LOOKBACK
-    expected_max = now + PUBLISHED_MAX_LOOKAHEAD
+    # `published_max` is plain `now` — no forward buffer. A future bound never survived the proxy's
+    # clamp anyway, and savagedata rejects one outright.
+    expected_max = now
     # Tolerate the few seconds of clock drift between the coordinator and the assertion.
     assert abs((call.kwargs["published_min"] - expected_min).total_seconds()) < 60
     assert abs((call.kwargs["published_max"] - expected_max).total_seconds()) < 60
@@ -219,10 +246,11 @@ async def test_rotated_credentials_persisted_on_upstream_error(hass: HomeAssista
 
 
 async def test_data_pending_raises_repair_issue_and_update_failed(hass: HomeAssistant) -> None:
-    """A 202 (async background load) → UpdateFailed + a non-fixable repair issue with the link.
+    """A fresh 202 → UpdateFailed, plus a *warning* repair issue that asks nothing of the user.
 
-    We don't support the ESPI async batch flow yet, so the only user-facing behaviour is a
-    repair issue pointing at the tracking GitHub issue; the entry then fails this refresh.
+    A custodian saying "collecting it now" is working as designed for some utilities — an error
+    there is a false alarm that makes a normal mode look like a broken integration. The refresh
+    still fails (there's no data to import), but the user-facing surface stays calm.
     """
     from homeassistant.helpers import issue_registry as ir
 
@@ -250,9 +278,225 @@ async def test_data_pending_raises_repair_issue_and_update_failed(hass: HomeAssi
     issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
     assert issue is not None
     assert issue.is_fixable is False
-    assert issue.severity == ir.IssueSeverity.ERROR
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert issue.translation_key == "background_load_pending"
     assert issue.learn_more_url == BACKGROUND_LOAD_ISSUE_URL
     assert issue.translation_placeholders == {"utility": "Example Utility"}
+    coordinator.cancel_pending_retry()
+
+
+async def test_data_pending_escalates_to_an_error_after_a_day(hass: HomeAssistant) -> None:
+    """Once the wait passes PENDING_ESCALATE_AFTER the issue becomes an error worth reporting.
+
+    Same issue_id throughout, so the entry upgrades in place rather than showing two notices.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+    from custom_components.greenbutton.const import CONF_PENDING_SINCE, PENDING_ESCALATE_AFTER
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("data pending (202)"),
+    )
+
+    entry = _entry(hass)
+    stale = datetime.now(UTC) - PENDING_ESCALATE_AFTER - timedelta(minutes=1)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_PENDING_PUBLISHED_MIN: "2024-08-06T20:19:00+00:00",
+            CONF_PENDING_PUBLISHED_MAX: "2026-08-06T20:19:00+00:00",
+            CONF_PENDING_SINCE: stale.isoformat(),
+        },
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
+    assert issue is not None
+    assert issue.severity == ir.IssueSeverity.ERROR
+    assert issue.translation_key == "background_load_stuck"
+    # Past the deadline we stop the five-minute cadence and let the ordinary poll timer carry it,
+    # so a custodian that never delivers isn't polled forever.
+    assert coordinator._pending_retry_unsub is None
+
+
+async def test_data_pending_freezes_the_window_and_retries_replay_it(
+    hass: HomeAssistant,
+) -> None:
+    """After a 202, every retry re-asks with the IDENTICAL window.
+
+    This is the Alectra bug in issues/10. A custodian doing ESPI asynchronous batch delivery
+    prepares the dataset under the URL it was asked for, so only an identical request can collect
+    it. The ordinary window is computed from `now`, so without the freeze each retry moves both
+    bounds, enqueues a fresh job, and gets a fresh 202 — forever.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("data pending (202)"),
+    )
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    first = api.fetch_usage.await_args.kwargs
+    assert entry.data[CONF_PENDING_PUBLISHED_MIN] == first["published_min"].isoformat()
+
+    # What we sent is what gets frozen, and it is never in the future — the proxy clamps a future
+    # `published-max` down to its own `now`, so a forward-dated bound would be rewritten to a fresh
+    # instant on every retry, pinning `published-min` while the custodian still sees a brand-new
+    # URL each time. See test_a_future_published_max_is_frozen_clamped_to_now.
+    frozen_max = datetime.fromisoformat(entry.data[CONF_PENDING_PUBLISHED_MAX])
+    assert frozen_max == first["published_max"]
+    assert frozen_max <= datetime.now(UTC)
+
+    # Two more retries — wall-clock moves on, so an unfrozen window would differ each time.
+    for _ in range(2):
+        with (
+            patch(
+                "custom_components.greenbutton.coordinator.import_usage_statistics",
+                new=AsyncMock(),
+            ),
+            pytest.raises(UpdateFailed),
+        ):
+            await coordinator._async_update_data()
+
+        retry = api.fetch_usage.await_args.kwargs
+        assert retry["published_min"] == first["published_min"]
+        # Identical AND not in the future: the value the proxy forwards is the value we sent.
+        assert retry["published_max"] == frozen_max
+
+
+async def test_data_pending_logs_the_custodian_detail(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The 202's forwarded detail reaches the log: INFO on the first, DEBUG on retries.
+
+    Nothing downstream prints the exception — setup logs its own generic line, and HA's
+    coordinator only logs UpdateFailed on a success→failure transition, which a 202 before any
+    success never produces. Issues/10 went two weeks without the custodian's response headers
+    because of exactly that. The affected user's HA log is the only place this detail can be
+    collected from, so losing it means losing the investigation.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+
+    detail = "data pending (202) (response-headers: [X-Powered-By: ASP.NET])"
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError(detail),
+    )
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        caplog.at_level(logging.DEBUG, logger="custom_components.greenbutton"),
+    ):
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+        # Match the deferral line specifically: the opportunistic batch-collection attempt also
+        # fails with this same exception and logs its own (DEBUG) line carrying the same text.
+        first_records = [
+            r for r in caplog.records if "utility deferred the fetch" in r.getMessage()
+        ]
+        assert [r.levelno for r in first_records] == [logging.INFO]
+        assert detail in first_records[0].getMessage()
+
+        caplog.clear()
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+    retry_records = [r for r in caplog.records if "utility deferred the fetch" in r.getMessage()]
+    assert [r.levelno for r in retry_records] == [logging.DEBUG]
+    coordinator.cancel_pending_retry()
+
+
+async def test_successful_fetch_clears_the_frozen_pending_window(hass: HomeAssistant) -> None:
+    """Once the deferred batch lands, polling returns to a `now`-relative window."""
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_PENDING_PUBLISHED_MIN: "2024-08-06T20:19:00+00:00",
+            CONF_PENDING_PUBLISHED_MAX: "2026-08-06T20:19:00+00:00",
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    # The frozen window was replayed for the fetch that succeeded...
+    assert api.fetch_usage.await_args.kwargs["published_min"] == datetime(
+        2024, 8, 6, 20, 19, tzinfo=UTC
+    )
+    # ...and is gone afterwards, so the next poll asks for whatever is new.
+    assert CONF_PENDING_PUBLISHED_MIN not in entry.data
+    assert CONF_PENDING_PUBLISHED_MAX not in entry.data
+
+
+async def test_rebuild_ignores_a_frozen_pending_window(hass: HomeAssistant) -> None:
+    """A rebuild means "re-fetch everything", not "resume the deferred slice"."""
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_PENDING_PUBLISHED_MIN: "2024-08-06T20:19:00+00:00",
+            CONF_PENDING_PUBLISHED_MAX: "2026-08-06T20:19:00+00:00",
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        patch(
+            "custom_components.greenbutton.coordinator.async_clear_statistics_for_entry",
+            new=AsyncMock(return_value=[]),
+        ),
+    ):
+        await coordinator.async_rebuild_statistics(publish=False)
+
+    # The full-history window, not the frozen 2024-08-06 one.
+    assert api.fetch_usage.await_args.kwargs["published_min"] != datetime(
+        2024, 8, 6, 20, 19, tzinfo=UTC
+    )
 
 
 async def test_successful_refresh_clears_background_load_issue(hass: HomeAssistant) -> None:
@@ -269,7 +513,11 @@ async def test_successful_refresh_clears_background_load_issue(hass: HomeAssista
         ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is not None
     )
 
-    coordinator.api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+    # A fetch that actually carries data — a *clean* fetch that carries nothing keeps the issue
+    # up (as `no_data_yet`), which is the whole point of the empty-feed path.
+    coordinator.api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        return_value=_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC))
+    )
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
         new=AsyncMock(),
@@ -277,6 +525,200 @@ async def test_successful_refresh_clears_background_load_issue(hass: HomeAssista
         await coordinator._async_update_data()
 
     assert ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is None
+
+
+async def test_clean_fetch_with_no_data_at_all_explains_itself_and_retries_soon(
+    hass: HomeAssistant,
+) -> None:
+    """A brand-new account whose utility returns nothing must not go quiet for a day.
+
+    The issues/43 report. A custodian that assembles data on demand (UtilityAPI, and everything
+    behind it) answers the first request after authorization with an ordinary HTTP 200 carrying no
+    readings. Nothing is imported, so no statistic metadata is registered, so the Energy dashboard
+    offers the user literally nothing — and the only thing that used to happen next was the
+    ordinary poll, a day later. The user reads that as a broken integration.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.const import BACKGROUND_LOAD_ISSUE_URL, CONF_EMPTY_SINCE
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    # The fetch SUCCEEDED — this is not a failed refresh, and must not be reported as one.
+    assert coordinator.last_update_success is True
+    assert CONF_EMPTY_SINCE in entry.data
+
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
+    assert issue is not None
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert issue.translation_key == "no_data_yet"
+    assert issue.learn_more_url == BACKGROUND_LOAD_ISSUE_URL
+    assert issue.translation_placeholders == {"utility": "Example Utility"}
+
+    assert coordinator._pending_retry_unsub is not None
+    coordinator.cancel_pending_retry()
+
+
+async def test_empty_wait_widens_and_is_capped_by_the_poll_interval(hass: HomeAssistant) -> None:
+    """Each re-check waits as long again as we've already waited, up to the poll cadence.
+
+    Unlike the 202 path — where we're collecting a batch the custodian has already prepared and
+    told us about — every attempt here re-asks for the whole initial-history window on nothing more
+    than a suspicion. A flat five minutes would mean ~288 full-history queries a day against a
+    utility that may simply have nothing to give us.
+    """
+    from custom_components.greenbutton.const import CONF_EMPTY_SINCE, EMPTY_RETRY_INITIAL
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    async def _delay_for(
+        coord: GreenButtonCoordinator, target: MockConfigEntry, waited: timedelta | None
+    ) -> timedelta:
+        data = {**target.data}
+        data.pop(CONF_EMPTY_SINCE, None)
+        if waited is not None:
+            data[CONF_EMPTY_SINCE] = (datetime.now(UTC) - waited).isoformat()
+        hass.config_entries.async_update_entry(target, data=data)
+        coord.cancel_pending_retry()
+        with (
+            patch(
+                "custom_components.greenbutton.coordinator.import_usage_statistics",
+                new=AsyncMock(),
+            ),
+            patch("custom_components.greenbutton.coordinator.async_call_later") as call_later,
+        ):
+            await coord._async_update_data()
+        return call_later.call_args.args[1]
+
+    # First empty poll: the floor.
+    assert await _delay_for(coordinator, entry, None) == EMPTY_RETRY_INITIAL
+    # Mid-backoff: doubling falls out of "wait as long again", with no attempt counter to persist
+    # (so it survives a restart and can't drift out of step with the stamp driving escalation).
+    # Approximate because the elapsed time is read off the wall clock inside the call.
+    delay = await _delay_for(coordinator, entry, timedelta(minutes=40))
+    assert delay.total_seconds() == pytest.approx(2400, abs=5)
+
+    # Capped at the entry's own cadence: re-checking more slowly than the ordinary poll would be a
+    # regression, not a backoff. Only reachable on a utility whose server-supplied cadence is
+    # shorter than the wait — a daily cadence escalates out first.
+    fast_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**entry.data, CONF_POLL_INTERVAL_SECONDS: 6 * 3600, CONF_CUSTOMER_LABEL: ""},
+    )
+    fast_entry.add_to_hass(hass)
+    fast = GreenButtonCoordinator(hass, api, fast_entry)
+    assert await _delay_for(fast, fast_entry, timedelta(hours=8)) == timedelta(hours=6)
+    fast.cancel_pending_retry()
+
+
+async def test_a_day_without_data_escalates_and_drops_the_fast_cadence(
+    hass: HomeAssistant,
+) -> None:
+    """Past PENDING_ESCALATE_AFTER: an error worth reporting, and no more extra polling."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.const import CONF_EMPTY_SINCE, PENDING_ESCALATE_AFTER
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    stale = datetime.now(UTC) - PENDING_ESCALATE_AFTER - timedelta(minutes=1)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_EMPTY_SINCE: stale.isoformat()}
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    # The stamp must NOT restart on every empty poll — it's what decides when to stop.
+    assert entry.data[CONF_EMPTY_SINCE] == stale.isoformat()
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
+    assert issue is not None
+    assert issue.severity == ir.IssueSeverity.ERROR
+    assert issue.translation_key == "no_data_yet_stuck"
+    assert coordinator._pending_retry_unsub is None
+
+
+async def test_first_data_clears_the_empty_wait(hass: HomeAssistant) -> None:
+    """The moment a reading lands, the stamp, the notice and the fast retry all go away."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.const import CONF_EMPTY_SINCE
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+        assert CONF_EMPTY_SINCE in entry.data
+
+        coordinator.api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+            return_value=_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC))
+        )
+        await coordinator._async_update_data()
+
+    assert CONF_EMPTY_SINCE not in entry.data
+    assert entry.data[CONF_LAST_FETCHED_AT] == "2026-07-05T05:00:00+00:00"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is None
+    assert coordinator._pending_retry_unsub is None
+
+
+async def test_an_established_entry_polling_into_a_quiet_window_stays_silent(
+    hass: HomeAssistant,
+) -> None:
+    """An empty poll is only remarkable for an account that has NEVER had data.
+
+    Utilities publish on a lag — weekly, or in batches — so an entry that already holds history
+    returns empty routinely. Warning about that, or re-polling it every few minutes, would turn
+    normal operation into a permanent repair notice.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.const import CONF_EMPTY_SINCE
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_LAST_FETCHED_AT: "2026-07-04T05:00:00+00:00"}
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert CONF_EMPTY_SINCE not in entry.data
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is None
+    assert coordinator._pending_retry_unsub is None
 
 
 async def test_rotated_credentials_are_persisted_before_stats_import(
@@ -720,10 +1162,13 @@ def _response_with_cumulative_register() -> UsageResponse:
     logic — it's the series that used to be summed into consumption (#6) and whose `cost=0`
     hijacked cost-source selection (#7).
     """
+    # The hourly series itemizes per-interval <cost>, as savagedata really does. That's also what
+    # settles the revision-3 check for this feed without a UsageSummary in the poll: an account on
+    # the per-interval cost path never ran billing-summary selection, so it has nothing to repair.
     delta = MeterReadingSeries(
         meter_reading_id="hourly",
         reading_type=_reading_type(),
-        readings=[UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0)],
+        readings=[UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0, cost=0.21)],
     )
     bulk_type = NormalizedReadingType(
         commodity="ELECTRICITY_SECONDARY_METERED",
@@ -785,17 +1230,99 @@ async def test_import_migration_rebuilds_entry_with_cumulative_register(
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
 
+def _summary_costed_response() -> UsageResponse:
+    """Burlington's shape: hourly readings with no per-interval cost, billed by UsageSummary."""
+    from custom_components.greenbutton.api import BillingSummary, CostDetail
+
+    series = MeterReadingSeries(
+        meter_reading_id="hourly",
+        reading_type=_reading_type(),
+        readings=[UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0)],
+    )
+    summary = BillingSummary(
+        billing_period_start=datetime(2026, 6, 2, tzinfo=UTC),
+        billing_period_duration_seconds=30 * 86400,
+        bill_last_period_raw=None,
+        cost_additional_last_period_raw=0,
+        cost_details=[
+            CostDetail(amount_raw=18_773_000, note="Energy", item_kind=None, unit_cost_raw=0)
+        ],
+        currency_numeric_code=124,
+    )
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[series],
+        summaries=[summary],
+    )
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def test_import_migration_rebuilds_a_summary_costed_entry(hass: HomeAssistant) -> None:
+    """Revision 3: an account billed through UsageSummary repairs its cost without being asked.
+
+    Selection used to drop every bill that overlapped the previous one at the meter-read day,
+    which is most of them, so the cost statistic was built from about half the money. Nothing
+    about the stored rows looks wrong — cost is simply too low — so nobody would think to run
+    `rebuild_statistics`, which is exactly why this has to happen on its own.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 2)  # current before this fix; only the revision-3 check should fire
+    api = _api_returning(_summary_costed_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_will_not_clear_an_entry_it_could_not_judge(
+    hass: HomeAssistant,
+) -> None:
+    """A poll carrying no cost of any kind leaves the entry unstamped, not cleared.
+
+    The trap this guards. Bills only appear in the poll that publishes them, and a monthly utility
+    hands over one at a time — so most Burlington polls carry readings and no summary. Treating
+    that as "unaffected" would stamp the entry on the first poll after the update and close the
+    repair permanently, on evidence we never had. Not deciding costs one cheap re-check a day.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 2)
+    api = _api_returning(_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC)))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()  # no rebuild
+    clear_mock.assert_not_awaited()
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == 2  # still owed the check
+
+
 async def test_import_migration_skips_entry_without_cumulative_register(
     hass: HomeAssistant,
 ) -> None:
     """An unaffected feed is stamped in place — no full-history re-pull from its utility.
 
-    The whole point of gating on the feed's shape: a blanket rebuild would make every Burlington
-    and Elexicon user re-download their entire history to fix a bug they never had.
+    The whole point of gating on the feed's shape: a blanket rebuild would make every user
+    re-download their entire history to fix a bug they never had. The readings carry per-interval
+    cost so every check can reach a verdict from this one poll — see
+    [statistics.response_cost_may_be_missing_bills] for why an entry that can't be judged is left
+    unstamped rather than cleared.
     """
     hass.set_state(CoreState.running)
     entry = _entry(hass)
-    api = _api_returning(_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC)))
+    api = _api_returning(
+        _response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC), cost=0.21),
+    )
     coordinator = GreenButtonCoordinator(hass, api, entry)
 
     has_stats, clear, _import = _migration_patches(had_statistics=True)
@@ -826,6 +1353,82 @@ async def test_import_migration_skips_entry_with_no_prior_statistics(
 
     api.fetch_usage.assert_awaited_once()
     clear_mock.assert_not_awaited()
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+def _billing_period_response() -> UsageResponse:
+    """Consumers Energy's shape: one month-long reading, mislabelled BULK_QUANTITY, no sibling."""
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="BULK_QUANTITY",
+        interval_length_seconds=2505599,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=840,
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="B12888756_kwh_1",
+        reading_type=reading_type,
+        readings=[UsageReading(datetime(2026, 6, 2, tzinfo=UTC), 2505599, 914_523.0, cost=234.02)],
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def _stamp(hass: HomeAssistant, entry: MockConfigEntry, revision: int) -> None:
+    """Mark [entry] as holding rows produced by import-logic [revision]."""
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_IMPORT_LOGIC_REVISION: revision}
+    )
+
+
+async def test_import_migration_rebuilds_entry_wiped_by_revision_1(hass: HomeAssistant) -> None:
+    """A billing-only entry emptied by revision 1 repairs itself — despite having no rows.
+
+    Revision 1 classed a month-long reading as a cumulative register, so its repair rebuild
+    purged the entry and re-imported nothing, leaving it stamped 1 with an empty store and a
+    cursor advanced past its data. "No statistics" must NOT be read as "newly added" here, or
+    the account stays permanently blank with nothing left to trigger a re-import.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 1)
+    api = _api_returning(_billing_period_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=False)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_rebuilds_milton_shape_for_zero_placeholder_fix(
+    hass: HomeAssistant,
+) -> None:
+    """A Milton-shaped entry at revision 3 rebuilds once for provisional zero damage.
+
+    The bad zero placeholders may be gone from the current response by upgrade time. The stable
+    signal is Milton's hourly DELTA_DATA plus its same-flow cumulative register companion, so a
+    previously current entry still needs one full rebuild under revision 4.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 3)
+    api = _api_returning(_response_with_cumulative_register())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert api.fetch_usage.await_count == 2  # poll, then full-history repair
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
 
@@ -922,3 +1525,514 @@ async def test_import_migration_deferred_until_hass_started(hass: HomeAssistant)
         clear_mock.assert_awaited_once_with(hass, entry.entry_id)
         assert api.fetch_usage.await_count == 2
         assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_advance_cursor_writes_one_cursor_per_meter(hass: HomeAssistant) -> None:
+    """Each UsagePoint gets its own cursor, anchored to that meter's own newest reading.
+
+    A subscription can carry several meters — commonly different commodities on entirely
+    different reading cadences — so one frontier for the whole entry only ever describes
+    whichever meter runs furthest ahead.
+    """
+    fast = datetime(2026, 6, 3, 12, tzinfo=UTC)
+    slow = datetime(2026, 4, 1, 0, tzinfo=UTC)
+    api = _api_returning(_response_with_meters({"electric": [fast], "gas": [slow]}))
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {
+        "electric": fast.isoformat(),
+        "gas": slow.isoformat(),
+    }
+    # The entry-wide frontier still tracks the newest across meters: it answers "has this entry
+    # ever imported anything", which is not a per-meter question.
+    assert entry.data[CONF_LAST_FETCHED_AT] == fast.isoformat()
+
+
+async def test_window_scopes_to_the_furthest_behind_meter(hass: HomeAssistant) -> None:
+    """`published_min` follows the OLDEST cursor, not the newest.
+
+    One request serves every meter on the subscription. Scoping to the newest would let a daily
+    electric meter drag the window past a monthly gas meter's not-yet-published data, and the
+    gas readings would never be asked for again.
+    """
+    fast = datetime(2026, 6, 3, 12, tzinfo=UTC)
+    slow = datetime(2026, 4, 1, 0, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: fast.isoformat(),
+            CONF_USAGE_POINT_CURSORS: {
+                "electric": fast.isoformat(),
+                "gas": slow.isoformat(),
+            },
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert api.fetch_usage.await_args.kwargs["published_min"] == slow - LAST_FETCHED_OVERLAP
+
+
+async def test_a_silent_meter_keeps_its_cursor(hass: HomeAssistant) -> None:
+    """A meter absent from a response keeps the cursor it had — absence is not "no data ever".
+
+    A monthly gas meter is silent through most of an electric meter's polls. Dropping or
+    resetting its cursor would re-fetch its entire history on the very next poll.
+    """
+    electric_first = datetime(2026, 6, 1, tzinfo=UTC)
+    gas = datetime(2026, 4, 1, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_USAGE_POINT_CURSORS: {
+                "electric": electric_first.isoformat(),
+                "gas": gas.isoformat(),
+            },
+        },
+    )
+
+    electric_next = datetime(2026, 6, 2, tzinfo=UTC)
+    api = _api_returning(_response_with_meters({"electric": [electric_next]}))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {
+        "electric": electric_next.isoformat(),
+        "gas": gas.isoformat(),
+    }
+
+
+async def test_meter_cursors_never_retreat(hass: HomeAssistant) -> None:
+    """A response carrying older readings for a meter leaves that meter's cursor alone."""
+    ahead = datetime(2026, 6, 10, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_USAGE_POINT_CURSORS: {"electric": ahead.isoformat()}},
+    )
+
+    api = _api_returning(_response_with_meters({"electric": [datetime(2026, 5, 1, tzinfo=UTC)]}))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {"electric": ahead.isoformat()}
+
+
+async def test_entry_written_before_per_meter_cursors_uses_the_old_frontier(
+    hass: HomeAssistant,
+) -> None:
+    """An entry with only the entry-wide frontier keeps polling incrementally.
+
+    The scalar stands in until the next successful fetch seeds the per-meter map, so upgrading
+    costs no migration step and — importantly — no accidental full-history refetch.
+    """
+    frontier = datetime(2026, 6, 1, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_LAST_FETCHED_AT: frontier.isoformat()},
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert api.fetch_usage.await_args.kwargs["published_min"] == frontier - LAST_FETCHED_OVERLAP
+
+
+async def test_unparseable_meter_cursor_is_skipped_not_fatal(hass: HomeAssistant) -> None:
+    """One corrupt cursor widens that meter's window instead of taking the entry down.
+
+    Re-fetched readings are harmless (the import is idempotent on (statistic_id, hour)), so
+    skipping is strictly cheaper than failing the refresh.
+    """
+    good = datetime(2026, 6, 1, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_USAGE_POINT_CURSORS: {"electric": good.isoformat(), "gas": "not-a-timestamp"},
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    # The surviving cursor still scopes the window — the corrupt one is simply ignored.
+    assert api.fetch_usage.await_args.kwargs["published_min"] == good - LAST_FETCHED_OVERLAP
+
+
+async def test_window_compliance_is_logged_per_meter(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every field needed to tell an honoured date filter from an ignored one, per meter.
+
+    Whether an async-batch custodian's per-UsagePoint URL honours `published-min` is unsettled,
+    and one poll cannot settle it: `published-min` filters by PUBLICATION date while readings
+    carry their own interval start, so a single publication legitimately holds years of data. The
+    signature of an ignored filter is only visible across polls — advancing windows returning
+    identical counts and spans — so each poll must record the whole comparison.
+    """
+    api = _api_returning(
+        _response_with_meters(
+            {
+                "electric": [datetime(2026, 6, 1, tzinfo=UTC), datetime(2026, 6, 2, tzinfo=UTC)],
+                "gas": [datetime(2024, 1, 1, tzinfo=UTC)],
+            }
+        )
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        caplog.at_level(logging.INFO, logger="custom_components.greenbutton"),
+    ):
+        await coordinator._async_update_data()
+
+    lines = [r.getMessage() for r in caplog.records if "Window check" in r.getMessage()]
+    assert len(lines) == 2
+    electric = next(line for line in lines if "usage_point=electric" in line)
+    assert "readings=2" in electric
+    assert "span=[2026-06-01T00:00:00+00:00, 2026-06-02T00:00:00+00:00]" in electric
+    # The gas meter's lone reading predates a 2-year initial window, which is exactly the kind of
+    # divergence the comparison exists to surface.
+    gas = next(line for line in lines if "usage_point=gas" in line)
+    assert "readings=1" in gas
+    assert "before_published_min=1" in gas
+
+
+async def test_a_future_published_max_is_frozen_clamped_to_now(hass: HomeAssistant) -> None:
+    """A forward-dated `published_max` is stored clamped, never as given.
+
+    The client no longer sends a future bound, so this is defence in depth — and a regression
+    guard. The proxy clamps a future `published-max` down to its own `now` before the request
+    reaches the custodian, so freezing one would have the clamp rewrite it to a fresh instant on
+    every retry: the window looks frozen here while the custodian sees a brand-new URL each time,
+    which is exactly what a deferring custodian answers with another 202. Re-introducing any
+    forward buffer must not silently defeat the freeze again.
+    """
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, _api_returning(_empty_response()), entry)
+
+    published_min = datetime(2026, 6, 1, tzinfo=UTC)
+    far_future = datetime.now(UTC) + timedelta(days=1)
+    coordinator._remember_pending_window(published_min, far_future)
+
+    frozen_max = datetime.fromisoformat(entry.data[CONF_PENDING_PUBLISHED_MAX])
+    assert frozen_max < far_future
+    assert frozen_max <= datetime.now(UTC)
+    assert entry.data[CONF_PENDING_PUBLISHED_MIN] == published_min.isoformat()
+
+
+async def test_deferred_fetch_probes_the_customer_feed_once(hass: HomeAssistant) -> None:
+    """A 202 on usage still probes the customer feed — once per deferral, not per retry.
+
+    The customer resource lives on the same custodian under the same /Batch/ tree but is far
+    smaller, so its status answers what the usage endpoint cannot: whether this custodian defers
+    everything under /Batch/ or only the heavyweight usage export. That question decides how a
+    prepared batch can be collected at all (issues/10). It had never been asked, because labeling
+    only ever ran after a successful usage fetch — and a deferring entry never has one.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("data pending (202)"),
+    )
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        return_value=CustomerResponse(
+            customer=CustomerInfo(
+                account_id="100001-0000001",
+                service_address="123 EXAMPLE ST",
+                customer_name=None,
+            ),
+            new_credentials=None,
+        )
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+        api.fetch_customer.assert_awaited_once()
+
+        # The retry replays the frozen window, so it is not a fresh deferral — and the label is
+        # resolved by now anyway. Either guard alone should stop a second probe; both must.
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+    api.fetch_customer.assert_awaited_once()
+    coordinator.cancel_pending_retry()
+
+
+async def test_a_deferred_customer_feed_is_reported_and_not_recorded(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 202 from the customer feed says the custodian's whole Batch tree is asynchronous.
+
+    Distinct from an ordinary transient failure, so it gets its own INFO line rather than a DEBUG
+    shrug — it is a fact about the platform, not a hiccup. No label is stored, so the probe runs
+    again rather than being written off as "this utility has no customer data".
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+    from custom_components.greenbutton.const import CONF_CUSTOMER_LABEL as LABEL_KEY
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("usage pending (202)"),
+    )
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("customer pending (202)"),
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        caplog.at_level(logging.INFO, logger="custom_components.greenbutton"),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    api.fetch_customer.assert_awaited_once()
+    assert any(
+        "customer feed is deferred as well" in r.getMessage() and r.levelno == logging.INFO
+        for r in caplog.records
+    )
+    # Not written off — an unanswered probe must stay unanswered, not become "no customer data".
+    assert LABEL_KEY not in entry.data
+
+    # And the retry does NOT probe again. This is the case that isolates the once-per-deferral
+    # guard: no label was stored, so the "already resolved" early return cannot be what stops it.
+    # Without this, a five-minute retry loop would double every custodian's request volume for the
+    # whole 24 hours it runs.
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    api.fetch_customer.assert_awaited_once()
+    coordinator.cancel_pending_retry()
+
+
+def _deferring_api(
+    listing: UsageResponse | None = None,
+    per_meter: dict[str, UsageResponse] | None = None,
+) -> OpenGbApi:
+    """An API whose subscription-level fetch always defers, but whose resources may answer.
+
+    Mirrors the custodians in issues/10: `Batch/Subscription/{sub}` is an enqueue endpoint that
+    answers 202 forever, while the batch it prepares is readable underneath it.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+
+    async def _fetch(**kwargs: object) -> UsageResponse:
+        path = kwargs.get("resource_path")
+        if path is None:
+            raise OpenGbDataPendingError("data pending (202)")
+        if path == "UsagePoint":
+            if listing is None:
+                raise OpenGbDataPendingError("listing pending (202)")
+            return listing
+        assert isinstance(path, str)
+        found = (per_meter or {}).get(path.removeprefix("UsagePoint/"))
+        if found is None:
+            raise OpenGbApiError(f"no such resource: {path}")
+        return found
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(side_effect=_fetch)  # type: ignore[method-assign]
+    return api
+
+
+async def test_a_deferred_batch_is_collected_from_its_usage_points(
+    hass: HomeAssistant,
+) -> None:
+    """A 202 turns into a successful poll by reading the batch the custodian prepared.
+
+    The subscription-level URL is an enqueue endpoint: it answers 202 to every request and never
+    serves the dataset, however exactly the URL is repeated (issues/10 — 252 byte-identical
+    requests, all 202). The data it prepares is readable at a per-UsagePoint URL underneath it,
+    which is derivable rather than something we must be told.
+    """
+    reading = datetime(2026, 6, 1, tzinfo=UTC)
+    api = _deferring_api(
+        listing=_response_with_meters({"up1": [], "up2": []}),
+        per_meter={
+            "up1": _response_with_meters({"up1": [reading]}),
+            "up2": _response_with_meters({"up2": [reading]}),
+        },
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ) as import_mock:
+        response = await coordinator._async_update_data()
+
+    # The poll SUCCEEDED — no UpdateFailed — and both meters' data reached the importer.
+    assert {up.usage_point_id for up in response.usage_points} == {"up1", "up2"}
+    import_mock.assert_awaited_once()
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {
+        "up1": reading.isoformat(),
+        "up2": reading.isoformat(),
+    }
+    # Nothing is left pending: the batch landed, so no frozen window and no fast retry.
+    assert CONF_PENDING_PUBLISHED_MIN not in entry.data
+    coordinator.cancel_pending_retry()
+
+
+async def test_known_meters_are_collected_without_a_listing_request(
+    hass: HomeAssistant,
+) -> None:
+    """An entry that has imported before skips discovery — its cursor map already names its meters.
+
+    That also covers a custodian which used to answer synchronously and starts deferring later,
+    where a listing endpoint may not exist to ask.
+    """
+    reading = datetime(2026, 6, 2, tzinfo=UTC)
+    api = _deferring_api(per_meter={"up1": _response_with_meters({"up1": [reading]})})
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_USAGE_POINT_CURSORS: {"up1": datetime(2026, 6, 1, tzinfo=UTC).isoformat()},
+        },
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    requested = [c.kwargs.get("resource_path") for c in api.fetch_usage.await_args_list]
+    assert "UsagePoint" not in requested, "asked for a listing despite already knowing the meters"
+    assert "UsagePoint/up1" in requested
+    coordinator.cancel_pending_retry()
+
+
+async def test_one_failing_meter_does_not_sink_the_others(hass: HomeAssistant) -> None:
+    """Meters are collected independently — a failure costs that meter, not the poll.
+
+    Safe precisely because cursors are per meter: the meters that answered advance, and the one
+    that didn't keeps its old cursor, so its window simply stays open until it does.
+    """
+    reading = datetime(2026, 6, 3, tzinfo=UTC)
+    api = _deferring_api(
+        listing=_response_with_meters({"good": [], "bad": []}),
+        per_meter={"good": _response_with_meters({"good": [reading]})},  # "bad" errors
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        response = await coordinator._async_update_data()
+
+    assert {up.usage_point_id for up in response.usage_points} == {"good"}
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {"good": reading.isoformat()}
+    coordinator.cancel_pending_retry()
+
+
+async def test_a_listing_that_carries_readings_is_used_directly(hass: HomeAssistant) -> None:
+    """If the listing returns the data itself, take it and skip the per-meter round trips."""
+    reading = datetime(2026, 6, 4, tzinfo=UTC)
+    api = _deferring_api(listing=_response_with_meters({"up1": [reading]}))
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        response = await coordinator._async_update_data()
+
+    assert {up.usage_point_id for up in response.usage_points} == {"up1"}
+    requested = [c.kwargs.get("resource_path") for c in api.fetch_usage.await_args_list]
+    assert "UsagePoint/up1" not in requested
+    coordinator.cancel_pending_retry()
+
+
+async def test_a_failed_collection_leaves_the_deferred_handling_untouched(
+    hass: HomeAssistant,
+) -> None:
+    """When nothing can be collected, the poll behaves exactly as it did before.
+
+    The collection attempt is opportunistic: it can turn a failed poll into a successful one, and
+    must never do the reverse. So a custodian that defers everything still gets the frozen window,
+    the repair issue and the short retry.
+    """
+    api = _deferring_api()  # listing defers too, so nothing is collectable
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    assert CONF_PENDING_PUBLISHED_MIN in entry.data
+    assert CONF_USAGE_POINT_CURSORS not in entry.data
+    coordinator.cancel_pending_retry()

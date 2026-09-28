@@ -278,21 +278,18 @@ async def test_reauth_flow_updates_existing_entry(
     assert config_entry.data[CONF_ENCRYPTED_REFRESH_BLOB] == "newblob=="
 
 
-async def test_options_flow_saves_daily_local_poll_time(
+async def test_options_flow_saves_the_daily_poll_time(
     hass: HomeAssistant,
     config_entry: config_entries.ConfigEntry,
 ) -> None:
-    """Polling options are persisted through HA's options flow."""
+    """Polling preferences round-trip through the options flow into entry.options."""
     result = await hass.config_entries.options.async_init(config_entry.entry_id)
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        {
-            CONF_DAILY_POLL_TIME_ENABLED: True,
-            CONF_DAILY_POLL_TIME: "06:00:00",
-        },
+        {CONF_DAILY_POLL_TIME_ENABLED: True, CONF_DAILY_POLL_TIME: "06:00:00"},
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert config_entry.options == {

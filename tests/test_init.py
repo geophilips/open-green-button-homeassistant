@@ -7,13 +7,18 @@ selection and validation (the rebuild mechanics themselves live in test_coordina
 
 from __future__ import annotations
 
-from datetime import timedelta
+import asyncio
+import logging
+import zoneinfo
+from contextlib import contextmanager
+from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.core import CoreState
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import ConfigEntryAuthFailed, ServiceValidationError
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -23,17 +28,18 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.greenbutton import (
     _async_register_services,
     _configured_daily_poll_time,
+    _previous_daily_occurrence,
 )
-from custom_components.greenbutton.api import CustomerResponse, UsageResponse
+from custom_components.greenbutton.api import (
+    CustomerResponse,
+    MeterReadingSeries,
+    NormalizedReadingType,
+    UsagePoint,
+    UsageReading,
+    UsageResponse,
+)
 from custom_components.greenbutton.const import (
-    ATTR_ACTIVE_PERIOD_START,
     ATTR_CONFIG_ENTRY_ID,
-    ATTR_CURRENCY_ALPHA,
-    ATTR_PREDICTED_DAYS,
-    ATTR_RESIDUAL_RATE,
-    ATTR_TIER_ONE_KWH_PER_DAY,
-    ATTR_TIER_ONE_RATE,
-    ATTR_TIER_TWO_RATE,
     CONF_DAILY_POLL_TIME,
     CONF_DAILY_POLL_TIME_ENABLED,
     CONF_ENCRYPTED_REFRESH_BLOB,
@@ -45,10 +51,11 @@ from custom_components.greenbutton.const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     SERVICE_REBUILD_STATISTICS,
-    SERVICE_SET_TIER_COST_ESTIMATE,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from homeassistant.core import HomeAssistant
 
 
@@ -58,27 +65,25 @@ def _stub_coordinator() -> MagicMock:
     return coord
 
 
-async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
-    """Regression: the entity-less integration must keep polling on its own timer.
-
-    It owns no entities, so HA's DataUpdateCoordinator won't self-schedule (its poll timer is
-    gated on having a listener AND `pref_disable_polling` being off). Setup therefore drives
-    the refresh with an explicit time interval. We assert real behaviour: a first fetch at
-    setup, then another fetch once the scan interval elapses.
-    """
-    entry = MockConfigEntry(
+def _entry(**extra_data) -> MockConfigEntry:
+    """A minimal authorized entry; `extra_data` adds/overrides entry.data keys."""
+    options = extra_data.pop("options", None)
+    return MockConfigEntry(
         domain=DOMAIN,
         data={
             CONF_UTILITY_ID: "example_utility",
             CONF_UTILITY_NAME: "Example Utility",
             CONF_ENCRYPTED_REFRESH_BLOB: "blob",
             CONF_PROXY_TOKEN: "token",
+            **extra_data,
         },
+        options=options or {},
     )
-    entry.add_to_hass(hass)
 
-    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
-    fetch = AsyncMock(return_value=empty)
+
+@contextmanager
+def _stub_network(fetch: AsyncMock) -> Iterator[None]:
+    """Patch every network/recorder touch point setup would otherwise reach."""
     with (
         patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
         # The coordinator opportunistically fetches customer data once to label the entry;
@@ -92,6 +97,57 @@ async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
             new=AsyncMock(),
         ),
     ):
+        yield
+
+
+def _ok_fetch() -> AsyncMock:
+    """A fetch that returns usable data.
+
+    It has to carry at least one reading, not just parse: an account that has never received a
+    single reading is now re-checked on its own backoff timer (see
+    [coordinator.GreenButtonCoordinator._reconcile_data_availability]), and that extra timer would
+    land inside the windows these scheduling tests advance through and be miscounted as a poll.
+    Which is the right behaviour to have — it just isn't what any test in this file is measuring.
+    """
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    reading = UsageReading(
+        start=datetime(2026, 7, 5, 5, tzinfo=UTC), duration_seconds=3600, value=1000.0
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="mr1", reading_type=reading_type, readings=[reading]
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    response = UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+    return AsyncMock(return_value=response)
+
+
+def _ago(**kwargs) -> str:
+    """An ISO `last_fetched_at` that far in the past."""
+    return (dt_util.utcnow() - timedelta(**kwargs)).isoformat()
+
+
+async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
+    """Regression: the entity-less integration must keep polling on its own timer.
+
+    It owns no entities, so HA's DataUpdateCoordinator won't self-schedule (its poll timer is
+    gated on having a listener AND `pref_disable_polling` being off). Setup therefore drives
+    the refresh with an explicit time interval. We assert real behaviour: a first fetch at
+    setup, then another fetch once the scan interval elapses.
+    """
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    fetch = _ok_fetch()
+    with _stub_network(fetch):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         assert fetch.await_count == 1  # async_config_entry_first_refresh
@@ -104,115 +160,255 @@ async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
         assert fetch.await_count == 2, "periodic poll did not fire on the scan interval"
 
 
-async def test_normal_restart_with_history_skips_immediate_fetch(hass: HomeAssistant) -> None:
-    """Persisted utility data waits for its schedule instead of blocking every HA boot."""
-    hass.set_state(CoreState.starting)
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={
-            CONF_UTILITY_ID: "milton_hydro",
-            CONF_UTILITY_NAME: "Milton Hydro",
-            CONF_ENCRYPTED_REFRESH_BLOB: "blob",
-            CONF_PROXY_TOKEN: "token",
-            CONF_LAST_FETCHED_AT: "2026-08-04T04:00:00+00:00",
-        },
-        options={
-            CONF_DAILY_POLL_TIME_ENABLED: True,
-            CONF_DAILY_POLL_TIME: "06:00:00",
-        },
-    )
+async def test_setup_completes_when_the_utility_is_still_preparing_data(
+    hass: HomeAssistant,
+) -> None:
+    """A 202 must not block setup — and the entry must retry in minutes, not at its cadence.
+
+    Refusing to finish setup would leave the entry showing as broken and, more damagingly, would
+    leave the poll timer unarmed: HA never reaches it. The coordinator's own short retry is what
+    carries a deferred fetch, so assert it actually fires well inside the (daily) poll interval.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+    from custom_components.greenbutton.const import PENDING_RETRY_INTERVAL
+
+    entry = _entry()
     entry.add_to_hass(hass)
-    fetch = AsyncMock()
-    with (
-        patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
-        patch("custom_components.greenbutton.async_track_time_change", return_value=MagicMock()),
-    ):
+
+    fetch = AsyncMock(side_effect=OpenGbDataPendingError("data pending (202)"))
+    with _stub_network(fetch):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
+        # Each deferred poll is the subscription fetch plus one attempt to collect the prepared
+        # batch (here: the UsagePoint listing, which this stub also defers), so count polls by
+        # the calls that carry no resource_path rather than by the raw total.
+        polls = [c for c in fetch.await_args_list if c.kwargs.get("resource_path") is None]
+        assert len(polls) == 1
 
-    fetch.assert_not_awaited()
-
-
-async def test_manual_reload_with_history_still_fetches(hass: HomeAssistant) -> None:
-    """When HA is running, Reload remains an explicit immediate refresh action."""
-    hass.set_state(CoreState.running)
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={
-            CONF_UTILITY_ID: "milton_hydro",
-            CONF_UTILITY_NAME: "Milton Hydro",
-            CONF_ENCRYPTED_REFRESH_BLOB: "blob",
-            CONF_PROXY_TOKEN: "token",
-            CONF_LAST_FETCHED_AT: "2026-08-04T04:00:00+00:00",
-        },
-    )
-    entry.add_to_hass(hass)
-    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
-    fetch = AsyncMock(return_value=empty)
-    with (
-        patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
-        patch(
-            "custom_components.greenbutton.OpenGbApi.fetch_customer",
-            new=AsyncMock(return_value=CustomerResponse(customer=None, new_credentials=None)),
-        ),
-        patch("custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()),
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
+        # Far short of DEFAULT_SCAN_INTERVAL — only the pending-retry timer can fire here.
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + PENDING_RETRY_INTERVAL + timedelta(seconds=30)
+        )
         await hass.async_block_till_done()
+        polls = [c for c in fetch.await_args_list if c.kwargs.get("resource_path") is None]
+        assert len(polls) == 2, "deferred fetch was not re-attempted on the short timer"
 
-    fetch.assert_awaited_once()
+    await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_setup_uses_server_interval_for_non_daily_utility(hass: HomeAssistant) -> None:
-    """A shorter server cadence is honored instead of the daily fallback."""
+async def test_setup_still_fails_for_errors_that_are_not_a_deferred_fetch(
+    hass: HomeAssistant,
+) -> None:
+    """The 202 escape hatch must not swallow genuine "can't start" failures."""
+    from custom_components.greenbutton.api import OpenGbApiError
+
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    with _stub_network(AsyncMock(side_effect=OpenGbApiError("proxy exploded"))):
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+
+
+async def test_poll_timer_uses_the_server_supplied_cadence(hass: HomeAssistant) -> None:
+    """Regression: the poll timer must honour the utility's cadence, not a fixed daily tick.
+
+    `poll_interval_seconds` comes from the claim response and drives the coordinator's
+    update_interval — but the coordinator's own scheduler is deliberately never armed here,
+    so a timer hard-coded to DEFAULT_SCAN_INTERVAL would make that server value dead config
+    and under-poll every sub-daily utility.
+    """
     six_hours = timedelta(hours=6)
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={
-            CONF_UTILITY_ID: "example_utility",
-            CONF_UTILITY_NAME: "Example Utility",
-            CONF_ENCRYPTED_REFRESH_BLOB: "blob",
-            CONF_PROXY_TOKEN: "token",
-            CONF_POLL_INTERVAL_SECONDS: six_hours.total_seconds(),
-        },
-    )
+    entry = _entry(**{CONF_POLL_INTERVAL_SECONDS: six_hours.total_seconds()})
     entry.add_to_hass(hass)
 
-    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
-    fetch = AsyncMock(return_value=empty)
-    with (
-        patch("custom_components.greenbutton.OpenGbApi.fetch_usage", new=fetch),
-        patch(
-            "custom_components.greenbutton.OpenGbApi.fetch_customer",
-            new=AsyncMock(return_value=CustomerResponse(customer=None, new_credentials=None)),
-        ),
-        patch(
-            "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
-        ),
-    ):
+    fetch = _ok_fetch()
+    with _stub_network(fetch):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         assert fetch.await_count == 1
 
         async_fire_time_changed(hass, dt_util.utcnow() + six_hours + timedelta(minutes=1))
         await hass.async_block_till_done()
-        assert fetch.await_count == 2
+        assert fetch.await_count == 2, "poll did not fire on the six-hour server cadence"
 
 
-async def test_setup_anchors_enabled_daily_schedule_to_local_time(
+async def test_restart_inside_a_polled_window_skips_the_startup_fetch(
     hass: HomeAssistant,
 ) -> None:
-    """An enabled daily option uses HA's DST-aware local wall-clock helper."""
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={
-            CONF_UTILITY_ID: "example_utility",
-            CONF_UTILITY_NAME: "Example Utility",
-            CONF_ENCRYPTED_REFRESH_BLOB: "blob",
-            CONF_PROXY_TOKEN: "token",
-            CONF_POLL_INTERVAL_SECONDS: DEFAULT_SCAN_INTERVAL.total_seconds(),
+    """A restart that lands mid-window must not re-ask the utility for what we already have."""
+    hass.set_state(CoreState.starting)
+    entry = _entry(**{CONF_LAST_FETCHED_AT: _ago(hours=2)})
+    entry.add_to_hass(hass)
+
+    fetch = _ok_fetch()
+    with _stub_network(fetch):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    fetch.assert_not_awaited()
+
+
+async def test_restart_after_a_missed_interval_fetches_and_surfaces_reauth(
+    hass: HomeAssistant,
+) -> None:
+    """A restart with a poll owed still fetches — that's where a revoked token surfaces."""
+    hass.set_state(CoreState.starting)
+    entry = _entry(**{CONF_LAST_FETCHED_AT: _ago(days=3)})
+    entry.add_to_hass(hass)
+
+    fetch = AsyncMock(side_effect=ConfigEntryAuthFailed("revoked"))
+    with _stub_network(fetch):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    fetch.assert_awaited_once()
+    reauths = [
+        flow
+        for flow in hass.config_entries.flow.async_progress()
+        if flow["context"].get("source") == SOURCE_REAUTH
+    ]
+    assert len(reauths) == 1, "reauth did not surface at startup for a revoked token"
+
+
+async def test_a_slow_first_fetch_does_not_hold_setup_open(hass: HomeAssistant) -> None:
+    """Regression (issues/49): setup must not stay open for a minutes-long first fetch.
+
+    A first full-history pull against a slow custodian is a minutes-scale operation, but setup is
+    usually driven by a browser request (finishing the config flow, or Reload) that a reverse
+    proxy in front of HA abandons at its own read timeout — cancelling the setup task, and with it
+    anything setup is inline-awaiting. That leaves the entry in SETUP_ERROR, which is terminal: no
+    backoff, no retry. So setup waits only briefly, then completes and lets the fetch land later.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    released = asyncio.Event()
+    response = _ok_fetch().return_value
+
+    async def _slow_fetch(*_args, **_kwargs):
+        await released.wait()
+        return response
+
+    fetch = AsyncMock(side_effect=_slow_fetch)
+    with (
+        _stub_network(fetch),
+        patch("custom_components.greenbutton.FIRST_REFRESH_GRACE", timedelta(seconds=0.01)),
+    ):
+        # The timeout is the assertion: setup awaited the fetch inline before this fix, and
+        # `released` is only set below, so an inline await would hang here.
+        async with asyncio.timeout(10):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+        assert entry.state is ConfigEntryState.LOADED
+        # The poll timer is armed even though the first fetch hasn't landed.
+        assert entry.entry_id in hass.data[DOMAIN]
+
+        # ...and the fetch is still running, not cancelled by setup returning.
+        released.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+        fetch.assert_awaited_once()
+
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_a_late_first_fetch_failure_still_surfaces_reauth(hass: HomeAssistant) -> None:
+    """A revoked token found after setup completed must still open a reauth flow.
+
+    `async_config_entry_first_refresh` re-raises ConfigEntryAuthFailed *instead of* starting the
+    reauth flow, on the assumption that config-entry setup will do it. Once setup has returned,
+    nothing else will — so the background task's done-callback has to.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    released = asyncio.Event()
+
+    async def _slow_failure(*_args, **_kwargs):
+        await released.wait()
+        raise ConfigEntryAuthFailed("revoked")
+
+    with (
+        _stub_network(AsyncMock(side_effect=_slow_failure)),
+        patch("custom_components.greenbutton.FIRST_REFRESH_GRACE", timedelta(seconds=0.01)),
+    ):
+        async with asyncio.timeout(10):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+        released.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    reauths = [
+        flow
+        for flow in hass.config_entries.flow.async_progress()
+        if flow["context"].get("source") == SOURCE_REAUTH
+    ]
+    assert len(reauths) == 1, "reauth did not surface for a token revoked after setup completed"
+
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_manual_reload_always_fetches(hass: HomeAssistant) -> None:
+    """With HA running, setup is an explicit user action — reload means refresh now."""
+    hass.set_state(CoreState.running)
+    entry = _entry(**{CONF_LAST_FETCHED_AT: _ago(minutes=1)})
+    entry.add_to_hass(hass)
+
+    fetch = _ok_fetch()
+    with _stub_network(fetch):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    fetch.assert_awaited_once()
+
+
+async def test_restart_after_a_missed_daily_time_catches_up(hass: HomeAssistant) -> None:
+    """`async_track_time_change` has no catch-up, so a poll missed while down runs at startup."""
+    hass.set_state(CoreState.starting)
+    poll_at = time(6, 0)
+    # Last poll was one full cycle before the most recent 06:00 — that 06:00 was missed.
+    missed = _previous_daily_occurrence(dt_util.utcnow(), poll_at)
+    entry = _entry(
+        options={
+            CONF_DAILY_POLL_TIME_ENABLED: True,
+            CONF_DAILY_POLL_TIME: poll_at.isoformat(),
         },
+        **{CONF_LAST_FETCHED_AT: (missed - timedelta(hours=1)).isoformat()},
+    )
+    entry.add_to_hass(hass)
+
+    fetch = _ok_fetch()
+    with _stub_network(fetch):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    fetch.assert_awaited_once()
+
+
+async def test_restart_after_todays_daily_poll_skips(hass: HomeAssistant) -> None:
+    """Restarting later the same day, after that day's poll already ran, must not re-fetch."""
+    hass.set_state(CoreState.starting)
+    poll_at = time(6, 0)
+    ran = _previous_daily_occurrence(dt_util.utcnow(), poll_at)
+    entry = _entry(
+        options={
+            CONF_DAILY_POLL_TIME_ENABLED: True,
+            CONF_DAILY_POLL_TIME: poll_at.isoformat(),
+        },
+        **{CONF_LAST_FETCHED_AT: (ran + timedelta(seconds=30)).isoformat()},
+    )
+    entry.add_to_hass(hass)
+
+    fetch = _ok_fetch()
+    with _stub_network(fetch):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    fetch.assert_not_awaited()
+
+
+async def test_enabled_daily_option_arms_the_wall_clock_timer(hass: HomeAssistant) -> None:
+    """An enabled daily option schedules on HA's DST-aware wall-clock helper, not an interval."""
+    entry = _entry(
         options={
             CONF_DAILY_POLL_TIME_ENABLED: True,
             CONF_DAILY_POLL_TIME: "06:15:30",
@@ -220,80 +416,65 @@ async def test_setup_anchors_enabled_daily_schedule_to_local_time(
     )
     entry.add_to_hass(hass)
 
-    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
     with (
-        patch(
-            "custom_components.greenbutton.OpenGbApi.fetch_usage", new=AsyncMock(return_value=empty)
-        ),
-        patch(
-            "custom_components.greenbutton.OpenGbApi.fetch_customer",
-            new=AsyncMock(return_value=CustomerResponse(customer=None, new_credentials=None)),
-        ),
-        patch(
-            "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
-        ),
-        patch("custom_components.greenbutton.async_track_time_change") as track_time_change,
-        patch("custom_components.greenbutton.async_track_time_interval") as track_time_interval,
+        _stub_network(_ok_fetch()),
+        patch("custom_components.greenbutton.async_track_time_change") as track_change,
+        patch("custom_components.greenbutton.async_track_time_interval") as track_interval,
     ):
-        track_time_change.return_value = MagicMock()
+        track_change.return_value = MagicMock()
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    track_time_change.assert_called_once()
-    assert track_time_change.call_args.kwargs == {"hour": 6, "minute": 15, "second": 30}
-    track_time_interval.assert_not_called()
+    track_change.assert_called_once()
+    assert track_change.call_args.kwargs == {"hour": 6, "minute": 15, "second": 30}
+    track_interval.assert_not_called()
 
 
-def test_daily_wall_clock_option_never_overrides_non_daily_cadence() -> None:
-    """A saved wall-clock option cannot increase a six-hour utility to daily."""
+def test_daily_option_cannot_override_a_non_daily_cadence() -> None:
+    """A saved wall-clock time must never speed up or slow down a utility's own cadence."""
     entry = MagicMock()
     entry.options = {
         CONF_DAILY_POLL_TIME_ENABLED: True,
         CONF_DAILY_POLL_TIME: "06:00:00",
     }
     assert _configured_daily_poll_time(entry, timedelta(hours=6)) is None
+    assert _configured_daily_poll_time(entry, timedelta(days=2)) is None
+    assert _configured_daily_poll_time(entry, timedelta(days=1)) == time(6, 0)
+
+
+def test_invalid_daily_poll_time_falls_back_to_the_interval() -> None:
+    """A corrupt options value degrades to interval scheduling instead of failing setup."""
+    entry = MagicMock()
+    entry.options = {CONF_DAILY_POLL_TIME_ENABLED: True, CONF_DAILY_POLL_TIME: "not a time"}
+    assert _configured_daily_poll_time(entry, timedelta(days=1)) is None
+
+    entry.options = {CONF_DAILY_POLL_TIME_ENABLED: True, CONF_DAILY_POLL_TIME: None}
+    assert _configured_daily_poll_time(entry, timedelta(days=1)) is None
+
+
+def test_previous_daily_occurrence_is_local_and_dst_aware() -> None:
+    """The boundary is a *local* wall-clock time; the UTC instant shifts across a DST change."""
+    at = time(6, 0)
+    original = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(zoneinfo.ZoneInfo("America/Toronto"))
+    try:
+        # Toronto is UTC−4 in April: 06:00 local is 10:00Z.
+        before = datetime(2026, 4, 2, 9, 30, tzinfo=UTC)
+        after = datetime(2026, 4, 2, 10, 30, tzinfo=UTC)
+        assert _previous_daily_occurrence(before, at) == datetime(2026, 4, 1, 10, tzinfo=UTC)
+        assert _previous_daily_occurrence(after, at) == datetime(2026, 4, 2, 10, tzinfo=UTC)
+
+        # UTC−5 in January: the same local time is 11:00Z, an hour later in absolute terms.
+        winter = datetime(2026, 1, 15, 12, tzinfo=UTC)
+        assert _previous_daily_occurrence(winter, at) == datetime(2026, 1, 15, 11, tzinfo=UTC)
+    finally:
+        dt_util.set_default_time_zone(original)
 
 
 async def test_service_is_registered(hass: HomeAssistant) -> None:
-    """_async_register_services exposes both maintenance services."""
+    """_async_register_services exposes greenbutton.rebuild_statistics."""
     _async_register_services(hass)
     assert hass.services.has_service(DOMAIN, SERVICE_REBUILD_STATISTICS)
-    assert hass.services.has_service(DOMAIN, SERVICE_SET_TIER_COST_ESTIMATE)
-
-
-async def test_set_tier_cost_estimate_seeds_loaded_entry(hass: HomeAssistant) -> None:
-    """A verified manual profile is stored and applied to the coordinator response."""
-    coordinator = _stub_coordinator()
-    coordinator.entry = MagicMock()
-    coordinator.entry.data = {CONF_UTILITY_NAME: "Example Utility"}
-    coordinator.data = UsageResponse(updated=None, usage_points=[], new_credentials=None)
-    hass.data[DOMAIN] = {"entry_a": coordinator}
-    _async_register_services(hass)
-
-    seed = AsyncMock()
-    with patch("custom_components.greenbutton.async_seed_tiered_estimate", new=seed):
-        await hass.services.async_call(
-            DOMAIN,
-            SERVICE_SET_TIER_COST_ESTIMATE,
-            {
-                ATTR_CONFIG_ENTRY_ID: "entry_a",
-                ATTR_ACTIVE_PERIOD_START: "2026-07-09T04:00:00+00:00",
-                ATTR_PREDICTED_DAYS: 30,
-                ATTR_CURRENCY_ALPHA: "CAD",
-                ATTR_TIER_ONE_RATE: 0.12,
-                ATTR_TIER_TWO_RATE: 0.142,
-                ATTR_TIER_ONE_KWH_PER_DAY: 20,
-                ATTR_RESIDUAL_RATE: 0.06,
-            },
-            blocking=True,
-        )
-
-    seed.assert_awaited_once()
-    assert seed.await_args.kwargs["active_period_start"].isoformat() == (
-        "2026-07-09T04:00:00+00:00"
-    )
-    assert seed.await_args.kwargs["predicted_days"] == 30
 
 
 async def test_service_targets_a_single_entry(hass: HomeAssistant) -> None:
@@ -346,3 +527,42 @@ async def test_service_errors_when_no_entries_loaded(hass: HomeAssistant) -> Non
 
     with pytest.raises(ServiceValidationError):
         await hass.services.async_call(DOMAIN, SERVICE_REBUILD_STATISTICS, {}, blocking=True)
+
+
+async def test_setup_logs_the_integration_version(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The setup line names the running version.
+
+    A pasted log excerpt is the commonest thing a bug report carries, and on its own it doesn't
+    say which build produced it. In issues/10 the affected client version had to be inferred from
+    poll cadence in server-side logs, which cost days. Assert against manifest.json rather than a
+    literal so a release bump can't silently make the log disagree with what's installed.
+    """
+    import json
+    from pathlib import Path
+
+    manifest = json.loads(
+        (Path(__file__).parent.parent / "custom_components/greenbutton/manifest.json").read_text()
+    )
+
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
+    fetch = AsyncMock(return_value=empty)
+    with (
+        _stub_network(fetch),
+        caplog.at_level(logging.INFO, logger="custom_components.greenbutton"),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    setup_lines = [
+        r.getMessage() for r in caplog.records if "Set up Open Green Button" in r.getMessage()
+    ]
+    assert setup_lines, "no setup line was logged"
+    assert manifest["version"] in setup_lines[0], setup_lines[0]
+
+    await hass.config_entries.async_unload(entry.entry_id)
