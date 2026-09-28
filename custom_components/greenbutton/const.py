@@ -10,9 +10,18 @@ DOMAIN = "greenbutton"
 # a full history re-fetch — the supported way to pick up a calculation-logic change (e.g. a
 # cost fix) without removing the entry and redoing the OAuth authorization.
 SERVICE_REBUILD_STATISTICS = "rebuild_statistics"
+SERVICE_SET_TIER_COST_ESTIMATE = "set_tier_cost_estimate"
 # Optional service field: which config entry to rebuild (via HA's config_entry selector).
 # Omitted → rebuild every loaded Open Green Button entry.
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"
+ATTR_ACTIVE_PERIOD_START = "active_period_start"
+ATTR_CURRENCY_ALPHA = "currency_alpha"
+ATTR_PREDICTED_DAYS = "predicted_days"
+ATTR_RESIDUAL_RATE = "residual_rate"
+ATTR_TIER_ONE_KWH_PER_DAY = "tier_one_kwh_per_day"
+ATTR_TIER_ONE_RATE = "tier_one_rate"
+ATTR_TIER_TWO_RATE = "tier_two_rate"
+ATTR_USAGE_POINT_ID = "usage_point_id"
 
 # How far back to overlap the window when re-fetching. Generous to absorb clock skew between
 # us and the utility, and to forgive late-arriving corrections. The statistics writer is
@@ -133,6 +142,11 @@ CONF_LAST_FETCHED_AT = "last_fetched_at"
 # [_published_min] reads the scalar until the next successful fetch seeds the map, so no migration
 # step is needed.
 CONF_USAGE_POINT_CURSORS = "usage_point_cursors"
+
+# Per-usage-point state for Milton Hydro's provisional Ontario Tiered cost estimate. The state
+# includes the cumulative cost at the open period boundary, so replacing provisional rows with a
+# later exact bill never has to guess its baseline from a narrow recorder window.
+CONF_TIER_COST_ESTIMATES = "tier_cost_estimates"
 
 # The exact `published-min`/`published-max` (UTC ISO 8601) of a fetch the utility answered with
 # HTTP 202 — "I'm preparing that dataset out of band". Set when a poll hits 202, replayed verbatim

@@ -33,9 +33,19 @@ from custom_components.greenbutton.api import (
     UsageReading,
     UsageResponse,
 )
-from custom_components.greenbutton.const import DOMAIN
+from custom_components.greenbutton.const import (
+    CONF_TIER_COST_ESTIMATES,
+    CONF_UTILITY_ID,
+    DOMAIN,
+)
 from custom_components.greenbutton.statistics import (
+    _cost_sum_before,
+    _import_cost_summaries_with_estimates,
+    _load_tiered_estimate_state,
     _recorded_forward_hours,
+    _tiered_estimated_costs,
+    _tiered_estimated_costs_with_provisional_rollover,
+    _TieredEstimateProfile,
     defer_recent_zero_placeholder_days,
     import_usage_statistics,
     statistic_id_for_series,
@@ -713,6 +723,202 @@ def test_zero_without_cumulative_companion_is_not_deferred() -> None:
 
     assert deferred == 0
     assert filtered is response
+
+
+def _saved_tier_state(
+    *,
+    active_period_start: datetime,
+    predicted_days: float = 30,
+    baseline_sum: float | None = 100.0,
+) -> dict:
+    return {
+        "active_period_start": active_period_start.isoformat(),
+        "predicted_days": predicted_days,
+        "currency_alpha": "CAD",
+        "tier_one_rate": 0.12,
+        "tier_two_rate": 0.142,
+        "tier_one_kwh_per_day": 20.0,
+        "residual_rate": 0.06,
+        "baseline_sum": baseline_sum,
+    }
+
+
+def _entry_with_tier_state(state: dict, *, utility_id: str = "milton_hydro") -> MagicMock:
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    entry.data = {
+        CONF_UTILITY_ID: utility_id,
+        CONF_TIER_COST_ESTIMATES: {"up1": state},
+    }
+    return entry
+
+
+def test_tiered_state_is_ignored_for_non_milton_entry() -> None:
+    entry = _entry_with_tier_state(
+        _saved_tier_state(active_period_start=_APR2),
+        utility_id="burlington_hydro",
+    )
+    assert _load_tiered_estimate_state(entry, "up1") is None
+
+
+async def test_cost_baseline_widens_past_missing_boundary_hours(hass: HomeAssistant) -> None:
+    manager = MagicMock()
+    manager.async_add_executor_job = AsyncMock(
+        side_effect=[
+            {},
+            {},
+            {"greenbutton:test_cost": [{"start": _APR2 - timedelta(days=60), "sum": 88.0}]},
+        ]
+    )
+    with patch("custom_components.greenbutton.statistics.get_instance", return_value=manager):
+        baseline = await _cost_sum_before(hass, "greenbutton:test_cost", _APR2)
+    assert baseline == 88.0
+    assert manager.async_add_executor_job.await_count == 3
+
+
+async def test_two_closed_bills_replace_estimates_from_saved_baseline(
+    hass: HomeAssistant,
+) -> None:
+    entry = _entry_with_tier_state(_saved_tier_state(active_period_start=_APR2))
+    first = _summary(_APR2, 1, 20.0)
+    second_start = _APR2 + timedelta(days=1)
+    second = _summary(second_start, 1, 30.0)
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[],
+        summaries=[first, second],
+    )
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(999.0, (_APR2 + timedelta(days=3)).timestamp())),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=AsyncMock(side_effect=[[(_APR2, 1.0)], [(second_start, 1.0)]]),
+        ),
+        patch("custom_components.greenbutton.statistics._clear_tiered_estimate_state"),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
+    ):
+        await _import_cost_summaries_with_estimates(
+            hass,
+            entry,
+            up,
+            utility_display_name="Milton Hydro",
+        )
+
+    rows = add.call_args.args[2]
+    assert [(row["start"], row["sum"]) for row in rows] == [
+        (_APR2, 120.0),
+        (second_start, 150.0),
+    ]
+
+
+async def test_tiered_estimate_stops_after_one_provisional_period(
+    hass: HomeAssistant,
+) -> None:
+    active = datetime(2026, 7, 1, tzinfo=UTC)
+    entry = _entry_with_tier_state(
+        _saved_tier_state(active_period_start=active, predicted_days=1, baseline_sum=10.0)
+    )
+    up = _milton_mixed_series_response().usage_points[0]
+    recorded = AsyncMock(return_value=[(active + timedelta(hours=5), 1.0)])
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(10.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=recorded,
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._latest_forward_hour",
+            return_value=active + timedelta(days=20),
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
+    ):
+        await _import_cost_summaries_with_estimates(
+            hass,
+            entry,
+            up,
+            utility_display_name="Milton Hydro",
+        )
+
+    assert recorded.await_args.args[4] == active + timedelta(days=2)
+    assert round(add.call_args.args[2][0]["sum"], 2) == 10.18
+
+
+async def test_monthly_tiered_estimate_survives_sixteen_day_summary_delay(
+    hass: HomeAssistant,
+) -> None:
+    active = datetime(2026, 7, 9, 4, tzinfo=UTC)
+    entry = _entry_with_tier_state(
+        _saved_tier_state(active_period_start=active, predicted_days=30, baseline_sum=10.0)
+    )
+    up = _milton_mixed_series_response().usage_points[0]
+    delayed_hour = active + timedelta(days=46)
+    recorded = AsyncMock(return_value=[(delayed_hour, 1.0)])
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(10.0, None)),
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._recorded_forward_hours",
+            new=recorded,
+        ),
+        patch(
+            "custom_components.greenbutton.statistics._latest_forward_hour",
+            return_value=delayed_hour,
+        ),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add,
+    ):
+        await _import_cost_summaries_with_estimates(
+            hass,
+            entry,
+            up,
+            utility_display_name="Milton Hydro",
+        )
+
+    assert recorded.await_args.args[4] == delayed_hour + timedelta(hours=1)
+    assert len(add.call_args.args[2]) == 1
+
+
+def test_tiered_estimate_resets_tier_one_at_provisional_boundary() -> None:
+    active = datetime(2026, 7, 1, tzinfo=UTC)
+    predicted_end = active + timedelta(days=1)
+    profile = _TieredEstimateProfile(
+        tier_one_rate=0.10,
+        tier_two_rate=0.20,
+        tier_one_kwh_per_day=1.0,
+        residual_rate=0.05,
+    )
+    hours = [(active, 1.5), (predicted_end, 1.0)]
+
+    costs = _tiered_estimated_costs_with_provisional_rollover(
+        hours,
+        profile,
+        predicted_days=1,
+        predicted_period_end=predicted_end,
+    )
+
+    assert round(costs[active], 3) == 0.275
+    assert round(costs[predicted_end], 3) == 0.15
+
+
+def test_tiered_estimate_splits_threshold_hour_and_preserves_total() -> None:
+    profile = _TieredEstimateProfile(
+        tier_one_rate=0.10,
+        tier_two_rate=0.20,
+        tier_one_kwh_per_day=1.0,
+        residual_rate=0.05,
+    )
+    hours = [(_APR2, 1.5), (_APR2 + timedelta(hours=1), 1.0)]
+    costs = _tiered_estimated_costs(hours, profile, predicted_days=2)
+    assert round(costs[hours[0][0]], 3) == 0.225
+    assert round(costs[hours[1][0]], 3) == 0.20
 
 
 def _accumulation_response(

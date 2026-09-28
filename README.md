@@ -69,6 +69,10 @@ When the cadence works out to exactly once a day, you can choose *when* that pol
 
 If Home Assistant is down when a poll was due — either the interval elapsed or the daily time went by — the poll runs when it next starts. Restarting inside a window that has already been polled doesn't re-fetch: that data is already in the recorder, so the restart just waits for the next scheduled poll.
 
+### Milton Hydro current-period cost estimate
+
+Milton Hydro accounts on Ontario Tiered pricing can show provisional current-period costs between completed bills. The estimator is deliberately utility-scoped: it learns the Block/Tier rates and non-energy residual from Milton's latest exact `UsageSummary`, stores the cumulative cost at the new period boundary, and replaces provisional rows when the exact bill arrives. If a bill is delayed, the estimate continues through at most one additional provisional billing period, then stops so stale rates cannot accumulate indefinitely. Exact utility summaries remain authoritative.
+
 ## Supported utilities
 
 See the [current utility status](https://github.com/rocketraman/open-green-button#status) on the proxy server for the up-to-date list of supported and in-progress utilities.
