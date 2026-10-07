@@ -263,7 +263,11 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       hours it has not finalized yet. Those hours were imported and then treated as immutable,
 #       permanently understating the day even after Milton corrected its feed. Affected feeds are
 #       identified by the hourly interval series plus same-flow cumulative-register companion.
-IMPORT_LOGIC_REVISION = 4
+#   5 — an incremental Milton response containing only its daily cumulative register snapshots
+#       was imported as daily consumption because the hourly sibling used to identify the
+#       register was temporarily absent. The register also advanced the per-meter cursor past
+#       the missing hourly data. Affected rows must be rebuilt after the classifier fix.
+IMPORT_LOGIC_REVISION = 5
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see
